@@ -290,133 +290,48 @@ def _here_departure_time():
 # ── HERE Routing (live traffic) ───────────────────────────────────────────────
 
 def fetch_here_matrix(locations):
-    """Fetch N×N matrix from HERE Matrix Routing v8 with live traffic.
-    Uses async polling (required on free tier — sync is only for paid plans)."""
+    """Build N×N matrix using HERE Router v8 /routes with live traffic.
+    Avoids the async Matrix API (which requires OAuth2 for polling).
+    Uses one API call per origin row — fast enough for ≤25 locations."""
     if not HERE_API_KEY:
         return None, None
     n = len(locations)
-    origins = [{"lat": loc["lat"], "lng": loc["lng"]} for loc in locations]
+    dist_mat = [[0.0]*n for _ in range(n)]
+    time_mat = [[0.0]*n for _ in range(n)]
 
-    # Compute bounding box of all locations + 20% padding for regionDefinition
-    lats = [loc["lat"] for loc in locations]
-    lngs = [loc["lng"] for loc in locations]
-    lat_pad = max(0.05, (max(lats) - min(lats)) * 0.2)
-    lng_pad = max(0.05, (max(lngs) - min(lngs)) * 0.2)
+    dep_time = _here_departure_time()
 
-    payload = {
-        "origins":          origins,
-        "destinations":     origins,
-        "routingMode":      "fast",
-        "transportMode":    "car",
-        "matrixAttributes": ["travelTimes", "distances"],
-        "regionDefinition": {
-            "type": "boundingBox",
-            "north": max(lats) + lat_pad,
-            "south": min(lats) - lat_pad,
-            "east":  max(lngs) + lng_pad,
-            "west":  min(lngs) - lng_pad,
-        },
-    }
-    try:
-        # Step 1: submit async job
-        # departureTime must be a query param, not in the POST body
-        resp = requests.post(
-            "https://matrix.router.hereapi.com/v8/matrix",
-            json=payload,
-            params={
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            params = {
                 "apiKey":        HERE_API_KEY,
-                "departureTime": _here_departure_time(),
-            },
-            headers={"Content-Type": "application/json"},
-            timeout=30,
-        )
-        if resp.status_code not in (200, 202):
-            print(f"[HERE matrix] submit failed: {resp.status_code} {resp.text[:200]}")
-            return None, None
-
-        data = resp.json()
-
-        # If synchronous result came back immediately
-        if "matrix" in data:
-            matrix = data["matrix"]
-        else:
-            # Async flow:
-            # statusUrl = .../matrix/{id}/status
-            # resultUrl = .../matrix/{id}  (drop /status suffix)
-            status_url = data.get("statusUrl", "")
-            if not status_url:
-                print(f"[HERE matrix] no statusUrl in response: {data}")
+                "transportMode": "car",
+                "routingMode":   "fast",
+                "departureTime": dep_time,
+                "origin":        f"{locations[i]['lat']},{locations[i]['lng']}",
+                "destination":   f"{locations[j]['lat']},{locations[j]['lng']}",
+                "return":        "summary",
+            }
+            try:
+                resp = requests.get("https://router.hereapi.com/v8/routes",
+                                    params=params, timeout=10)
+                if resp.status_code == 200:
+                    routes = resp.json().get("routes", [])
+                    if routes:
+                        summary = routes[0]["sections"][0]["summary"]
+                        dist_mat[i][j] = summary["length"]   / 1000.0  # m → km
+                        time_mat[i][j] = summary["duration"] / 60.0    # s → min
+                        continue
+                print(f"[HERE matrix] ({i},{j}) failed: {resp.status_code} {resp.text[:100]}")
+                return None, None   # fail fast — fall back to OSRM
+            except Exception as e:
+                print(f"[HERE matrix] ({i},{j}) exception: {e}")
                 return None, None
 
-            # Derive result URL by stripping /status from the end
-            result_url = status_url.rstrip("/")
-            if result_url.endswith("/status"):
-                result_url = result_url[:-7]   # remove "/status"
-
-            print(f"[HERE matrix] statusUrl={status_url}")
-            print(f"[HERE matrix] resultUrl={result_url}")
-
-            matrix = None
-            auth_header = {"Authorization": f"Bearer {HERE_API_KEY}"}
-            for attempt in range(30):   # up to ~45 seconds
-                time.sleep(1.5)
-
-                # Poll status using Bearer auth (aws subdomain requires header, not query param)
-                poll = requests.get(status_url, headers=auth_header, timeout=15)
-                print(f"[HERE matrix] poll {attempt+1}: status={poll.status_code} body={poll.text[:200]}")
-
-                if poll.status_code == 200:
-                    poll_data = poll.json()
-                    state = poll_data.get("status", "")
-
-                    if state == "completed":
-                        # Fetch the actual result
-                        res = requests.get(result_url, headers=auth_header, timeout=15)
-                        print(f"[HERE matrix] result fetch: {res.status_code} {res.text[:200]}")
-                        if res.status_code == 200:
-                            res_data = res.json()
-                            matrix   = res_data.get("matrix", res_data)
-                            break
-                        print(f"[HERE matrix] result fetch failed: {res.status_code}")
-                        return None, None
-
-                    elif state in ("failed", "cancelled"):
-                        print(f"[HERE matrix] job {state}: {poll_data}")
-                        return None, None
-                    # else still processing — keep polling
-
-                elif poll.status_code == 303:
-                    # Some HERE responses use 303 redirect to result
-                    result_url = poll.headers.get("Location", result_url)
-                    res = requests.get(result_url, headers=auth_header, timeout=15)
-                    print(f"[HERE matrix] 303 redirect result: {res.status_code} {res.text[:200]}")
-                    if res.status_code == 200:
-                        res_data = res.json()
-                        matrix   = res_data.get("matrix", res_data)
-                        break
-
-            if matrix is None:
-                print("[HERE matrix] timed out waiting for async result")
-                return None, None
-
-        times = matrix.get("travelTimes", [])
-        dists = matrix.get("distances",   [])
-        if not times or not dists:
-            print(f"[HERE matrix] empty matrix in response")
-            return None, None
-
-        dist_mat = [[0.0]*n for _ in range(n)]
-        time_mat = [[0.0]*n for _ in range(n)]
-        for i in range(n):
-            for j in range(n):
-                idx = i * n + j
-                dist_mat[i][j] = dists[idx] / 1000.0   # m  → km
-                time_mat[i][j] = times[idx] / 60.0     # s  → min
-        return dist_mat, time_mat
-    except Exception as e:
-        print(f"[HERE matrix] exception: {e}")
-        return None, None
-
+    print(f"[HERE matrix] ✅ {n}×{n} matrix built with live traffic")
+    return dist_mat, time_mat
 
 
 def _decode_here_polyline(encoded):
