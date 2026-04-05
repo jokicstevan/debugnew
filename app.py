@@ -334,27 +334,68 @@ def fetch_here_matrix(locations):
 
         data = resp.json()
 
-        # If synchronous result came back immediately (paid tier)
+        # If synchronous result came back immediately
         if "matrix" in data:
             matrix = data["matrix"]
         else:
-            # Step 2: poll the status URL until complete
-            status_url = data.get("statusUrl") or data.get("resourceUrl")
+            # Async flow:
+            # statusUrl = .../matrix/{id}/status
+            # resultUrl = .../matrix/{id}  (drop /status suffix)
+            status_url = data.get("statusUrl", "")
             if not status_url:
                 print(f"[HERE matrix] no statusUrl in response: {data}")
                 return None, None
 
-            for attempt in range(20):   # up to ~30 seconds
+            # Derive result URL by stripping /status from the end
+            result_url = status_url.rstrip("/")
+            if result_url.endswith("/status"):
+                result_url = result_url[:-7]   # remove "/status"
+
+            print(f"[HERE matrix] statusUrl={status_url}")
+            print(f"[HERE matrix] resultUrl={result_url}")
+
+            matrix = None
+            for attempt in range(30):   # up to ~45 seconds
                 time.sleep(1.5)
+
+                # Poll status
                 poll = requests.get(status_url,
                                     params={"apiKey": HERE_API_KEY}, timeout=15)
-                if poll.status_code != 200:
-                    continue
-                poll_data = poll.json()
-                if poll_data.get("status") == "completed" or "matrix" in poll_data:
-                    matrix = poll_data.get("matrix", {})
-                    break
-            else:
+                print(f"[HERE matrix] poll {attempt+1}: status={poll.status_code} body={poll.text[:200]}")
+
+                if poll.status_code == 200:
+                    poll_data = poll.json()
+                    state = poll_data.get("status", "")
+
+                    if state == "completed":
+                        # Fetch the actual result
+                        res = requests.get(result_url,
+                                           params={"apiKey": HERE_API_KEY}, timeout=15)
+                        print(f"[HERE matrix] result fetch: {res.status_code} {res.text[:200]}")
+                        if res.status_code == 200:
+                            res_data = res.json()
+                            matrix   = res_data.get("matrix", res_data)
+                            break
+                        print(f"[HERE matrix] result fetch failed: {res.status_code}")
+                        return None, None
+
+                    elif state in ("failed", "cancelled"):
+                        print(f"[HERE matrix] job {state}: {poll_data}")
+                        return None, None
+                    # else still processing — keep polling
+
+                elif poll.status_code == 303:
+                    # Some HERE responses use 303 redirect to result
+                    result_url = poll.headers.get("Location", result_url)
+                    res = requests.get(result_url,
+                                       params={"apiKey": HERE_API_KEY}, timeout=15)
+                    print(f"[HERE matrix] 303 redirect result: {res.status_code} {res.text[:200]}")
+                    if res.status_code == 200:
+                        res_data = res.json()
+                        matrix   = res_data.get("matrix", res_data)
+                        break
+
+            if matrix is None:
                 print("[HERE matrix] timed out waiting for async result")
                 return None, None
 
