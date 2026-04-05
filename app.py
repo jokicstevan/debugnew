@@ -335,7 +335,7 @@ def fetch_here_matrix(locations):
 
 
 def _decode_here_polyline(encoded):
-    """Decode HERE flexible-polyline → list of (lat, lng)."""
+    """Decode HERE flexible-polyline → list of (lat, lng). Handles 2D and 3D."""
     TABLE = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
     dec   = {c: i for i, c in enumerate(TABLE)}
 
@@ -352,13 +352,17 @@ def _decode_here_polyline(encoded):
         return (~r >> 1) if (r & 1) else (r >> 1), i
 
     idx = 0
-    _, idx  = _uint(encoded, idx)           # version
-    hdr, idx = _uint(encoded, idx)
-    factor   = 10 ** (hdr & 0xF)
+    _, idx    = _uint(encoded, idx)          # version
+    hdr, idx  = _uint(encoded, idx)          # header
+    factor    = 10 ** (hdr & 0xF)            # lat/lng precision (bits 0-3)
+    third_dim = (hdr >> 4) & 0x7             # 3D type: 0=absent, else altitude/elevation/etc.
+
     coords, lat, lng = [], 0, 0
     while idx < len(encoded):
         dlat, idx = _sint(encoded, idx)
         dlng, idx = _sint(encoded, idx)
+        if third_dim:                        # consume altitude delta to keep pointer in sync
+            _, idx = _sint(encoded, idx)
         lat += dlat; lng += dlng
         coords.append((lat / factor, lng / factor))
     return coords
@@ -371,6 +375,9 @@ def fetch_here_route(waypoints):
         return None, None, None
     origin = f"{waypoints[0][1]},{waypoints[0][0]}"
     dest   = f"{waypoints[-1][1]},{waypoints[-1][0]}"
+    # HERE v8 expects repeated `via=lat,lng` query params, NOT `via[0]=…`.
+    # Passing a list makes `requests` emit: &via=lat1,lng1&via=lat2,lng2
+    via_list = [f"{lat},{lng}" for lng, lat in waypoints[1:-1]]
     params = {
         "apiKey":        HERE_API_KEY,
         "transportMode": "car",
@@ -380,9 +387,12 @@ def fetch_here_route(waypoints):
         "destination":   dest,
         "return":        "polyline,summary",
     }
-    for i, (lng, lat) in enumerate(waypoints[1:-1]):
-        params[f"via[{i}]"] = f"{lat},{lng}"
+    if via_list:
+        params["via"] = via_list
     try:
+        req = requests.Request("GET", "https://router.hereapi.com/v8/routes",
+                               params=params).prepare()
+        print(f"[HERE route] URL: {req.url[:300]}")
         resp = requests.get("https://router.hereapi.com/v8/routes",
                             params=params, timeout=20)
         if resp.status_code != 200:
@@ -392,14 +402,20 @@ def fetch_here_route(waypoints):
         if not routes:
             print("[HERE route] no routes returned")
             return None, None, None
-        # Concatenate geometry from ALL sections (one per leg between stops)
+        # Concatenate geometry from ALL sections (one per leg between stops).
+        # Adjacent sections share an endpoint (junction stop), so skip the
+        # duplicate first point on every section after the first.
         geom, dist_km, dur_min = [], 0.0, 0.0
         for section in routes[0]["sections"]:
-            summary  = section.get("summary", {})
-            dist_km += summary.get("length",   0) / 1000.0
-            dur_min += summary.get("duration", 0) / 60.0
-            pts      = _decode_here_polyline(section["polyline"])
-            geom    += [(p[1], p[0]) for p in pts]
+            summary   = section.get("summary", {})
+            dist_km  += summary.get("length",   0) / 1000.0
+            dur_min  += summary.get("duration", 0) / 60.0
+            raw_poly  = section.get("polyline")
+            if not raw_poly:
+                continue
+            pts  = _decode_here_polyline(raw_poly)
+            pts  = pts[1:] if geom else pts   # drop duplicate junction point
+            geom += [(p[1], p[0]) for p in pts]
         if not geom:
             print("[HERE route] empty geometry after decoding")
             return None, None, None
