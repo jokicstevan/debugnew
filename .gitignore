@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.env
+venv/
+.venv/
+
+# App runtime folders (created automatically on startup)
+uploads/
+reports/
+
+# OS
+.DS_Store
+Thumbs.db

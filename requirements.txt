@@ -1,0 +1,7 @@
+flask>=3.0
+requests>=2.31
+numpy>=1.24
+reportlab>=4.0
+openpyxl>=3.1
+alns>=0.3
+gunicorn>=21.2

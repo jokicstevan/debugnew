@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: grps-routing
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --workers 2 --timeout 120 --bind 0.0.0.0:$PORT
+    envVars:
+      - key: SECRET_KEY
+        generateValue: true        # Render auto-generates a secure random value
+      - key: HERE_API_KEY
+        sync: false                # Get your free key at developer.here.com
+      - key: APP_USER
+        value: admin               # Change this to your preferred username
+      - key: APP_PASS
+        sync: false                # Render will prompt you to set this secretly
+      - key: APP_USER2
+        value: dispatcher
+      - key: APP_PASS2
+        sync: false                # Render will prompt you to set this secretly
