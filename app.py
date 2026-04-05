@@ -366,14 +366,14 @@ def _decode_here_polyline(encoded):
 
 def fetch_here_route(waypoints):
     """Fetch road geometry from HERE Router v8 (live traffic).
-    waypoints: list of (lng, lat).  Returns (geom, dist_km, dur_min) or (None,None,None)."""
+    Concatenates all sections so multi-stop routes display correctly on the map."""
     if not HERE_API_KEY:
         return None, None, None
     origin = f"{waypoints[0][1]},{waypoints[0][0]}"
     dest   = f"{waypoints[-1][1]},{waypoints[-1][0]}"
     params = {
         "apiKey":        HERE_API_KEY,
-        "transportMode": "car",          # 'truck' requires paid tier
+        "transportMode": "car",
         "routingMode":   "fast",
         "departureTime": _here_departure_time(),
         "origin":        origin,
@@ -386,18 +386,27 @@ def fetch_here_route(waypoints):
         resp = requests.get("https://router.hereapi.com/v8/routes",
                             params=params, timeout=20)
         if resp.status_code != 200:
+            print(f"[HERE route] failed: {resp.status_code} {resp.text[:200]}")
             return None, None, None
         routes = resp.json().get("routes", [])
         if not routes:
+            print("[HERE route] no routes returned")
             return None, None, None
-        section  = routes[0]["sections"][0]
-        summary  = section["summary"]
-        dist_km  = summary["length"]   / 1000.0
-        dur_min  = summary["duration"] / 60.0
-        pts      = _decode_here_polyline(section["polyline"])
-        geom     = [(p[1], p[0]) for p in pts]   # (lng, lat)
+        # Concatenate geometry from ALL sections (one per leg between stops)
+        geom, dist_km, dur_min = [], 0.0, 0.0
+        for section in routes[0]["sections"]:
+            summary  = section.get("summary", {})
+            dist_km += summary.get("length",   0) / 1000.0
+            dur_min += summary.get("duration", 0) / 60.0
+            pts      = _decode_here_polyline(section["polyline"])
+            geom    += [(p[1], p[0]) for p in pts]
+        if not geom:
+            print("[HERE route] empty geometry after decoding")
+            return None, None, None
+        print(f"[HERE route] OK {len(geom)} pts {dist_km:.1f}km {dur_min:.1f}min")
         return geom, dist_km, dur_min
-    except Exception:
+    except Exception as e:
+        print(f"[HERE route] exception: {e}")
         return None, None, None
 
 
@@ -504,13 +513,14 @@ def fetch_best_matrix(locations):
 
 
 def fetch_best_route(waypoints):
-    """Try HERE (live traffic) → OSRM → straight-line. Returns (geom, dist, dur, source)."""
+    """Fetch road geometry for map display.
+    Uses HERE route geometry (exact roads HERE calculated) when key is set,
+    falls back to OSRM, then straight-line."""
     if HERE_API_KEY:
         g, d, t = fetch_here_route(waypoints)
         if g:
             return g, d, t, "here"
     g, d, t = fetch_osrm_route(waypoints)
-    # detect if osrm fell back to straight-line internally
     sl_g, sl_d, sl_t = straight_line_geometry(waypoints)
     src = "haversine" if (g == sl_g) else "osrm"
     return g, d, t, src
@@ -1495,7 +1505,7 @@ def optimize():
         total_wage_cost_rsd = sum(vr["wage_cost_rsd"] for vr in vehicle_routes)
         total_cost_rsd      = total_fuel_cost_rsd + total_wage_cost_rsd
         matrix_msg = {
-            "here":      "live traffic (HERE Routing API)",
+            "here":      "live traffic (HERE) — routes & map display",
             "osrm":      "road distances (OSRM, no live traffic)",
             "haversine": "straight-line estimates (all routers unavailable)",
         }.get(matrix_source, matrix_source)

@@ -565,7 +565,7 @@ async function runOptimize() {
     }
 
     const srcBadges = {
-      here:      { label: '🟢 Live traffic (HERE)', color: '#22c55e' },
+      here:      { label: '🟢 Live traffic (HERE) — routes & map display', color: '#22c55e' },
       osrm:      { label: '🔵 Road distances (OSRM)', color: '#3b82f6' },
       haversine: { label: '🟠 Straight-line estimate', color: '#f97316' },
     };
