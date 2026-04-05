@@ -357,12 +357,12 @@ def fetch_here_matrix(locations):
             print(f"[HERE matrix] resultUrl={result_url}")
 
             matrix = None
+            auth_header = {"Authorization": f"Bearer {HERE_API_KEY}"}
             for attempt in range(30):   # up to ~45 seconds
                 time.sleep(1.5)
 
-                # Poll status
-                poll = requests.get(status_url,
-                                    params={"apiKey": HERE_API_KEY}, timeout=15)
+                # Poll status using Bearer auth (aws subdomain requires header, not query param)
+                poll = requests.get(status_url, headers=auth_header, timeout=15)
                 print(f"[HERE matrix] poll {attempt+1}: status={poll.status_code} body={poll.text[:200]}")
 
                 if poll.status_code == 200:
@@ -371,8 +371,7 @@ def fetch_here_matrix(locations):
 
                     if state == "completed":
                         # Fetch the actual result
-                        res = requests.get(result_url,
-                                           params={"apiKey": HERE_API_KEY}, timeout=15)
+                        res = requests.get(result_url, headers=auth_header, timeout=15)
                         print(f"[HERE matrix] result fetch: {res.status_code} {res.text[:200]}")
                         if res.status_code == 200:
                             res_data = res.json()
@@ -389,8 +388,7 @@ def fetch_here_matrix(locations):
                 elif poll.status_code == 303:
                     # Some HERE responses use 303 redirect to result
                     result_url = poll.headers.get("Location", result_url)
-                    res = requests.get(result_url,
-                                       params={"apiKey": HERE_API_KEY}, timeout=15)
+                    res = requests.get(result_url, headers=auth_header, timeout=15)
                     print(f"[HERE matrix] 303 redirect result: {res.status_code} {res.text[:200]}")
                     if res.status_code == 200:
                         res_data = res.json()
