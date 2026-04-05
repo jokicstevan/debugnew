@@ -108,6 +108,8 @@ def here_debug():
     except Exception as e:
         return jsonify({"exception": str(e)})
 
+
+@app.route("/api/status")
 def status():
     """Health-check endpoint — shows which routing services are configured and reachable."""
     import time as _time
