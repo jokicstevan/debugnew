@@ -81,6 +81,13 @@ def here_debug():
         "routingMode":      "fast",
         "transportMode":    "car",
         "matrixAttributes": ["travelTimes", "distances"],
+        "regionDefinition": {
+            "type":  "boundingBox",
+            "north": 44.83,
+            "south": 44.80,
+            "east":  20.47,
+            "west":  20.45,
+        },
     }
     try:
         resp = requests.post(
@@ -287,12 +294,26 @@ def fetch_here_matrix(locations):
         return None, None
     n = len(locations)
     origins = [{"lat": loc["lat"], "lng": loc["lng"]} for loc in locations]
+
+    # Compute bounding box of all locations + 20% padding for regionDefinition
+    lats = [loc["lat"] for loc in locations]
+    lngs = [loc["lng"] for loc in locations]
+    lat_pad = max(0.05, (max(lats) - min(lats)) * 0.2)
+    lng_pad = max(0.05, (max(lngs) - min(lngs)) * 0.2)
+
     payload = {
         "origins":          origins,
         "destinations":     origins,
         "routingMode":      "fast",
         "transportMode":    "car",
         "matrixAttributes": ["travelTimes", "distances"],
+        "regionDefinition": {
+            "type": "boundingBox",
+            "north": max(lats) + lat_pad,
+            "south": min(lats) - lat_pad,
+            "east":  max(lngs) + lng_pad,
+            "west":  min(lngs) - lng_pad,
+        },
     }
     try:
         # Step 1: submit async job
