@@ -717,44 +717,6 @@ function drawResults(data) {
     `${data.total_time_h}h${data.total_time_m}m`;
   document.getElementById('r-pkgs').textContent = (data.total_volume ?? data.total_packages ?? 0).toFixed(2) + ' m³';
   document.getElementById('r-vehs').textContent = data.vehicle_routes.length;
-
-  // ── Fleet-wide capacity utilisation ──────────────────────────────────────
-  const routes = data.vehicle_routes || [];
-  const totalVolUsed = routes.reduce((s, vr) => s + (vr.volume_used  ?? 0), 0);
-  const totalVolCap  = routes.reduce((s, vr) => s + (vr.volume_capacity ?? 0), 0);
-  const totalWtUsed  = routes.reduce((s, vr) => s + (vr.weight_used  ?? 0), 0);
-  const totalWtCap   = routes.reduce((s, vr) => s + (vr.weight_capacity ?? 0), 0);
-
-  function pctColor(pct) {
-    if (pct >= 90) return '#ef4444';   // red   — very full
-    if (pct >= 70) return '#f97316';   // orange — high
-    if (pct >= 40) return '#22c55e';   // green  — healthy
-    return 'var(--muted)';             // grey   — low utilisation
-  }
-
-  const volPctEl = document.getElementById('r-vol-pct');
-  if (volPctEl) {
-    if (totalVolCap > 0) {
-      const pct = Math.round(totalVolUsed / totalVolCap * 100);
-      volPctEl.textContent = pct + '%';
-      volPctEl.style.color = pctColor(pct);
-      volPctEl.title = `${totalVolUsed.toFixed(2)} m³ used of ${totalVolCap.toFixed(1)} m³ total capacity`;
-    } else {
-      volPctEl.textContent = '—';
-    }
-  }
-
-  const wtPctEl = document.getElementById('r-wt-pct');
-  if (wtPctEl) {
-    if (totalWtCap > 0) {
-      const pct = Math.round(totalWtUsed / totalWtCap * 100);
-      wtPctEl.textContent = pct + '%';
-      wtPctEl.style.color = pctColor(pct);
-      wtPctEl.title = `${totalWtUsed.toFixed(0)} kg used of ${totalWtCap.toLocaleString()} kg total capacity`;
-    } else {
-      wtPctEl.textContent = '—';
-    }
-  }
   document.getElementById('r-fuel-cost').textContent = (data.total_fuel_cost_rsd ?? 0).toLocaleString();
   document.getElementById('r-wage-cost').textContent = (data.total_wage_cost_rsd ?? 0).toLocaleString();
   document.getElementById('r-total-cost').textContent = (data.total_cost_rsd ?? 0).toLocaleString();
@@ -841,10 +803,6 @@ function resetResults() {
   document.getElementById('legend-rows').innerHTML = '';
   document.getElementById('simulate-btn').disabled = true;
   document.getElementById('pdf-btn').disabled = true;
-  ['r-vol-pct','r-wt-pct'].forEach(id => {
-    const el = document.getElementById(id);
-    if (el) { el.textContent = '—'; el.style.color = ''; }
-  });
   state.lastResult = null;
 }
 

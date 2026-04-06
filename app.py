@@ -335,7 +335,7 @@ def fetch_here_matrix(locations):
 
 
 def _decode_here_polyline(encoded):
-    """Decode HERE flexible-polyline → list of (lat, lng). Handles 2D and 3D."""
+    """Decode HERE flexible-polyline → list of (lat, lng)."""
     TABLE = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
     dec   = {c: i for i, c in enumerate(TABLE)}
 
@@ -352,17 +352,13 @@ def _decode_here_polyline(encoded):
         return (~r >> 1) if (r & 1) else (r >> 1), i
 
     idx = 0
-    _, idx    = _uint(encoded, idx)          # version
-    hdr, idx  = _uint(encoded, idx)          # header
-    factor    = 10 ** (hdr & 0xF)            # lat/lng precision (bits 0-3)
-    third_dim = (hdr >> 4) & 0x7             # 3D type: 0=absent, else altitude/elevation/etc.
-
+    _, idx  = _uint(encoded, idx)           # version
+    hdr, idx = _uint(encoded, idx)
+    factor   = 10 ** (hdr & 0xF)
     coords, lat, lng = [], 0, 0
     while idx < len(encoded):
         dlat, idx = _sint(encoded, idx)
         dlng, idx = _sint(encoded, idx)
-        if third_dim:                        # consume altitude delta to keep pointer in sync
-            _, idx = _sint(encoded, idx)
         lat += dlat; lng += dlng
         coords.append((lat / factor, lng / factor))
     return coords
@@ -375,9 +371,6 @@ def fetch_here_route(waypoints):
         return None, None, None
     origin = f"{waypoints[0][1]},{waypoints[0][0]}"
     dest   = f"{waypoints[-1][1]},{waypoints[-1][0]}"
-    # HERE v8 expects repeated `via=lat,lng` query params, NOT `via[0]=…`.
-    # Passing a list makes `requests` emit: &via=lat1,lng1&via=lat2,lng2
-    via_list = [f"{lat},{lng}" for lng, lat in waypoints[1:-1]]
     params = {
         "apiKey":        HERE_API_KEY,
         "transportMode": "car",
@@ -387,12 +380,9 @@ def fetch_here_route(waypoints):
         "destination":   dest,
         "return":        "polyline,summary",
     }
-    if via_list:
-        params["via"] = via_list
+    for i, (lng, lat) in enumerate(waypoints[1:-1]):
+        params[f"via[{i}]"] = f"{lat},{lng}"
     try:
-        req = requests.Request("GET", "https://router.hereapi.com/v8/routes",
-                               params=params).prepare()
-        print(f"[HERE route] URL: {req.url[:300]}")
         resp = requests.get("https://router.hereapi.com/v8/routes",
                             params=params, timeout=20)
         if resp.status_code != 200:
@@ -402,20 +392,14 @@ def fetch_here_route(waypoints):
         if not routes:
             print("[HERE route] no routes returned")
             return None, None, None
-        # Concatenate geometry from ALL sections (one per leg between stops).
-        # Adjacent sections share an endpoint (junction stop), so skip the
-        # duplicate first point on every section after the first.
+        # Concatenate geometry from ALL sections (one per leg between stops)
         geom, dist_km, dur_min = [], 0.0, 0.0
         for section in routes[0]["sections"]:
-            summary   = section.get("summary", {})
-            dist_km  += summary.get("length",   0) / 1000.0
-            dur_min  += summary.get("duration", 0) / 60.0
-            raw_poly  = section.get("polyline")
-            if not raw_poly:
-                continue
-            pts  = _decode_here_polyline(raw_poly)
-            pts  = pts[1:] if geom else pts   # drop duplicate junction point
-            geom += [(p[1], p[0]) for p in pts]
+            summary  = section.get("summary", {})
+            dist_km += summary.get("length",   0) / 1000.0
+            dur_min += summary.get("duration", 0) / 60.0
+            pts      = _decode_here_polyline(section["polyline"])
+            geom    += [(p[1], p[0]) for p in pts]
         if not geom:
             print("[HERE route] empty geometry after decoding")
             return None, None, None
@@ -1614,6 +1598,86 @@ def generate_pdf():
     ]))
     story.append(t); story.append(Spacer(1,10))
 
+    # Capacity utilisation per vehicle
+    story.append(Paragraph("Capacity Utilisation", styles["Sec"]))
+    cap_data = [["Vehicle", "Vol Used", "Vol Cap", "Vol %", "Wt Used", "Wt Cap", "Wt %"]]
+    for vr in data.get("vehicle_routes", []):
+        vol_used = float(vr.get("volume_used", vr.get("packages", 0)))
+        vol_cap  = float(vr.get("volume_capacity", vr.get("capacity", 0)) or 0)
+        wt_used  = float(vr.get("weight_used", 0))
+        wt_cap   = float(vr.get("weight_capacity", 0))
+
+        vol_pct  = f"{vol_used/vol_cap*100:.1f}%" if vol_cap > 0 else "—"
+        wt_pct   = f"{wt_used/wt_cap*100:.1f}%"  if wt_cap  > 0 else "Unl."
+        wt_cap_s = f"{wt_cap:.0f} kg"             if wt_cap  > 0 else "Unlimited"
+
+        # Colour-code percentage: green <70%, orange 70-90%, red >90%
+        def pct_color(pct_str):
+            try:
+                v = float(pct_str.replace("%",""))
+                if v >= 90: return rl_colors.HexColor("#e74c3c")
+                if v >= 70: return rl_colors.HexColor("#f39c12")
+                return rl_colors.HexColor("#27ae60")
+            except Exception:
+                return rl_colors.HexColor("#7f8c8d")
+
+        cap_data.append([
+            f"{vr['type']} #{vr['vehicle_id']+1}",
+            f"{vol_used:.3f} m³",
+            f"{vol_cap:.2f} m³",
+            vol_pct,
+            f"{wt_used:.0f} kg",
+            wt_cap_s,
+            wt_pct,
+        ])
+
+    cap_t = Table(cap_data, colWidths=[95, 55, 55, 38, 52, 62, 38])
+    cap_style = [
+        ("FONTSIZE",  (0,0), (-1,-1), 8.5),
+        ("BACKGROUND",(0,0), (-1,0),  rl_colors.HexColor("#2c3e50")),
+        ("TEXTCOLOR", (0,0), (-1,0),  rl_colors.white),
+        ("FONTNAME",  (0,0), (-1,0),  "Helvetica-Bold"),
+        ("FONTNAME",  (0,1), (0,-1),  "Helvetica-Bold"),
+        ("GRID",      (0,0), (-1,-1), 0.5, rl_colors.grey),
+        ("ALIGN",     (1,1), (-1,-1), "CENTER"),
+        ("ROWBACKGROUNDS",(0,1),(-1,-1),
+         [rl_colors.white, rl_colors.HexColor("#f5f5f5")]),
+    ]
+    # Colour-code vol% column (col 3) and wt% column (col 6)
+    for row_i, vr in enumerate(data.get("vehicle_routes", []), start=1):
+        vol_used = float(vr.get("volume_used", 0))
+        vol_cap  = float(vr.get("volume_capacity", vr.get("capacity", 0)) or 0)
+        wt_used  = float(vr.get("weight_used", 0))
+        wt_cap   = float(vr.get("weight_capacity", 0))
+        for col_i, used, cap in [(3, vol_used, vol_cap), (6, wt_used, wt_cap)]:
+            if cap > 0:
+                pct = used / cap * 100
+                if pct >= 90:
+                    c = rl_colors.HexColor("#fadbd8")
+                elif pct >= 70:
+                    c = rl_colors.HexColor("#fdebd0")
+                else:
+                    c = rl_colors.HexColor("#d5f5e3")
+                cap_style.append(("BACKGROUND", (col_i, row_i), (col_i, row_i), c))
+                cap_style.append(("FONTNAME",   (col_i, row_i), (col_i, row_i), "Helvetica-Bold"))
+    cap_t.setStyle(TableStyle(cap_style))
+    story.append(cap_t)
+    story.append(Spacer(1, 6))
+    # Legend
+    legend_items = [
+        ("🟩 < 70%", "#d5f5e3"), ("🟧 70–90%", "#fdebd0"), ("🟥 ≥ 90%", "#fadbd8")
+    ]
+    legend_para = "  ".join(
+        f'<font color="{c}">■</font> {label}' for label, c in legend_items
+    )
+    story.append(Paragraph(
+        "<font size='8'>Utilisation colour: &nbsp;"
+        "<font color='#27ae60'>■</font> &lt;70% &nbsp;"
+        "<font color='#f39c12'>■</font> 70–90% &nbsp;"
+        "<font color='#e74c3c'>■</font> ≥90%</font>",
+        styles["Info"]))
+    story.append(Spacer(1, 10))
+
     # Fleet
     story.append(Paragraph("Fleet Configuration", styles["Sec"]))
     fleet_data = [["Vehicle Type","Count","Vol. Cap. (m³)","Weight Cap. (kg)","Fuel (L/100km)"]]
@@ -1667,12 +1731,17 @@ def generate_pdf():
         )
         vol_used = vr.get("volume_used", vr.get("packages", 0))
         vol_cap  = vr.get("volume_capacity", vr.get("capacity", "?"))
+        vol_pct  = f" ({float(vol_used)/float(vol_cap)*100:.0f}%)" if vol_cap and str(vol_cap) != "?" and float(vol_cap) > 0 else ""
+        wt_used  = float(vr.get("weight_used", 0))
+        wt_cap   = float(vr.get("weight_capacity", 0))
+        wt_str   = f"{wt_used:.0f}/{'Unl.' if not wt_cap else str(int(wt_cap))+'kg'}"
+        wt_pct   = f" ({wt_used/wt_cap*100:.0f}%)" if wt_cap > 0 else ""
         story.append(Paragraph(
             f"{vr['type']} #{vr['vehicle_id']+1} — "
             f"Departs {vr.get('departure_time','?')} · Returns {vr.get('return_time','?')} · "
             f"{vr.get('working_hours',0):.1f}h worked · "
-            f"{vr['num_customers']} stops · {float(vol_used):.2f}/{float(vol_cap):.1f} m\u00b3 · "
-            f"{float(vr.get('weight_used',0)):.0f}/{'Unl.' if not vr.get('weight_capacity') else str(int(vr['weight_capacity']))+'kg'} kg · "
+            f"{vr['num_customers']} stops · {float(vol_used):.2f}/{float(vol_cap):.1f} m\u00b3{vol_pct} · "
+            f"{wt_str} kg{wt_pct} · "
             f"{vr['distance']:.1f} km · {vr.get('effective_fuel_consumption', vr.get('fuel_consumption',10)):.1f} L/100km · {vr.get('fuel_used',0):.2f} L · "
             f"Fuel {vr.get('fuel_cost_rsd',0):,} RSD · Wages {vr.get('wage_cost_rsd',0):,} RSD · "
             f"Total {vr.get('total_cost_rsd',0):,} RSD",
