@@ -31,7 +31,6 @@
     overflow: hidden;
   }
 
-  /* grid bg */
   body::before {
     content: '';
     position: fixed; inset: 0;
@@ -42,141 +41,112 @@
     pointer-events: none;
   }
 
-  .login-wrap {
-    width: 380px;
-    animation: fadeUp .5s ease both;
-  }
+  .login-wrap { width: 380px; animation: fadeUp .5s ease both; }
 
   @keyframes fadeUp {
     from { opacity:0; transform:translateY(24px); }
     to   { opacity:1; transform:translateY(0); }
   }
 
-  .logo {
-    text-align: center;
-    margin-bottom: 36px;
-  }
+  .logo { text-align: center; margin-bottom: 36px; }
   .logo-mark {
     display: inline-block;
     font-family: 'Syne', sans-serif;
-    font-size: 42px;
-    font-weight: 800;
-    letter-spacing: -2px;
-    color: var(--accent);
-    line-height: 1;
+    font-size: 42px; font-weight: 800;
+    letter-spacing: -2px; color: var(--accent); line-height: 1;
   }
-  .logo-sub {
-    font-size: 11px;
-    color: var(--muted);
-    letter-spacing: .18em;
-    text-transform: uppercase;
-    margin-top: 6px;
-  }
+  .logo-sub { font-size: 11px; color: var(--muted); letter-spacing: .18em; text-transform: uppercase; margin-top: 6px; }
 
-  .card {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 12px;
-    padding: 32px;
-  }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 32px; }
+  .card h2 { font-family: 'Syne', sans-serif; font-size: 18px; font-weight: 700; margin-bottom: 24px; color: var(--text); }
 
-  .card h2 {
-    font-family: 'Syne', sans-serif;
-    font-size: 18px;
-    font-weight: 700;
-    margin-bottom: 24px;
-    color: var(--text);
-  }
-
-  .field {
-    margin-bottom: 16px;
-  }
-  .field label {
-    display: block;
-    font-size: 11px;
-    color: var(--muted);
-    letter-spacing: .1em;
-    text-transform: uppercase;
-    margin-bottom: 6px;
-  }
+  .field { margin-bottom: 16px; }
+  .field label { display: block; font-size: 11px; color: var(--muted); letter-spacing: .1em; text-transform: uppercase; margin-bottom: 6px; }
   .field input {
-    width: 100%;
-    background: var(--bg);
-    border: 1px solid var(--border);
-    border-radius: 7px;
-    color: var(--text);
-    font-family: 'DM Mono', monospace;
-    font-size: 14px;
-    padding: 10px 14px;
-    outline: none;
-    transition: border-color .2s;
+    width: 100%; background: var(--bg); border: 1px solid var(--border);
+    border-radius: 7px; color: var(--text); font-family: 'DM Mono', monospace;
+    font-size: 14px; padding: 10px 14px; outline: none; transition: border-color .2s;
   }
-  .field input:focus {
-    border-color: var(--accent2);
-  }
+  .field input:focus { border-color: var(--accent2); }
 
   .error-msg {
-    background: rgba(231,76,60,.1);
-    border: 1px solid rgba(231,76,60,.3);
-    border-radius: 7px;
-    color: var(--danger);
-    font-size: 12px;
-    padding: 10px 14px;
-    margin-bottom: 16px;
+    background: rgba(231,76,60,.1); border: 1px solid rgba(231,76,60,.3);
+    border-radius: 7px; color: var(--danger); font-size: 12px;
+    padding: 10px 14px; margin-bottom: 16px;
   }
 
   .btn-login {
-    width: 100%;
-    background: var(--accent);
-    color: #0d1117;
-    border: none;
-    border-radius: 7px;
-    font-family: 'Syne', sans-serif;
-    font-size: 15px;
-    font-weight: 700;
-    padding: 12px;
-    cursor: pointer;
-    transition: opacity .2s, transform .1s;
-    margin-top: 8px;
+    width: 100%; background: var(--accent); color: #0d1117; border: none;
+    border-radius: 7px; font-family: 'Syne', sans-serif; font-size: 15px;
+    font-weight: 700; padding: 12px; cursor: pointer;
+    transition: opacity .2s, transform .1s; margin-top: 8px;
   }
   .btn-login:hover  { opacity: .88; }
   .btn-login:active { transform: scale(.98); }
 
-  .hint {
-    text-align: center;
-    font-size: 11px;
-    color: var(--muted);
-    margin-top: 20px;
+  .hint { text-align: center; font-size: 11px; color: var(--muted); margin-top: 20px; }
+  .hint code { color: var(--accent2); }
+
+  .lang-row { display:flex; justify-content:center; gap:8px; margin-bottom:18px; }
+  .lang-btn {
+    font-family: 'DM Mono', monospace; font-size: 11px;
+    padding: 4px 12px; border-radius: 4px;
+    border: 1px solid var(--border); background: var(--surface);
+    color: var(--muted); cursor: pointer; transition: all .15s;
   }
-  .hint code {
-    color: var(--accent2);
-  }
+  .lang-btn.active { background: var(--accent2); color: #fff; border-color: var(--accent2); }
+  .lang-btn:hover:not(.active) { color: var(--text); border-color: var(--text); }
 </style>
 </head>
 <body>
 <div class="login-wrap">
   <div class="logo">
     <div class="logo-mark">GRPS</div>
-    <div class="logo-sub">Global Route Planning System</div>
+    <div class="logo-sub" id="logo-sub">Global Route Planning System</div>
+  </div>
+  <div class="lang-row">
+    <button class="lang-btn active" data-lang="en" onclick="setLang('en')">EN</button>
+    <button class="lang-btn" data-lang="sr" onclick="setLang('sr')">SR</button>
   </div>
   <div class="card">
-    <h2>Sign in</h2>
+    <h2 id="signin-title">Sign in</h2>
     {% if error %}
     <div class="error-msg">{{ error }}</div>
     {% endif %}
     <form method="POST">
       <div class="field">
-        <label>Username</label>
+        <label id="label-user">Username</label>
         <input type="text" name="username" autocomplete="username" autofocus>
       </div>
       <div class="field">
-        <label>Password</label>
+        <label id="label-pass">Password</label>
         <input type="password" name="password" autocomplete="current-password">
       </div>
-      <button type="submit" class="btn-login">Sign in →</button>
+      <button type="submit" class="btn-login" id="btn-signin">Sign in →</button>
     </form>
   </div>
-  <div class="hint">Default: <code>admin</code> / <code>grps2024</code></div>
+  <div class="hint" id="hint-default">Default: <code>admin</code> / <code>grps2024</code></div>
 </div>
+<script>
+const LOGIN_I18N = {
+  en: { sub:'Global Route Planning System', title:'Sign in', user:'Username', pass:'Password', btn:'Sign in →', hint:'Default: ' },
+  sr: { sub:'Globalni sistem planiranja ruta', title:'Prijavite se', user:'Korisničko ime', pass:'Lozinka', btn:'Prijava →', hint:'Podrazumevano: ' }
+};
+let loginLang = localStorage.getItem('grps_lang') || 'en';
+function setLang(l) {
+  loginLang = l;
+  localStorage.setItem('grps_lang', l);
+  const s = LOGIN_I18N[l] || LOGIN_I18N.en;
+  document.getElementById('logo-sub').textContent = s.sub;
+  document.getElementById('signin-title').textContent = s.title;
+  document.getElementById('label-user').textContent = s.user;
+  document.getElementById('label-pass').textContent = s.pass;
+  document.getElementById('btn-signin').textContent = s.btn;
+  document.getElementById('hint-default').innerHTML = s.hint + '<code>admin</code> / <code>grps2024</code>';
+  document.querySelectorAll('.lang-btn').forEach(b => b.classList.toggle('active', b.dataset.lang === l));
+  document.documentElement.lang = l;
+}
+setLang(loginLang);
+</script>
 </body>
 </html>

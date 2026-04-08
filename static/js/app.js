@@ -4,6 +4,321 @@
            OSRM routing, results panel, legend, route simulation, PDF, Excel.
 ══════════════════════════════════════════════════════════════════════════════ */
 
+// ─── I18N ─────────────────────────────────────────────────────────────────────
+const TRANSLATIONS = {
+  en: {
+    routePlanner: 'Route Planner',
+    signOut: 'Sign out',
+    locations: '📍 Locations',
+    addDepot: '+ Depot',
+    addCustomer: '+ Customer',
+    multiDepotHint: 'Multiple depots supported — optimizer picks best depot per vehicle',
+    type1qty: 'Type 1 (qty)',
+    type2qty: 'Type 2 (qty)',
+    type3qty: 'Type 3 (qty)',
+    volume: '📐 Volume',
+    unloading: 'Unloading (min)',
+    timeWindow: 'Time window',
+    searchAddress: 'Search address…',
+    go: 'Go',
+    orClickMap: 'or click the map to place a pin',
+    clearAll: 'Clear all',
+    importExcel: 'Import Excel',
+    fleet: '🚛 Fleet',
+    packageTypes: '📦 Package Types',
+    packageWeights: '⚖️ Package Weights',
+    type1m3: 'Type 1 (m³)',
+    type2m3: 'Type 2 (m³)',
+    type3m3: 'Type 3 (m³)',
+    type1kg: 'Type 1 (kg)',
+    type2kg: 'Type 2 (kg)',
+    type3kg: 'Type 3 (kg)',
+    algorithm: '⚙️ Algorithm',
+    method: 'Method',
+    iterations: 'Iterations',
+    temperature: 'Temperature',
+    hardConstraints: '🔒 Hard Constraints',
+    volumeCapacity: '📐 Volume capacity',
+    weightCapacity: '⚖️ Weight capacity',
+    constraintWarning: '⚠️ Disabling constraints may cause overloads',
+    useTimeWindows: '⏱ Use time windows',
+    unloadingHint: '⏱ Unloading time per customer is set individually (Excel or manual input)',
+    optimiseFor: '🎯 Optimise for',
+    fuelCost: '⛽ Fuel cost',
+    driverWages: '👷 Driver wages',
+    distance: '📏 Distance',
+    vehiclesUsed: '🚛 Vehicles used',
+    minimisingDefault: 'Minimising: fuel cost + driver wages',
+    findRoutes: '🚀 Find Optimal Routes',
+    results: '📊 Results',
+    litresFuel: 'litres ⛽',
+    time: 'time',
+    m3load: 'm³ load',
+    volFill: 'vol fill %',
+    wtFill: 'wt fill %',
+    vehicles: 'vehicles',
+    fuelCostRSD: 'fuel cost (RSD)',
+    wagesRSD: 'wages (RSD)',
+    totalCostRSD: 'total cost (RSD)',
+    osrmWarning: '⚠️ OSRM unavailable — distances are straight-line estimates',
+    runOptimizationHint: 'Run optimization to see results',
+    legend: '🗺 Legend',
+    toggleAll: '👁 Toggle all',
+    actions: 'Actions',
+    simSpeed: 'Sim speed',
+    slow: '🐢 Slow',
+    normal: '🚗 Normal',
+    fast: '🚀 Fast',
+    turbo: '⚡ Turbo',
+    simulateRoutes: '▶ Simulate Routes',
+    downloadPDF: '📄 Download PDF',
+    configureVehicle: 'Configure Vehicle',
+    count: 'Count',
+    capacityM3: 'Capacity (m³)',
+    weightCap: 'Weight cap (kg)',
+    fuel: 'Fuel (L/100km)',
+    cancel: 'Cancel',
+    apply: 'Apply',
+    excelPreview: 'Excel Import Preview',
+    geocodingHint: 'Customers will be geocoded after import. This may take a moment.',
+    excelColumns: 'Expected columns: Customer, Address, Packages#1, Packages#2, Packages#3, Time',
+    importAll: 'Import All',
+    searching: '🔍 Searching…',
+    found: '✅ Found',
+    parsingExcel: '📊 Parsing Excel…',
+    geocodingProgress: (i, n, name) => `🔍 Geocoding ${i+1}/${n}: ${name}…`,
+    importedCustomers: n => `✅ Imported ${n} customers`,
+    foundRows: n => `Found ${n} rows`,
+    outOfSerbia: '⚠️ Please place locations within Serbia',
+    mapNotLoaded: 'Map not loaded yet — please wait a moment and try again.',
+    addDepotFirst: 'Please add at least one depot first.',
+    addCustomerFirst: 'Please add at least one customer.',
+    optimizationError: 'Optimization error: ',
+    routesCalculated: '✅ Routes calculated',
+    phase1: 'Phase 1: fetching road distance matrix…',
+    phase1short: 'Phase 1: road matrix…',
+    phase2: 'Phase 2: optimizing routes…',
+    srcHere: '🟢 Live traffic (HERE) — routes & map display',
+    srcOsrm: '🔵 Road distances (OSRM)',
+    srcHaversine: '🟠 Straight-line estimate',
+    optimisedFor: 'Optimised for: ',
+    constraints: 'Constraints: ',
+    selectAtLeastOne: '⚠️ Select at least one — defaulting to fuel + wages',
+    minimising: 'Minimising: ',
+    capDisabled: (off, plural) => `⚠️ ${off} cap${plural} disabled — overloads allowed`,
+    totalType: (cnt, cap, wStr) => `Type total: ${cnt}m³${wStr}`,
+    unlimitedWeight: ' · unlimited weight',
+    fleetSummary: (vehs, plural, total) => `🚛 ${vehs} vehicle${plural} · Total capacity: ${total} m³`,
+    noVehicles: 'No vehicles configured — click a card',
+    configureDash: name => `Configure — ${name}`,
+    captureMaps: '📸 Capturing maps…',
+    captureVehicle: (i, n) => `📸 Vehicle ${i}/${n}…`,
+    buildingPDF: '📄 Building PDF…',
+    exportPDF: '📄 Export PDF',
+    pdfError: 'PDF error: ',
+    errorPrefix: 'Error: ',
+    objLabels: { fuel:'⛽ Fuel cost', wages:'👷 Wages', distance:'📏 Distance', vehicles:'🚛 Vehicles' },
+    owLabels: { fuel:'⛽ Fuel cost', wages:'👷 Wages', distance:'📏 Distance', vehicles:'🚛 Vehicles' },
+    srcBadges: {
+      here:      { label: '🟢 Live traffic (HERE) — routes & map display', color: '#22c55e' },
+      osrm:      { label: '🔵 Road distances (OSRM)', color: '#3b82f6' },
+      haversine: { label: '🟠 Straight-line estimate', color: '#f97316' },
+    },
+    language: 'Language',
+    langEn: 'English',
+    langSr: 'Srpski',
+    clickToConfigure: 'Click to configure',
+    fuelConsumption: 'Fuel consumption',
+    unservedWarning: (n, names) => `⚠️ ${n} customer(s) NOT served: ${names}`,
+    stopsLabel: n => `${n} stops`,
+    splitDelivery: (part, total) => `Split delivery: part ${part} of ${total}`,
+    minUnloading: min => `${min} min unloading`,
+    volLoad: 'Volumetric load / capacity',
+    weightLoad: eff => `Weight load / capacity (effective fuel: ${eff} L/100km)`,
+  },
+  sr: {
+    routePlanner: 'Planer ruta',
+    signOut: 'Odjavi se',
+    locations: '📍 Lokacije',
+    addDepot: '+ Depo',
+    addCustomer: '+ Mušterija',
+    multiDepotHint: 'Podržano više depoa — optimizator bira najbliži depo po vozilu',
+    type1qty: 'Tip 1 (kom)',
+    type2qty: 'Tip 2 (kom)',
+    type3qty: 'Tip 3 (kom)',
+    volume: '📐 Zapremina',
+    unloading: 'Istovar (min)',
+    timeWindow: 'Vremenski okvir',
+    searchAddress: 'Pretraži adresu…',
+    go: 'Idi',
+    orClickMap: 'ili klikni na mapu da postaviš pin',
+    clearAll: 'Obriši sve',
+    importExcel: 'Uvezi Excel',
+    fleet: '🚛 Vozni park',
+    packageTypes: '📦 Tipovi paketa',
+    packageWeights: '⚖️ Težine paketa',
+    type1m3: 'Tip 1 (m³)',
+    type2m3: 'Tip 2 (m³)',
+    type3m3: 'Tip 3 (m³)',
+    type1kg: 'Tip 1 (kg)',
+    type2kg: 'Tip 2 (kg)',
+    type3kg: 'Tip 3 (kg)',
+    algorithm: '⚙️ Algoritam',
+    method: 'Metod',
+    iterations: 'Iteracije',
+    temperature: 'Temperatura',
+    hardConstraints: '🔒 Tvrda ograničenja',
+    volumeCapacity: '📐 Kapacitet zapremine',
+    weightCapacity: '⚖️ Kapacitet težine',
+    constraintWarning: '⚠️ Isključivanje ograničenja može uzrokovati preopterećenja',
+    useTimeWindows: '⏱ Koristi vremenske okvire',
+    unloadingHint: '⏱ Vreme istovara po mušteriji se postavlja pojedinačno (Excel ili ručno)',
+    optimiseFor: '🎯 Optimizuj za',
+    fuelCost: '⛽ Troškovi goriva',
+    driverWages: '👷 Plate vozača',
+    distance: '📏 Rastojanje',
+    vehiclesUsed: '🚛 Broj vozila',
+    minimisingDefault: 'Minimizacija: troškovi goriva + plate',
+    findRoutes: '🚀 Pronađi optimalne rute',
+    results: '📊 Rezultati',
+    litresFuel: 'litara ⛽',
+    time: 'vreme',
+    m3load: 'm³ teret',
+    volFill: 'popunjenost vol %',
+    wtFill: 'popunjenost tež %',
+    vehicles: 'vozila',
+    fuelCostRSD: 'troškovi goriva (RSD)',
+    wagesRSD: 'plate (RSD)',
+    totalCostRSD: 'ukupni troškovi (RSD)',
+    osrmWarning: '⚠️ OSRM nedostupan — rastojanja su procenjena pravom linijom',
+    runOptimizationHint: 'Pokrenite optimizaciju da vidite rezultate',
+    legend: '🗺 Legenda',
+    toggleAll: '👁 Prikaži/sakrij sve',
+    actions: 'Akcije',
+    simSpeed: 'Brzina simulacije',
+    slow: '🐢 Sporo',
+    normal: '🚗 Normalno',
+    fast: '🚀 Brzo',
+    turbo: '⚡ Turbo',
+    simulateRoutes: '▶ Simuliraj rute',
+    downloadPDF: '📄 Preuzmi PDF',
+    configureVehicle: 'Podesi vozilo',
+    count: 'Broj',
+    capacityM3: 'Kapacitet (m³)',
+    weightCap: 'Kapacitet težine (kg)',
+    fuel: 'Gorivo (L/100km)',
+    cancel: 'Otkaži',
+    apply: 'Primeni',
+    excelPreview: 'Pregled Excel uvoza',
+    geocodingHint: 'Mušterije će biti geokodirane nakon uvoza. Ovo može potrajati.',
+    excelColumns: 'Očekivane kolone: Customer, Address, Packages#1, Packages#2, Packages#3, Time',
+    importAll: 'Uvezi sve',
+    searching: '🔍 Pretraga…',
+    found: '✅ Pronađeno',
+    parsingExcel: '📊 Obrada Excel fajla…',
+    geocodingProgress: (i, n, name) => `🔍 Geokodiranje ${i+1}/${n}: ${name}…`,
+    importedCustomers: n => `✅ Uvezeno ${n} mušterija`,
+    foundRows: n => `Pronađeno ${n} redova`,
+    outOfSerbia: '⚠️ Molimo postavite lokacije unutar Srbije',
+    mapNotLoaded: 'Mapa nije učitana — molimo sačekajte trenutak i pokušajte ponovo.',
+    addDepotFirst: 'Molimo dodajte barem jedan depo.',
+    addCustomerFirst: 'Molimo dodajte barem jednu mušteriju.',
+    optimizationError: 'Greška optimizacije: ',
+    routesCalculated: '✅ Rute izračunate',
+    phase1: 'Faza 1: preuzimanje matrice putnih rastojanja…',
+    phase1short: 'Faza 1: matrica puteva…',
+    phase2: 'Faza 2: optimizacija ruta…',
+    srcHere: '🟢 Saobraćaj uživo (HERE) — rute i prikaz mape',
+    srcOsrm: '🔵 Putna rastojanja (OSRM)',
+    srcHaversine: '🟠 Procena pravom linijom',
+    optimisedFor: 'Optimizovano za: ',
+    constraints: 'Ograničenja: ',
+    selectAtLeastOne: '⚠️ Izaberite barem jedno — podrazumevano gorivo + plate',
+    minimising: 'Minimizacija: ',
+    capDisabled: (off, plural) => `⚠️ ${off} ogr${plural} isključeno — preopterećenja dozvoljena`,
+    totalType: (cnt, cap, wStr) => `Ukupno tipa: ${cnt}m³${wStr}`,
+    unlimitedWeight: ' · neograničena težina',
+    fleetSummary: (vehs, plural, total) => `🚛 ${vehs} vozilo${plural} · Ukupni kapacitet: ${total} m³`,
+    noVehicles: 'Nema podešenih vozila — kliknite na karticu',
+    configureDash: name => `Podesi — ${name}`,
+    captureMaps: '📸 Snimanje mapa…',
+    captureVehicle: (i, n) => `📸 Vozilo ${i}/${n}…`,
+    buildingPDF: '📄 Generisanje PDF-a…',
+    exportPDF: '📄 Izvezi PDF',
+    pdfError: 'Greška PDF-a: ',
+    errorPrefix: 'Greška: ',
+    objLabels: { fuel:'⛽ Troškovi goriva', wages:'👷 Plate', distance:'📏 Rastojanje', vehicles:'🚛 Vozila' },
+    owLabels: { fuel:'⛽ Troškovi goriva', wages:'👷 Plate', distance:'📏 Rastojanje', vehicles:'🚛 Vozila' },
+    srcBadges: {
+      here:      { label: '🟢 Saobraćaj uživo (HERE) — rute i prikaz mape', color: '#22c55e' },
+      osrm:      { label: '🔵 Putna rastojanja (OSRM)', color: '#3b82f6' },
+      haversine: { label: '🟠 Procena pravom linijom', color: '#f97316' },
+    },
+    language: 'Jezik',
+    langEn: 'English',
+    langSr: 'Srpski',
+    clickToConfigure: 'Kliknite za podešavanje',
+    fuelConsumption: 'Potrošnja goriva',
+    unservedWarning: (n, names) => `⚠️ ${n} mušterija nije opsluž.: ${names}`,
+    stopsLabel: n => `${n} stanica`,
+    splitDelivery: (part, total) => `Podeljena isporuka: deo ${part} od ${total}`,
+    minUnloading: min => `${min} min istovar`,
+    volLoad: 'Zapreminski teret / kapacitet',
+    weightLoad: eff => `Težinski teret / kapacitet (efektivna potrošnja: ${eff} L/100km)`,
+  }
+};
+
+let currentLang = localStorage.getItem('grps_lang') || 'en';
+function t(key) { return TRANSLATIONS[currentLang][key] ?? TRANSLATIONS['en'][key] ?? key; }
+
+function setLanguage(lang) {
+  currentLang = lang;
+  localStorage.setItem('grps_lang', lang);
+  applyLanguage();
+}
+
+function applyLanguage() {
+  // Update <html lang>
+  document.documentElement.lang = currentLang;
+
+  // Update all data-i18n elements in HTML
+  document.querySelectorAll('[data-i18n]').forEach(el => {
+    const key = el.getAttribute('data-i18n');
+    const attr = el.getAttribute('data-i18n-attr');
+    const val = t(key);
+    if (attr) el.setAttribute(attr, val);
+    else el.textContent = val;
+  });
+
+  // Update language toggle button state
+  document.querySelectorAll('.lang-btn').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.lang === currentLang);
+  });
+
+  // Re-render dynamic elements that build their own HTML
+  renderFleetCards();
+  updateFleetFooter();
+  updateObjHint();
+  updateConstraintHint();
+
+  // Update results placeholder if visible
+  const ph = document.getElementById('results-placeholder');
+  if (ph && !ph.classList.contains('hidden')) ph.textContent = t('runOptimizationHint');
+
+  // Update OSRM warning text
+  const mw = document.getElementById('matrix-warning');
+  if (mw) mw.innerHTML = t('osrmWarning');
+
+  // Update address input placeholder
+  const ai = document.getElementById('address-input');
+  if (ai) ai.placeholder = t('searchAddress');
+
+  // Re-draw results if we have them
+  if (state && state.lastResult) {
+    drawResults(state.lastResult);
+  }
+}
+
 // ─── STATE ────────────────────────────────────────────────────────────────────
 const state = {
   depots: [],       // multi-depot: array of {lat,lng,name,time_window}
@@ -38,10 +353,10 @@ let map;
 window.addEventListener('DOMContentLoaded', () => {
   map = L.map('map', {
     zoomControl: true,
-    minZoom: 11, maxZoom: 18,
-    maxBounds: [[44.55, 19.9], [45.1, 21.0]],
+    minZoom: 7, maxZoom: 18,
+    maxBounds: [[41.85, 18.8], [46.2, 23.0]],
     maxBoundsViscosity: 0.85
-  }).setView([44.8176, 20.4569], 13);
+  }).setView([44.0, 21.0], 8);
 
   const layers = {
     '🗺 Standard':  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
@@ -63,22 +378,25 @@ window.addEventListener('DOMContentLoaded', () => {
     document.getElementById('alns-opts').style.display =
       this.value.startsWith('Model 1') ? '' : 'none';
   });
+
+  // Apply saved language on load
+  applyLanguage();
 });
 
-// Belgrade bounding box — app only supports Belgrade, Serbia
-const BELGRADE_BBOX = { minLat:44.65, maxLat:44.95, minLng:20.20, maxLng:20.65 };
-function inBelgrade(lat, lng) {
-  return lat >= BELGRADE_BBOX.minLat && lat <= BELGRADE_BBOX.maxLat &&
-         lng >= BELGRADE_BBOX.minLng && lng <= BELGRADE_BBOX.maxLng;
+// Serbia bounding box
+const SERBIA_BBOX = { minLat:41.85, maxLat:46.2, minLng:18.8, maxLng:23.0 };
+function inSerbia(lat, lng) {
+  return lat >= SERBIA_BBOX.minLat && lat <= SERBIA_BBOX.maxLat &&
+         lng >= SERBIA_BBOX.minLng && lng <= SERBIA_BBOX.maxLng;
 }
 
 // ─── MAP CLICK ────────────────────────────────────────────────────────────────
 function onMapClick(e) {
   const { lat, lng } = e.latlng;
-  if (!inBelgrade(lat, lng)) {
+  if (!inSerbia(lat, lng)) {
     const st = document.getElementById('geocode-status');
-    st.textContent = '⚠️ Please place locations within Belgrade';
-    setTimeout(() => { if (st.textContent.includes('Belgrade')) st.textContent = ''; }, 3000);
+    st.textContent = t('outOfSerbia');
+    setTimeout(() => { st.textContent = ''; }, 3000);
     return;
   }
   if (state.mode === 'depot') {
@@ -111,7 +429,7 @@ function safeRemove(layer) {
 const DEPOT_COLOR = '#1a1a1a';  // all depots are black
 
 function placeDepot(lat, lng, name) {
-  if (typeof L === 'undefined') { alert('Map not loaded yet — please wait a moment and try again.'); return; }
+  if (typeof L === 'undefined') { alert(t('mapNotLoaded')); return; }
   const depotIdx = state.depots.length;
   const id = 'depot_' + depotIdx;
   const depotName = name || (depotIdx === 0 ? 'Depot' : `Depot ${depotIdx + 1}`);
@@ -143,7 +461,7 @@ function placeDepot(lat, lng, name) {
 }
 
 function placeCustomer(lat, lng, name, pkg_counts, time_window, unloading_time) {
-  if (typeof L === 'undefined') { alert('Map not loaded yet — please wait a moment and try again.'); return; }
+  if (typeof L === 'undefined') { alert(t('mapNotLoaded')); return; }
   const id = 'customer_' + Date.now() + '_' + state.customers.length;
   const num = state.customers.length + 1;
   const cname = name || `Customer ${num}`;
@@ -240,7 +558,7 @@ async function geocodeAddress() {
   const addr = document.getElementById('address-input').value.trim();
   if (!addr) return;
   const st = document.getElementById('geocode-status');
-  st.textContent = '🔍 Searching…';
+  st.textContent = t('searching');
   try {
     const res = await fetch('/api/geocode', {
       method:'POST', headers:{'Content-Type':'application/json'},
@@ -248,7 +566,7 @@ async function geocodeAddress() {
     });
     const data = await res.json();
     if (data.ok) {
-      st.textContent = '✅ Found';
+      st.textContent = t('found');
       if (state.mode === 'depot') {
         placeDepot(data.lat, data.lng, addr.split(',')[0].trim());
       } else {
@@ -320,13 +638,13 @@ async function importExcel(input) {
   const fd = new FormData();
   fd.append('file', file);
   const st = document.getElementById('geocode-status');
-  st.textContent = '📊 Parsing Excel…';
+  st.textContent = t('parsingExcel');
   try {
     const res = await fetch('/api/import_excel', { method:'POST', body: fd });
     const data = await res.json();
     input.value = '';
     if (!data.ok) { st.textContent = `❌ ${data.error}`; return; }
-    st.textContent = `Found ${data.rows.length} rows`;
+    st.textContent = t('foundRows')(data.rows.length);
     state.excelRows = data.rows;
     showExcelPreview(data.rows);
   } catch(e) {
@@ -381,7 +699,7 @@ async function confirmExcelImport() {
   let importedCount = 0;
   for (let i=0; i<rows.length; i++) {
     const r = rows[i];
-    st.textContent = `🔍 Geocoding ${i+1}/${rows.length}: ${r.name}…`;
+    st.textContent = t('geocodingProgress')(i, rows.length, r.name);
     try {
       const res = await fetch('/api/geocode', {
         method:'POST', headers:{'Content-Type':'application/json'},
@@ -397,7 +715,7 @@ async function confirmExcelImport() {
     await sleep(1100); // Nominatim rate limit
   }
   renumberCustomers();
-  st.textContent = `✅ Imported ${importedCount} customers`;
+  st.textContent = t('importedCustomers')(importedCount);
 }
 function closeExcelModal() { document.getElementById('excel-modal').classList.add('hidden'); }
 
@@ -405,13 +723,13 @@ function closeExcelModal() { document.getElementById('excel-modal').classList.ad
 function renderFleetCards() {
   const emojis = ['🚐','🚚','🚛','🏎','🚜','🚑'];
   let html = state.fleet.map((v,i) => `
-    <div class="fleet-card" onclick="openFleetModal(${i})" title="Click to configure">
+    <div class="fleet-card" onclick="openFleetModal(${i})" title="${t('clickToConfigure')}">
       <span class="fc-emoji">${v.emoji || emojis[i%emojis.length]}</span>
       <span class="fc-name">${esc(v.name)}</span>
       <span class="fc-count" style="color:${v.color}">×${v.count}</span>
       <span class="fc-cap">${v.capacity} m³</span>
-      <span class="fc-fuel" title="Fuel consumption">${v.fuel_consumption} L/100km</span>
-      <span class="fc-weight" title="Max payload weight">${v.weight_capacity > 0 ? v.weight_capacity + ' kg' : '∞ kg'}</span>
+      <span class="fc-fuel" title="${t('fuelConsumption')}">${v.fuel_consumption} L/100km</span>
+      <span class="fc-weight" title="${t('weightCapacity')}">${v.weight_capacity > 0 ? v.weight_capacity + ' kg' : '∞ kg'}</span>
     </div>`).join('');
   document.getElementById('fleet-cards').innerHTML = html;
 }
@@ -421,14 +739,14 @@ function updateFleetFooter() {
   const vehs  = state.fleet.reduce((s,v) => s + v.count, 0);
   const el    = document.getElementById('fleet-footer');
   el.textContent = total > 0
-    ? `🚛 ${vehs} vehicle${vehs!==1?'s':''} · Total capacity: ${total.toFixed(1)} m³`
-    : 'No vehicles configured — click a card';
+    ? t('fleetSummary')(vehs, vehs!==1?'s':'', total.toFixed(1))
+    : t('noVehicles');
 }
 
 function openFleetModal(idx) {
   state.editingFleetIdx = idx;
   const v = state.fleet[idx];
-  document.getElementById('modal-title').textContent = `Configure — ${v.name}`;
+  document.getElementById('modal-title').textContent = t('configureDash')(v.name);
   document.getElementById('modal-count').value      = v.count;
   document.getElementById('modal-cap').value        = v.capacity;
   document.getElementById('modal-weight-cap').value = v.weight_capacity ?? 0;
@@ -441,9 +759,9 @@ function updateModalHint() {
   const cnt  = parseFloat(document.getElementById('modal-count').value)||0;
   const cap  = parseFloat(document.getElementById('modal-cap').value)||0;
   const wCap = parseFloat(document.getElementById('modal-weight-cap')?.value)||0;
-  const wStr = wCap > 0 ? ` · ${(cnt*wCap).toLocaleString()} kg total` : ' · unlimited weight';
+  const wStr = wCap > 0 ? ` · ${(cnt*wCap).toLocaleString()} kg total` : t('unlimitedWeight');
   document.getElementById('modal-hint').textContent =
-    `Type total: ${(cnt*cap).toFixed(1)} m³${wStr}`;
+    t('totalType')((cnt*cap).toFixed(1), cap, wStr);
 }
 
 
@@ -475,22 +793,17 @@ function getObjWeights() {
 
 function updateObjHint() {
   const ow = getObjWeights();
-  const labels = {
-    fuel:     '⛽ fuel cost',
-    wages:    '👷 driver wages',
-    distance: '📏 distance',
-    vehicles: '🚛 vehicles used',
-  };
+  const labels = t('objLabels');
   const active = Object.entries(ow)
     .filter(([, v]) => v)
     .map(([k]) => labels[k]);
   const hint = document.getElementById('obj-hint');
   if (!hint) return;
   if (active.length === 0) {
-    hint.textContent = '⚠️ Select at least one — defaulting to fuel + wages';
+    hint.textContent = t('selectAtLeastOne');
     hint.style.color = '#e74c3c';
   } else {
-    hint.textContent = 'Minimising: ' + active.join(' + ');
+    hint.textContent = t('minimising') + active.join(' + ');
     hint.style.color = 'var(--accent)';
   }
 }
@@ -502,7 +815,7 @@ function updateConstraintHint() {
   if (!hint) return;
   if (!volOn || !wtOn) {
     const off = [!volOn && '📐 volume', !wtOn && '⚖️ weight'].filter(Boolean).join(' & ');
-    hint.textContent = `⚠️ ${off} cap${(!volOn && !wtOn) ? 's' : ''} disabled — overloads allowed`;
+    hint.textContent = t('capDisabled')(off, (!volOn && !wtOn) ? 's' : '');
     hint.style.color = '#e74c3c';
     hint.style.display = 'block';
   } else {
@@ -512,8 +825,8 @@ function updateConstraintHint() {
 
 // ─── OPTIMIZATION ────────────────────────────────────────────────────────────
 async function runOptimize() {
-  if (state.depots.length === 0) { alert('Please add at least one depot first.'); return; }
-  if (state.customers.length < 1) { alert('Please add at least one customer.'); return; }
+  if (state.depots.length === 0) { alert(t('addDepotFirst')); return; }
+  if (state.customers.length < 1) { alert(t('addCustomerFirst')); return; }
 
   clearRoutes();
   resetResults();
@@ -525,7 +838,7 @@ async function runOptimize() {
   if (routingBanner) routingBanner.style.display = 'none';
   btn.disabled = true;
   pw.classList.remove('hidden');
-  setProgress(10, 'Phase 1: fetching road distance matrix…');
+  setProgress(10, t('phase1'));
 
   const payload = {
     depots:    state.depots,
@@ -547,7 +860,7 @@ async function runOptimize() {
     let prog = 10;
     const ticker = setInterval(() => {
       prog = Math.min(prog + 3, 85);
-      setProgress(prog, prog < 40 ? 'Phase 1: road matrix…' : 'Phase 2: optimizing routes…');
+      setProgress(prog, prog < 40 ? t('phase1short') : t('phase2'));
     }, 800);
 
     const res = await fetch('/api/optimize', {
@@ -558,21 +871,17 @@ async function runOptimize() {
     const data = await res.json();
 
     if (!data.ok) {
-      alert('Optimization error: ' + (data.error||'Unknown'));
+      alert(t('optimizationError') + (data.error||'Unknown'));
       btn.disabled = false;
       pw.classList.add('hidden');
       return;
     }
 
-    const srcBadges = {
-      here:      { label: '🟢 Live traffic (HERE) — routes & map display', color: '#22c55e' },
-      osrm:      { label: '🔵 Road distances (OSRM)', color: '#3b82f6' },
-      haversine: { label: '🟠 Straight-line estimate', color: '#f97316' },
-    };
+    const srcBadges = t('srcBadges');
     const src     = data.matrix_source || 'osrm';
     const badge   = srcBadges[src] || srcBadges.osrm;
     const srcMsg  = data.matrix_msg ? ` · ${data.matrix_msg}` : '';
-    setProgress(100, `✅ Routes calculated${srcMsg}`);
+    setProgress(100, t('routesCalculated') + srcMsg);
 
     // Show routing source banner below the progress bar
     const routingBanner = document.getElementById('routing-source-banner');
@@ -590,7 +899,7 @@ async function runOptimize() {
     document.getElementById('simulate-btn').disabled = false;
     document.getElementById('pdf-btn').disabled = false;
   } catch(e) {
-    alert('Error: ' + e.message);
+    alert(t('errorPrefix') + e.message);
   } finally {
     btn.disabled = false;
     setTimeout(() => pw.classList.add('hidden'), 2000);
@@ -652,7 +961,7 @@ function drawRoutes(data) {
   const unserved = data.unserved_customers || [];
   if (unserved.length > 0) {
     const st = document.getElementById('geocode-status');
-    st.textContent = `⚠️ ${unserved.length} customer(s) NOT served: ${unserved.join(', ')}`;
+    st.textContent = t('unservedWarning')(unserved.length, unserved.join(', '));
     st.style.color = '#e74c3c';
   }
 
@@ -760,11 +1069,11 @@ function drawResults(data) {
   document.getElementById('r-total-cost').textContent = (data.total_cost_rsd ?? 0).toLocaleString();
 
   // Show which objective was active during this run
-  const owLabels = { fuel:'⛽ Fuel cost', wages:'👷 Wages', distance:'📏 Distance', vehicles:'🚛 Vehicles' };
+  const owLabels = t('owLabels');
   const ow = data.obj_weights || { fuel: true, wages: true };
   const activeObj = Object.entries(ow).filter(([,v]) => v).map(([k]) => owLabels[k]).join(' + ');
   const objEl = document.getElementById('r-objective');
-  if (objEl) objEl.textContent = activeObj ? `Optimised for: ${activeObj}` : '';
+  if (objEl) objEl.textContent = activeObj ? t('optimisedFor') + activeObj : '';
 
   // Show active constraint info
   const constraintEl = document.getElementById('r-constraints');
@@ -774,7 +1083,7 @@ function drawResults(data) {
     else cList.push('<span style="color:var(--accent);text-decoration:line-through">📐 Volume cap</span>');
     if (data.use_weight_capacity !== false) cList.push('⚖️ Weight cap');
     else cList.push('<span style="color:var(--accent);text-decoration:line-through">⚖️ Weight cap</span>');
-    constraintEl.innerHTML = 'Constraints: ' + cList.join(' · ');
+    constraintEl.innerHTML = t('constraints') + cList.join(' · ');
   }
 
   let html = '';
@@ -788,13 +1097,13 @@ function drawResults(data) {
       const pc = s.pkg_counts || [s.packages||0, 0, 0];
       const pkgTip = `P1:${pc[0]} P2:${pc[1]} P3:${pc[2]}`;
       const splitBadge = s.split
-        ? `<span style="background:#f97316;color:#fff;font-size:9px;padding:1px 4px;border-radius:3px;margin-left:2px" title="Split delivery: part ${s.split_part} of ${s.split_total}">✂️ ${s.split_part}/${s.split_total}</span>`
+        ? `<span style="background:#f97316;color:#fff;font-size:9px;padding:1px 4px;border-radius:3px;margin-left:2px" title="${t('splitDelivery')(s.split_part, s.split_total)}">✂️ ${s.split_part}/${s.split_total}</span>`
         : '';
       return `<div class="stop-row">
         <span class="stop-num">${i+1}.</span>
         <span class="stop-name" title="${esc(s.name)}">${esc(s.name.substring(0,18))}</span>${splitBadge}
         <span class="stop-time">${s.arrival}</span>
-        <span class="stop-svc" title="${s.service_time ?? 10} min unloading">+${s.service_time ?? 10}m</span>
+        <span class="stop-svc" title="${t('minUnloading')(s.service_time ?? 10)}">+${s.service_time ?? 10}m</span>
         <span style="color:var(--muted);font-size:10px">[${s.tw_start}–${s.tw_end}]</span>
         <span style="color:var(--accent);font-size:10px" title="${pkgTip}">📦${pkgTip}</span>
         ${flag}
@@ -808,17 +1117,17 @@ function drawResults(data) {
     const volUsed = vr.volume_used ?? vr.packages ?? 0;
     const volCap  = vr.volume_capacity ?? vr.capacity ?? 0;
     const volBadge = volUsed != null
-      ? `<span class="veh-fuel" title="Volumetric load / capacity">📐 ${parseFloat(volUsed).toFixed(2)}/${parseFloat(volCap).toFixed(1)}m³</span>`
+      ? `<span class="veh-fuel" title="${t('volLoad')}">📐 ${parseFloat(volUsed).toFixed(2)}/${parseFloat(volCap).toFixed(1)}m³</span>`
       : '';
     const wUsed = vr.weight_used ?? 0;
     const wCap  = vr.weight_capacity ?? 0;
     const wCapStr = wCap > 0 ? `/${wCap}kg` : '/∞';
-    const weightBadge = `<span class="veh-fuel" title="Weight load / capacity (effective fuel: ${vr.effective_fuel_consumption ?? vr.fuel_consumption ?? '?'} L/100km)">⚖️ ${wUsed.toFixed(0)}${wCapStr}</span>`;
+    const weightBadge = `<span class="veh-fuel" title="${t('weightLoad')(vr.effective_fuel_consumption ?? vr.fuel_consumption ?? '?')}">⚖️ ${wUsed.toFixed(0)}${wCapStr}</span>`;
     html += `<div class="veh-card" id="vcard-${vr.vehicle_id}">
       <div class="veh-card-header" onclick="toggleVehCard(${vr.vehicle_id})">
         <span class="veh-dot" style="background:${vr.color}"></span>
         <span class="veh-name">${esc(vr.type)} #${vr.vehicle_id+1}</span>
-        <span class="veh-meta">${vr.num_customers} stops · ${vr.distance.toFixed(1)}km ${fuelBadge} ${volBadge} ${weightBadge}</span>
+        <span class="veh-meta">${vr.num_customers} ${currentLang === 'sr' ? 'stan.' : 'stops'} · ${vr.distance.toFixed(1)}km ${fuelBadge} ${volBadge} ${weightBadge}</span>
         <span class="veh-meta" style="color:var(--muted);font-size:10px">⛽ ${(vr.fuel_cost_rsd??0).toLocaleString()} + 👷 ${(vr.wage_cost_rsd??0).toLocaleString()} = <b>${(vr.total_cost_rsd??0).toLocaleString()} RSD</b></span>
         <span class="veh-chevron">▼</span>
       </div>
@@ -835,6 +1144,7 @@ function toggleVehCard(vid) {
 
 function resetResults() {
   document.getElementById('results-placeholder').classList.remove('hidden');
+  document.getElementById('results-placeholder').textContent = t('runOptimizationHint');
   document.getElementById('results-summary').classList.add('hidden');
   document.getElementById('vehicle-results').innerHTML = '';
   document.getElementById('legend-panel').classList.add('hidden');
@@ -1112,7 +1422,7 @@ async function generatePDF() {
 
   const btn = document.getElementById('pdf-btn');
   btn.disabled = true;
-  btn.textContent = '📸 Capturing maps…';
+  btn.textContent = t('captureMaps');
 
   // ── Capture full overview map ──────────────────────────────────────────────
   // First fit map to show all routes
@@ -1128,7 +1438,7 @@ async function generatePDF() {
   // ── Capture per-vehicle maps ───────────────────────────────────────────────
   const vehicleMaps = {};
   for (const vr of d.vehicle_routes) {
-    btn.textContent = `📸 Vehicle ${vr.vehicle_id + 1}/${d.vehicle_routes.length}…`;
+    btn.textContent = t('captureVehicle')(vr.vehicle_id + 1, d.vehicle_routes.length);
     vehicleMaps[vr.vehicle_id] = await captureVehicleMap(vr);
     await sleep(200);
   }
@@ -1141,7 +1451,7 @@ async function generatePDF() {
     }
   } catch(e) {}
 
-  btn.textContent = '📄 Building PDF…';
+  btn.textContent = t('buildingPDF');
 
   // Attach per-vehicle map images to each vehicle_route object
   const vehicleRoutesWithMaps = d.vehicle_routes.map(vr => ({
@@ -1185,10 +1495,10 @@ async function generatePDF() {
     a.click();
     URL.revokeObjectURL(url);
   } catch(e) {
-    alert('PDF error: ' + e.message);
+    alert(t('pdfError') + e.message);
   } finally {
     btn.disabled = false;
-    btn.textContent = '📄 Export PDF';
+    btn.textContent = t('exportPDF');
   }
 }
 

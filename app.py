@@ -181,12 +181,12 @@ def status():
 def geocode():
     data = request.json
     address = data.get("address", "")
-    if "belgrade" not in address.lower() and "serbia" not in address.lower():
-        address = f"{address}, Belgrade, Serbia"
+    if "serbia" not in address.lower() and "srbija" not in address.lower():
+        address = f"{address}, Serbia"
     try:
         resp = requests.get(
             "https://nominatim.openstreetmap.org/search",
-            params={"q": address, "format": "json", "limit": 1},
+            params={"q": address, "format": "json", "limit": 1, "countrycodes": "rs"},
             headers={"User-Agent": "GRPSWeb/1.0"},
             timeout=8,
         )

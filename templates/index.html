@@ -8,8 +8,27 @@
 <link href="https://fonts.googleapis.com/css2?family=DM+Mono:ital,wght@0,400;0,500;1,400&family=Syne:wght@600;700;800&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
 <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}">
-<!-- Leaflet loaded in head so L is always defined before any user interaction -->
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+.lang-switcher { display:flex; gap:4px; align-items:center; }
+.lang-btn {
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+  padding: 3px 8px;
+  border-radius: 4px;
+  border: 1px solid var(--border2, #333);
+  background: var(--bg2, #1a1a1a);
+  color: var(--muted, #888);
+  cursor: pointer;
+  transition: all .15s;
+}
+.lang-btn.active {
+  background: var(--accent, #3b82f6);
+  color: #fff;
+  border-color: var(--accent, #3b82f6);
+}
+.lang-btn:hover:not(.active) { color: var(--fg, #e0e0e0); border-color: var(--fg, #e0e0e0); }
+</style>
 </head>
 <body>
 
@@ -17,11 +36,15 @@
 <header class="header">
   <div class="header-left">
     <span class="logo">GRPS</span>
-    <span class="logo-sub">Route Planner</span>
+    <span class="logo-sub" data-i18n="routePlanner">Route Planner</span>
   </div>
   <div class="header-right">
+    <div class="lang-switcher">
+      <button class="lang-btn active" data-lang="en" onclick="setLanguage('en')">EN</button>
+      <button class="lang-btn" data-lang="sr" onclick="setLanguage('sr')">SR</button>
+    </div>
     <span class="user-badge">{{ user }}</span>
-    <a href="/logout" class="btn-logout">Sign out</a>
+    <a href="/logout" class="btn-logout" data-i18n="signOut">Sign out</a>
   </div>
 </header>
 
@@ -33,39 +56,39 @@
 
     <!-- Location controls -->
     <section class="panel">
-      <div class="panel-title">📍 Locations</div>
+      <div class="panel-title" data-i18n="locations">📍 Locations</div>
 
       <div class="mode-tabs">
-        <button class="mode-tab active" data-mode="depot" onclick="setMode('depot',this)">+ Depot</button>
-        <button class="mode-tab" data-mode="customer" onclick="setMode('customer',this)">+ Customer</button>
+        <button class="mode-tab active" data-mode="depot" onclick="setMode('depot',this)" data-i18n="addDepot">+ Depot</button>
+        <button class="mode-tab" data-mode="customer" onclick="setMode('customer',this)" data-i18n="addCustomer">+ Customer</button>
       </div>
-      <div style="font-size:9px;color:var(--muted);margin-bottom:6px;font-style:italic">
+      <div style="font-size:9px;color:var(--muted);margin-bottom:6px;font-style:italic" data-i18n="multiDepotHint">
         Multiple depots supported — optimizer picks best depot per vehicle
       </div>
 
       <div id="customer-opts" class="customer-opts hidden">
         <div class="field-row">
-          <label>Type 1 (qty)</label>
+          <label data-i18n="type1qty">Type 1 (qty)</label>
           <input type="number" id="pkg-count-1" value="0" min="0" max="999" oninput="updatePkgVolHint()">
         </div>
         <div class="field-row">
-          <label>Type 2 (qty)</label>
+          <label data-i18n="type2qty">Type 2 (qty)</label>
           <input type="number" id="pkg-count-2" value="0" min="0" max="999" oninput="updatePkgVolHint()">
         </div>
         <div class="field-row">
-          <label>Type 3 (qty)</label>
+          <label data-i18n="type3qty">Type 3 (qty)</label>
           <input type="number" id="pkg-count-3" value="0" min="0" max="999" oninput="updatePkgVolHint()">
         </div>
         <div class="field-row" style="margin-bottom:2px;">
-          <label style="color:var(--accent);">📐 Volume</label>
+          <label style="color:var(--accent);" data-i18n="volume">📐 Volume</label>
           <span id="pkg-vol-hint" style="font-family:var(--font-mono);font-size:11px;color:var(--accent);">0.000 m³</span>
         </div>
         <div class="field-row">
-          <label>Unloading (min)</label>
+          <label data-i18n="unloading">Unloading (min)</label>
           <input type="number" id="unloading-time" value="10" min="1" max="120">
         </div>
         <div class="field-row">
-          <label>Time window</label>
+          <label data-i18n="timeWindow">Time window</label>
           <input type="time" id="tw-start" value="09:00">
           <span>–</span>
           <input type="time" id="tw-end" value="17:00">
@@ -73,20 +96,20 @@
       </div>
 
       <div class="search-row">
-        <input type="text" id="address-input" placeholder="Search address…">
-        <button class="btn-sm btn-primary" onclick="geocodeAddress()">Go</button>
+        <input type="text" id="address-input" data-i18n="searchAddress" data-i18n-attr="placeholder" placeholder="Search address…">
+        <button class="btn-sm btn-primary" onclick="geocodeAddress()" data-i18n="go">Go</button>
       </div>
       <div id="geocode-status" class="status-line"></div>
 
-      <div class="map-hint">or click the map to place a pin</div>
+      <div class="map-hint" data-i18n="orClickMap">or click the map to place a pin</div>
 
       <!-- Location list -->
       <div id="locations-list" class="locations-list"></div>
 
       <div class="action-row">
-        <button class="btn-sm btn-danger" onclick="clearAll()">Clear all</button>
+        <button class="btn-sm btn-danger" onclick="clearAll()" data-i18n="clearAll">Clear all</button>
         <label class="btn-sm btn-secondary" style="cursor:pointer">
-          Import Excel
+          <span data-i18n="importExcel">Import Excel</span>
           <input type="file" id="excel-file" accept=".xlsx,.xls" style="display:none" onchange="importExcel(this)">
         </label>
       </div>
@@ -94,25 +117,25 @@
 
     <!-- Fleet -->
     <section class="panel">
-      <div class="panel-title">🚛 Fleet</div>
+      <div class="panel-title" data-i18n="fleet">🚛 Fleet</div>
       <div id="fleet-cards" class="fleet-cards"></div>
       <div id="fleet-footer" class="fleet-footer"></div>
     </section>
 
     <!-- Package Types -->
     <section class="panel">
-      <div class="panel-title">📦 Package Types</div>
+      <div class="panel-title" data-i18n="packageTypes">📦 Package Types</div>
       <div style="font-size:9px;color:var(--muted);margin-bottom:8px;">Volumetric size per package type</div>
       <div class="field-row">
-        <label>Type 1 (m³)</label>
+        <label data-i18n="type1m3">Type 1 (m³)</label>
         <input type="number" id="pkg-size-1" value="0.100" min="0.001" max="10" step="0.001" oninput="updatePkgSizes()">
       </div>
       <div class="field-row">
-        <label>Type 2 (m³)</label>
+        <label data-i18n="type2m3">Type 2 (m³)</label>
         <input type="number" id="pkg-size-2" value="0.300" min="0.001" max="10" step="0.001" oninput="updatePkgSizes()">
       </div>
       <div class="field-row">
-        <label>Type 3 (m³)</label>
+        <label data-i18n="type3m3">Type 3 (m³)</label>
         <input type="number" id="pkg-size-3" value="0.600" min="0.001" max="10" step="0.001" oninput="updatePkgSizes()">
       </div>
       <div id="pkg-sizes-summary" style="font-size:9px;color:var(--accent);padding:4px 6px;background:var(--bg3);border-radius:4px;font-family:var(--font-mono);">
@@ -122,23 +145,23 @@
 
     <!-- Package Weights -->
     <section class="panel">
-      <div class="panel-title">⚖️ Package Weights</div>
+      <div class="panel-title" data-i18n="packageWeights">⚖️ Package Weights</div>
       <div style="font-size:9px;color:var(--muted);margin-bottom:8px;">
         Weight per package type (kg) — used for vehicle weight capacity constraints
         and load-dependent fuel calculation
       </div>
       <div class="field-row">
-        <label>Type 1 (kg)</label>
+        <label data-i18n="type1kg">Type 1 (kg)</label>
         <input type="number" id="pkg-weight-1" value="5" min="0.1" max="1000" step="0.1"
                oninput="updatePkgWeights()" title="Typical small parcel: 3–8 kg">
       </div>
       <div class="field-row">
-        <label>Type 2 (kg)</label>
+        <label data-i18n="type2kg">Type 2 (kg)</label>
         <input type="number" id="pkg-weight-2" value="15" min="0.1" max="1000" step="0.1"
                oninput="updatePkgWeights()" title="Typical medium box: 10–20 kg">
       </div>
       <div class="field-row">
-        <label>Type 3 (kg)</label>
+        <label data-i18n="type3kg">Type 3 (kg)</label>
         <input type="number" id="pkg-weight-3" value="30" min="0.1" max="1000" step="0.1"
                oninput="updatePkgWeights()" title="Typical large item: 20–50 kg">
       </div>
@@ -149,9 +172,9 @@
 
     <!-- Algorithm -->
     <section class="panel">
-      <div class="panel-title">⚙️ Algorithm</div>
+      <div class="panel-title" data-i18n="algorithm">⚙️ Algorithm</div>
       <div class="field-row">
-        <label>Method</label>
+        <label data-i18n="method">Method</label>
         <select id="algo-select">
           <option>Model 1</option>
           <option>Model 2</option>
@@ -160,62 +183,62 @@
       </div>
       <div id="alns-opts">
         <div class="field-row">
-          <label>Iterations</label>
+          <label data-i18n="iterations">Iterations</label>
           <input type="number" id="max-iter" value="500" min="50" max="5000">
         </div>
         <div class="field-row">
-          <label>Temperature</label>
+          <label data-i18n="temperature">Temperature</label>
           <input type="number" id="temperature" value="150" min="10" max="1000">
         </div>
       </div>
       <div style="border-top:1px solid var(--border2);margin:6px 0 4px;padding-top:6px">
         <div style="font-size:10px;color:var(--muted);margin-bottom:4px;letter-spacing:.05em;text-transform:uppercase">
-          🔒 Hard Constraints
+          <span data-i18n="hardConstraints">🔒 Hard Constraints</span>
         </div>
         <div class="field-row">
           <label>
-            <input type="checkbox" id="use-vol-cap" checked onchange="updateConstraintHint()"> 📐 Volume capacity
+            <input type="checkbox" id="use-vol-cap" checked onchange="updateConstraintHint()"> <span data-i18n="volumeCapacity">📐 Volume capacity</span>
           </label>
         </div>
         <div class="field-row">
           <label>
-            <input type="checkbox" id="use-wt-cap" checked onchange="updateConstraintHint()"> ⚖️ Weight capacity
+            <input type="checkbox" id="use-wt-cap" checked onchange="updateConstraintHint()"> <span data-i18n="weightCapacity">⚖️ Weight capacity</span>
           </label>
         </div>
         <div id="constraint-hint" style="font-size:9px;color:var(--muted);margin-top:4px;padding:3px 6px;background:var(--bg3);border-radius:4px;font-style:italic;display:none">
-          ⚠️ Disabling constraints may cause overloads
+          <span data-i18n="constraintWarning">⚠️ Disabling constraints may cause overloads</span>
         </div>
       </div>
       <div class="field-row" style="margin-top:4px">
         <label>
-          <input type="checkbox" id="use-tw"> ⏱ Use time windows
+          <input type="checkbox" id="use-tw"> <span data-i18n="useTimeWindows">⏱ Use time windows</span>
         </label>
       </div>
       <div style="font-size:9px;color:var(--accent);padding:4px 0;border-top:1px solid var(--border2);margin-top:2px">
-        ⏱ Unloading time per customer is set individually (Excel or manual input)
+        <span data-i18n="unloadingHint">⏱ Unloading time per customer is set individually (Excel or manual input)</span>
       </div>
 
       <!-- Objective function selector -->
       <div style="border-top:1px solid var(--border2);margin:10px 0 8px;padding-top:8px">
         <div style="font-size:10px;color:var(--muted);margin-bottom:6px;letter-spacing:.05em;text-transform:uppercase">
-          🎯 Optimise for
+          <span data-i18n="optimiseFor">🎯 Optimise for</span>
         </div>
         <div class="obj-checks">
           <label class="obj-label">
             <input type="checkbox" id="obj-fuel" checked onchange="updateObjHint()">
-            <span class="obj-chip">⛽ Fuel cost</span>
+            <span class="obj-chip" data-i18n="fuelCost">⛽ Fuel cost</span>
           </label>
           <label class="obj-label">
             <input type="checkbox" id="obj-wages" checked onchange="updateObjHint()">
-            <span class="obj-chip">👷 Driver wages</span>
+            <span class="obj-chip" data-i18n="driverWages">👷 Driver wages</span>
           </label>
           <label class="obj-label">
             <input type="checkbox" id="obj-distance" onchange="updateObjHint()">
-            <span class="obj-chip">📏 Distance</span>
+            <span class="obj-chip" data-i18n="distance">📏 Distance</span>
           </label>
           <label class="obj-label">
             <input type="checkbox" id="obj-vehicles" onchange="updateObjHint()">
-            <span class="obj-chip">🚛 Vehicles used</span>
+            <span class="obj-chip" data-i18n="vehiclesUsed">🚛 Vehicles used</span>
           </label>
         </div>
         <div id="obj-hint" style="font-size:9px;color:var(--accent);margin-top:5px;padding:3px 6px;background:var(--bg3);border-radius:4px;font-style:italic">
@@ -224,7 +247,7 @@
       </div>
 
       <button id="optimize-btn" class="btn-primary btn-full" onclick="runOptimize()">
-        🚀 Find Optimal Routes
+        <span data-i18n="findRoutes">🚀 Find Optimal Routes</span>
       </button>
       <div id="progress-wrap" class="hidden">
         <div id="progress-bar-track"><div id="progress-bar-fill"></div></div>
@@ -249,58 +272,58 @@
 
     <!-- Results -->
     <section class="panel">
-      <div class="panel-title">📊 Results</div>
+      <div class="panel-title" data-i18n="results">📊 Results</div>
       <div id="results-summary" class="results-summary hidden">
         <div class="stat-row">
           <div class="stat"><div class="stat-val" id="r-dist">—</div><div class="stat-key">km</div></div>
-          <div class="stat"><div class="stat-val" id="r-fuel">—</div><div class="stat-key">litres ⛽</div></div>
-          <div class="stat"><div class="stat-val" id="r-time">—</div><div class="stat-key">time</div></div>
-          <div class="stat"><div class="stat-val" id="r-pkgs">—</div><div class="stat-key">m³ load</div></div>
-          <div class="stat"><div class="stat-val" id="r-vol-pct">—</div><div class="stat-key">vol fill %</div></div>
-          <div class="stat"><div class="stat-val" id="r-wt-pct">—</div><div class="stat-key">wt fill %</div></div>
-          <div class="stat"><div class="stat-val" id="r-vehs">—</div><div class="stat-key">vehicles</div></div>
+          <div class="stat"><div class="stat-val" id="r-fuel">—</div><div class="stat-key" data-i18n="litresFuel">litres ⛽</div></div>
+          <div class="stat"><div class="stat-val" id="r-time">—</div><div class="stat-key" data-i18n="time">time</div></div>
+          <div class="stat"><div class="stat-val" id="r-pkgs">—</div><div class="stat-key" data-i18n="m3load">m³ load</div></div>
+          <div class="stat"><div class="stat-val" id="r-vol-pct">—</div><div class="stat-key" data-i18n="volFill">vol fill %</div></div>
+          <div class="stat"><div class="stat-val" id="r-wt-pct">—</div><div class="stat-key" data-i18n="wtFill">wt fill %</div></div>
+          <div class="stat"><div class="stat-val" id="r-vehs">—</div><div class="stat-key" data-i18n="vehicles">vehicles</div></div>
         </div>
         <div class="stat-row" style="margin-top:6px;border-top:1px solid var(--border);padding-top:6px">
-          <div class="stat"><div class="stat-val" id="r-fuel-cost">—</div><div class="stat-key">fuel cost (RSD)</div></div>
-          <div class="stat"><div class="stat-val" id="r-wage-cost">—</div><div class="stat-key">wages (RSD)</div></div>
-          <div class="stat" style="font-weight:700"><div class="stat-val" id="r-total-cost">—</div><div class="stat-key">total cost (RSD)</div></div>
+          <div class="stat"><div class="stat-val" id="r-fuel-cost">—</div><div class="stat-key" data-i18n="fuelCostRSD">fuel cost (RSD)</div></div>
+          <div class="stat"><div class="stat-val" id="r-wage-cost">—</div><div class="stat-key" data-i18n="wagesRSD">wages (RSD)</div></div>
+          <div class="stat" style="font-weight:700"><div class="stat-val" id="r-total-cost">—</div><div class="stat-key" data-i18n="totalCostRSD">total cost (RSD)</div></div>
         </div>
       </div>
       <div id="r-objective" style="font-size:9px;color:var(--accent);padding:3px 6px 2px;font-style:italic"></div>
       <div id="r-constraints" style="font-size:9px;color:var(--muted);padding:2px 6px 4px;font-style:italic"></div>
       <div id="vehicle-results" class="vehicle-results"></div>
       <div id="matrix-warning" style="display:none;font-size:10px;color:#f39c12;background:rgba(243,156,18,.1);border:1px solid rgba(243,156,18,.3);border-radius:5px;padding:5px 8px;margin-top:6px">
-        ⚠️ OSRM unavailable — distances are straight-line estimates
+        <span data-i18n="osrmWarning">⚠️ OSRM unavailable — distances are straight-line estimates</span>
       </div>
-      <div id="results-placeholder" class="placeholder-msg">Run optimization to see results</div>
+      <div id="results-placeholder" class="placeholder-msg"><span data-i18n="runOptimizationHint">Run optimization to see results</span></div>
     </section>
 
     <!-- Legend -->
     <section id="legend-panel" class="panel hidden">
-      <div class="panel-title">🗺 Legend</div>
+      <div class="panel-title" data-i18n="legend">🗺 Legend</div>
       <div id="legend-rows"></div>
       <button class="btn-sm btn-secondary btn-full" style="margin-top:8px" onclick="toggleAllRoutes()">
-        👁 Toggle all
+        <span data-i18n="toggleAll">👁 Toggle all</span>
       </button>
     </section>
 
     <!-- Actions -->
     <section class="panel">
-      <div class="panel-title">Actions</div>
+      <div class="panel-title" data-i18n="actions">Actions</div>
       <div class="field-row" style="margin-bottom:8px">
-        <label>Sim speed</label>
+        <label data-i18n="simSpeed">Sim speed</label>
         <select id="sim-speed" style="flex:1">
-          <option value="500">🐢 Slow</option>
-          <option value="200" selected>🚗 Normal</option>
-          <option value="80">🚀 Fast</option>
-          <option value="20">⚡ Turbo</option>
+          <option value="500" data-i18n="slow">🐢 Slow</option>
+          <option value="200" selected data-i18n="normal">🚗 Normal</option>
+          <option value="80" data-i18n="fast">🚀 Fast</option>
+          <option value="20" data-i18n="turbo">⚡ Turbo</option>
         </select>
       </div>
       <button id="simulate-btn" class="btn-secondary btn-full" onclick="startSimulation()" disabled>
-        ▶ Simulate Routes
+        <span data-i18n="simulateRoutes">▶ Simulate Routes</span>
       </button>
       <button id="pdf-btn" class="btn-secondary btn-full" onclick="generatePDF()" disabled style="margin-top:6px">
-        📄 Download PDF
+        <span data-i18n="downloadPDF">📄 Download PDF</span>
       </button>
     </section>
 
@@ -311,26 +334,26 @@
 <div id="fleet-modal" class="modal-overlay hidden" onclick="if(event.target===this)closeFleetModal()">
   <div class="modal-box">
     <div class="modal-header">
-      <span id="modal-title">Configure Vehicle</span>
+      <span id="modal-title" data-i18n="configureVehicle">Configure Vehicle</span>
       <button class="modal-close" onclick="closeFleetModal()">✕</button>
     </div>
     <div class="modal-body">
       <div class="field-row">
-        <label>Count</label>
+        <label data-i18n="count">Count</label>
         <input type="number" id="modal-count" min="0" max="20" value="1">
       </div>
       <div class="field-row">
-        <label>Capacity (m³)</label>
+        <label data-i18n="capacityM3">Capacity (m³)</label>
         <input type="number" id="modal-cap" min="0.1" max="200" step="0.1" value="5.0">
       </div>
       <div class="field-row">
-        <label>Weight cap (kg)</label>
+        <label data-i18n="weightCap">Weight cap (kg)</label>
         <input type="number" id="modal-weight-cap" min="0" max="50000" step="50" value="0"
                title="Max payload weight in kg. Set 0 for unlimited.">
         <span style="font-size:10px;color:var(--muted);margin-left:4px">0=∞</span>
       </div>
       <div class="field-row">
-        <label>Fuel (L/100km)</label>
+        <label data-i18n="fuel">Fuel (L/100km)</label>
         <input type="number" id="modal-fuel" min="1" max="100" step="0.1" value="10"
                title="Base fuel consumption when empty. Increases linearly with load.">
       </div>
@@ -341,8 +364,8 @@
       </div>
     </div>
     <div class="modal-footer">
-      <button class="btn-secondary" onclick="closeFleetModal()">Cancel</button>
-      <button class="btn-primary" onclick="applyFleetModal()">Apply</button>
+      <button class="btn-secondary" onclick="closeFleetModal()" data-i18n="cancel">Cancel</button>
+      <button class="btn-primary" onclick="applyFleetModal()" data-i18n="apply">Apply</button>
     </div>
   </div>
 </div>
@@ -351,19 +374,19 @@
 <div id="excel-modal" class="modal-overlay hidden" onclick="if(event.target===this)closeExcelModal()">
   <div class="modal-box modal-wide">
     <div class="modal-header">
-      <span>Excel Import Preview</span>
+      <span data-i18n="excelPreview">Excel Import Preview</span>
       <button class="modal-close" onclick="closeExcelModal()">✕</button>
     </div>
     <div class="modal-body">
       <div id="excel-table-wrap"></div>
       <p style="font-size:11px;color:var(--muted);margin-top:8px;">
-        Customers will be geocoded after import. This may take a moment.<br>
-        <span style="color:var(--accent);font-size:10px;">Expected columns: Customer, Address, Packages#1, Packages#2, Packages#3, Time</span>
+        <span data-i18n="geocodingHint">Customers will be geocoded after import. This may take a moment.</span><br>
+        <span style="color:var(--accent);font-size:10px;"><span data-i18n="excelColumns">Expected columns: Customer, Address, Packages#1, Packages#2, Packages#3, Time</span></span>
       </p>
     </div>
     <div class="modal-footer">
-      <button class="btn-secondary" onclick="closeExcelModal()">Cancel</button>
-      <button class="btn-primary" onclick="confirmExcelImport()">Import All</button>
+      <button class="btn-secondary" onclick="closeExcelModal()" data-i18n="cancel">Cancel</button>
+      <button class="btn-primary" onclick="confirmExcelImport()" data-i18n="importAll">Import All</button>
     </div>
   </div>
 </div>
