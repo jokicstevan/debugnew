@@ -657,6 +657,56 @@ def route_dist(route_mat_indices, depot_mat_idx, dist_mat):
     return d
 
 
+def route_fuel_litres(route_mat_indices, depot_mat_idx, dist_mat,
+                      demands_kg, n_depots, fuel_per_100km_fn):
+    """Compute total fuel (litres) for a route with load-shedding after each stop.
+
+    The van starts fully loaded and unloads each customer's cargo on arrival,
+    so subsequent legs are driven with a lighter vehicle — reducing fuel burn.
+
+    route_mat_indices : list of matrix indices of customers in visit order
+    depot_mat_idx     : matrix index of the depot
+    dist_mat          : N×N road distance matrix (km)
+    demands_kg        : list indexed by (mat_idx - n_depots)
+    n_depots          : number of depots (offset between mat index and demands_kg)
+    fuel_per_100km_fn : callable(payload_kg) → L/100 km for the vehicle
+    """
+    if not route_mat_indices:
+        return 0.0
+
+    # Start fully loaded
+    remaining_kg = sum(
+        demands_kg[c - n_depots]
+        for c in route_mat_indices
+        if 0 <= (c - n_depots) < len(demands_kg)
+    )
+
+    total_litres = 0.0
+
+    # Leg: depot → first customer
+    leg_km = dist_mat[depot_mat_idx][route_mat_indices[0]]
+    total_litres += leg_km * fuel_per_100km_fn(remaining_kg) / 100.0
+
+    # Unload at first customer, then drive subsequent legs
+    prev = route_mat_indices[0]
+    drop = demands_kg[prev - n_depots] if 0 <= (prev - n_depots) < len(demands_kg) else 0.0
+    remaining_kg = max(0.0, remaining_kg - drop)
+
+    for c in route_mat_indices[1:]:
+        leg_km = dist_mat[prev][c]
+        total_litres += leg_km * fuel_per_100km_fn(remaining_kg) / 100.0
+        # Unload at this customer
+        drop = demands_kg[c - n_depots] if 0 <= (c - n_depots) < len(demands_kg) else 0.0
+        remaining_kg = max(0.0, remaining_kg - drop)
+        prev = c
+
+    # Final leg: last customer → depot (empty or nearly empty)
+    leg_km = dist_mat[prev][depot_mat_idx]
+    total_litres += leg_km * fuel_per_100km_fn(remaining_kg) / 100.0
+
+    return total_litres
+
+
 def best_depot_for_route(route_mat_indices, n_depots, dist_mat):
     """Return the depot index (0..n_depots-1) that minimises route distance."""
     if n_depots == 1 or not route_mat_indices:
@@ -808,10 +858,15 @@ class VRPState:
             if not self.use_tw and tw_viol > 0:
                 return float("inf")
             dist_km    = route_dist(route, depot, self.dist_mat)
-            payload_kg = self.weight_load(v)
 
             if do_fuel:
-                fuel_litres = dist_km * self.fuel_per_100km(v, payload_kg) / 100.0
+                # Fuel calculated leg-by-leg: payload shrinks after each delivery,
+                # so early deliveries reward routes that drop off heavy stops first.
+                fuel_litres = route_fuel_litres(
+                    route, depot, self.dist_mat,
+                    self.demands_kg, self.n_depots,
+                    lambda kg, _v=v: self.fuel_per_100km(_v, kg)
+                )
                 total += fuel_litres * FUEL_PRICE_RSD_PER_LITRE
             if do_wages:
                 work_mins = route_working_minutes(
@@ -831,11 +886,16 @@ class VRPState:
                    for v, r in enumerate(self.routes) if r)
 
     def total_fuel(self):
-        return sum(
-            route_dist(r, self.depot_of[v], self.dist_mat)
-            * self.fuel_per_100km(v, self.weight_load(v)) / 100.0
-            for v, r in enumerate(self.routes) if r
-        )
+        total = 0.0
+        for v, r in enumerate(self.routes):
+            if not r:
+                continue
+            total += route_fuel_litres(
+                r, self.depot_of[v], self.dist_mat,
+                self.demands_kg, self.n_depots,
+                lambda kg, _v=v: self.fuel_per_100km(_v, kg)
+            )
+        return total
 
     def total_time(self):
         return sum(
@@ -1458,15 +1518,21 @@ def optimize():
 
             route_km    = (seg_dist if seg_dist
                            else route_dist(route, depot_mat, dist_mat))
-            # Load-dependent fuel: weight carried on this route
+            # Load-dependent fuel: calculated leg-by-leg as cargo is unloaded.
+            # route_weight_kg is total initial load (used for display only).
             route_weight_kg = sum(
                 demands_kg[c - n_depots]
                 for c in route
                 if 0 <= (c - n_depots) < len(demands_kg)
             )
             base_fuel       = veh_cfg.get("fuel_consumption", 10.0)
-            eff_fuel        = base_fuel * (1.0 + FUEL_LOAD_FACTOR_PER_1000KG * route_weight_kg / 1000.0)
-            fuel_l          = round(route_km * eff_fuel / 100.0, 2)
+            # Effective average L/100km (for display) — weight-average over the route
+            eff_fuel        = base_fuel * (1.0 + FUEL_LOAD_FACTOR_PER_1000KG * (route_weight_kg / 2.0) / 1000.0)
+            fuel_l          = round(route_fuel_litres(
+                route, depot_mat, dist_mat,
+                demands_kg, n_depots,
+                lambda kg: base_fuel * (1.0 + FUEL_LOAD_FACTOR_PER_1000KG * kg / 1000.0)
+            ), 2)
             fuel_cost       = round(fuel_l * FUEL_PRICE_RSD_PER_LITRE, 0)
             work_mins   = route_working_minutes(
                 route, depot_mat, dist_mat, time_mat, tw, SERVICE_TIME, depart_min,
