@@ -135,6 +135,20 @@ const TRANSLATIONS = {
     minUnloading: min => `${min} min unloading`,
     volLoad: 'Volumetric load / capacity',
     weightLoad: eff => `Weight load / capacity (effective fuel: ${eff} L/100km)`,
+    volSizeHint: 'Volumetric size per package type',
+    weightHint: 'Weight per package type (kg) — used for vehicle weight capacity constraints and load-dependent fuel calculation',
+    sizesLabel: (s1, s2, s3) => `Sizes: ${s1} · ${s2} · ${s3} m³`,
+    weightsLabel: (w1, w2, w3) => `Weights: ${w1} · ${w2} · ${w3} kg`,
+    titleSmallParcel: 'Typical small parcel: 3–8 kg',
+    titleMediumBox: 'Typical medium box: 10–20 kg',
+    titleLargeItem: 'Typical large item: 20–50 kg',
+    titleWeightCap: 'Max payload weight in kg. Set 0 for unlimited.',
+    titleFuelBase: 'Base fuel consumption when empty. Increases linearly with load.',
+    fuelLoadNote: '⛽ Fuel usage is load-dependent: +3% per 1 000 kg payload',
+    fuelLoadExample: 'e.g. 10 L/100km empty → 10.3 L at 1 000 kg, 10.9 L at 3 000 kg',
+    volUsedOf: (used, cap) => `${used} m³ used of ${cap} m³ total capacity`,
+    wtUsedOf: (used, cap) => `${used} kg used of ${cap} kg total capacity`,
+    unloadPopup: min => `Unload: ${min}min`,
   },
   sr: {
     routePlanner: 'Planer ruta',
@@ -265,6 +279,20 @@ const TRANSLATIONS = {
     minUnloading: min => `${min} min istovar`,
     volLoad: 'Zapreminski teret / kapacitet',
     weightLoad: eff => `Težinski teret / kapacitet (efektivna potrošnja: ${eff} L/100km)`,
+    volSizeHint: 'Zapremina po tipu paketa',
+    weightHint: 'Težina po tipu paketa (kg) — koristi se za ograničenja nosivosti i potrošnju goriva',
+    sizesLabel: (s1, s2, s3) => `Veličine: ${s1} · ${s2} · ${s3} m³`,
+    weightsLabel: (w1, w2, w3) => `Težine: ${w1} · ${w2} · ${w3} kg`,
+    titleSmallParcel: 'Tipičan mali paket: 3–8 kg',
+    titleMediumBox: 'Tipična srednja kutija: 10–20 kg',
+    titleLargeItem: 'Tipičan veliki predmet: 20–50 kg',
+    titleWeightCap: 'Maks. nosivost u kg. Postavite 0 za neograničeno.',
+    titleFuelBase: 'Osnovna potrošnja goriva praznog vozila. Raste linearno sa teretom.',
+    fuelLoadNote: '⛽ Potrošnja zavisi od tereta: +3% na svakih 1 000 kg',
+    fuelLoadExample: 'npr. 10 L/100km prazno → 10,3 L na 1 000 kg, 10,9 L na 3 000 kg',
+    volUsedOf: (used, cap) => `${used} m³ iskorišćeno od ${cap} m³ ukupnog kapaciteta`,
+    wtUsedOf: (used, cap) => `${used} kg iskorišćeno od ${cap} kg ukupnog kapaciteta`,
+    unloadPopup: min => `Istovar: ${min}min`,
   }
 };
 
@@ -300,6 +328,8 @@ function applyLanguage() {
   updateFleetFooter();
   updateObjHint();
   updateConstraintHint();
+  updatePkgSizes();
+  updatePkgWeights();
 
   // Update results placeholder if visible
   const ph = document.getElementById('results-placeholder');
@@ -487,7 +517,7 @@ function placeCustomer(lat, lng, name, pkg_counts, time_window, unloading_time) 
   });
   const marker = L.marker([lat, lng], { icon, draggable:true })
     .addTo(map)
-    .bindPopup(`<b>${cname}</b><br>📦 P1:${pkg_counts[0]} P2:${pkg_counts[1]} P3:${pkg_counts[2]}<br>📐 ${vol.toFixed(2)} m³ · ⚖️ ${calcWeight(pkg_counts).toFixed(1)} kg<br>⏱ ${time_window.start}–${time_window.end}<br>🔧 Unload: ${unload}min`);
+    .bindPopup(`<b>${cname}</b><br>📦 P1:${pkg_counts[0]} P2:${pkg_counts[1]} P3:${pkg_counts[2]}<br>📐 ${vol.toFixed(2)} m³ · ⚖️ ${calcWeight(pkg_counts).toFixed(1)} kg<br>⏱ ${time_window.start}–${time_window.end}<br>🔧 ${t('unloadPopup')(unload)}`);
   marker.on('dragend', e => {
     const p = e.target.getLatLng();
     cust.lat = p.lat; cust.lng = p.lng;
@@ -603,7 +633,7 @@ function updatePkgSizes() {
   const s3 = parseFloat(document.getElementById('pkg-size-3')?.value) || 0.60;
   state.pkg_sizes = [s1, s2, s3];
   const el = document.getElementById('pkg-sizes-summary');
-  if (el) el.textContent = `Sizes: ${s1.toFixed(3)} · ${s2.toFixed(3)} · ${s3.toFixed(3)} m³`;
+  if (el) el.textContent = t('sizesLabel')(s1.toFixed(3), s2.toFixed(3), s3.toFixed(3));
   updatePkgVolHint();
   updateFleetFooter();
 }
@@ -614,7 +644,7 @@ function updatePkgWeights() {
   const w3 = parseFloat(document.getElementById('pkg-weight-3')?.value) || 30.0;
   state.pkg_weights_kg = [w1, w2, w3];
   const el = document.getElementById('pkg-weights-summary');
-  if (el) el.textContent = `Weights: ${w1.toFixed(1)} · ${w2.toFixed(1)} · ${w3.toFixed(1)} kg`;
+  if (el) el.textContent = t('weightsLabel')(w1.toFixed(1), w2.toFixed(1), w3.toFixed(1));
 }
 
 function calcWeight(pkg_counts) {
@@ -1047,7 +1077,7 @@ function drawResults(data) {
       const pct = Math.round(totalVolUsed / totalVolCap * 100);
       volPctEl.textContent = pct + '%';
       volPctEl.style.color = pctColor(pct);
-      volPctEl.title = `${totalVolUsed.toFixed(2)} m³ used of ${totalVolCap.toFixed(1)} m³ total capacity`;
+      volPctEl.title = t('volUsedOf')(totalVolUsed.toFixed(2), totalVolCap.toFixed(1));
     } else {
       volPctEl.textContent = '—';
     }
@@ -1059,7 +1089,7 @@ function drawResults(data) {
       const pct = Math.round(totalWtUsed / totalWtCap * 100);
       wtPctEl.textContent = pct + '%';
       wtPctEl.style.color = pctColor(pct);
-      wtPctEl.title = `${totalWtUsed.toFixed(0)} kg used of ${totalWtCap.toLocaleString()} kg total capacity`;
+      wtPctEl.title = t('wtUsedOf')(totalWtUsed.toFixed(0), totalWtCap.toLocaleString());
     } else {
       wtPctEl.textContent = '—';
     }

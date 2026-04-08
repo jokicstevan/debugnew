@@ -125,7 +125,7 @@
     <!-- Package Types -->
     <section class="panel">
       <div class="panel-title" data-i18n="packageTypes">📦 Package Types</div>
-      <div style="font-size:9px;color:var(--muted);margin-bottom:8px;">Volumetric size per package type</div>
+      <div style="font-size:9px;color:var(--muted);margin-bottom:8px;" data-i18n="volSizeHint">Volumetric size per package type</div>
       <div class="field-row">
         <label data-i18n="type1m3">Type 1 (m³)</label>
         <input type="number" id="pkg-size-1" value="0.100" min="0.001" max="10" step="0.001" oninput="updatePkgSizes()">
@@ -147,23 +147,22 @@
     <section class="panel">
       <div class="panel-title" data-i18n="packageWeights">⚖️ Package Weights</div>
       <div style="font-size:9px;color:var(--muted);margin-bottom:8px;">
-        Weight per package type (kg) — used for vehicle weight capacity constraints
-        and load-dependent fuel calculation
+        <span data-i18n="weightHint">Weight per package type (kg) — used for vehicle weight capacity constraints and load-dependent fuel calculation</span>
       </div>
       <div class="field-row">
         <label data-i18n="type1kg">Type 1 (kg)</label>
         <input type="number" id="pkg-weight-1" value="5" min="0.1" max="1000" step="0.1"
-               oninput="updatePkgWeights()" title="Typical small parcel: 3–8 kg">
+               oninput="updatePkgWeights()" data-i18n="titleSmallParcel" data-i18n-attr="title" title="Typical small parcel: 3–8 kg">
       </div>
       <div class="field-row">
         <label data-i18n="type2kg">Type 2 (kg)</label>
         <input type="number" id="pkg-weight-2" value="15" min="0.1" max="1000" step="0.1"
-               oninput="updatePkgWeights()" title="Typical medium box: 10–20 kg">
+               oninput="updatePkgWeights()" data-i18n="titleMediumBox" data-i18n-attr="title" title="Typical medium box: 10–20 kg">
       </div>
       <div class="field-row">
         <label data-i18n="type3kg">Type 3 (kg)</label>
         <input type="number" id="pkg-weight-3" value="30" min="0.1" max="1000" step="0.1"
-               oninput="updatePkgWeights()" title="Typical large item: 20–50 kg">
+               oninput="updatePkgWeights()" data-i18n="titleLargeItem" data-i18n-attr="title" title="Typical large item: 20–50 kg">
       </div>
       <div id="pkg-weights-summary" style="font-size:9px;color:var(--accent);padding:4px 6px;background:var(--bg3);border-radius:4px;font-family:var(--font-mono);">
         Weights: 5.0 · 15.0 · 30.0 kg
@@ -349,18 +348,18 @@
       <div class="field-row">
         <label data-i18n="weightCap">Weight cap (kg)</label>
         <input type="number" id="modal-weight-cap" min="0" max="50000" step="50" value="0"
-               title="Max payload weight in kg. Set 0 for unlimited.">
+               data-i18n="titleWeightCap" data-i18n-attr="title" title="Max payload weight in kg. Set 0 for unlimited.">
         <span style="font-size:10px;color:var(--muted);margin-left:4px">0=∞</span>
       </div>
       <div class="field-row">
         <label data-i18n="fuel">Fuel (L/100km)</label>
         <input type="number" id="modal-fuel" min="1" max="100" step="0.1" value="10"
-               title="Base fuel consumption when empty. Increases linearly with load.">
+               data-i18n="titleFuelBase" data-i18n-attr="title" title="Base fuel consumption when empty. Increases linearly with load.">
       </div>
       <div class="field-row" id="modal-hint" style="color:var(--accent);font-size:11px;"></div>
       <div style="font-size:9px;color:var(--muted);padding:4px 6px;background:var(--bg3);border-radius:4px;line-height:1.5">
-        ⛽ Fuel usage is load-dependent: +3% per 1 000 kg payload<br>
-        e.g. 10 L/100km empty → 10.3 L at 1 000 kg, 10.9 L at 3 000 kg
+        <span data-i18n="fuelLoadNote">⛽ Fuel usage is load-dependent: +3% per 1 000 kg payload</span><br>
+        <span data-i18n="fuelLoadExample">e.g. 10 L/100km empty → 10.3 L at 1 000 kg, 10.9 L at 3 000 kg</span>
       </div>
     </div>
     <div class="modal-footer">

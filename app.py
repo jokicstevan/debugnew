@@ -270,13 +270,13 @@ def import_excel():
 
 # ─────────────────────── OSRM MATRIX ─────────────────────────────────────────
 
-# Belgrade bounding box (generous margin)
-BELGRADE_BBOX = {"lat_min": 44.60, "lat_max": 45.00,
-                  "lng_min": 20.20, "lng_max": 20.70}
+# Serbia bounding box
+SERBIA_BBOX = {"lat_min": 41.85, "lat_max": 46.20,
+               "lng_min": 18.80, "lng_max": 23.00}
 
-def in_belgrade(lat, lng):
-    """Return True if coordinates are within Greater Belgrade area."""
-    b = BELGRADE_BBOX
+def in_serbia(lat, lng):
+    """Return True if coordinates are within Serbia."""
+    b = SERBIA_BBOX
     return b["lat_min"] <= lat <= b["lat_max"] and b["lng_min"] <= lng <= b["lng_max"]
 
 HERE_API_KEY = os.environ.get("HERE_API_KEY", "")
@@ -1185,17 +1185,17 @@ def optimize():
         n_depots = len(depots)
         n_cust   = len(customers)
 
-        # Belgrade validation
+        # Serbia validation
         outside = []
         for i, dep in enumerate(depots):
-            if not in_belgrade(dep["lat"], dep["lng"]):
+            if not in_serbia(dep["lat"], dep["lng"]):
                 outside.append(dep.get("name", f"Depot {i+1}"))
         for c in customers:
-            if not in_belgrade(c["lat"], c["lng"]):
+            if not in_serbia(c["lat"], c["lng"]):
                 outside.append(c.get("name", "Customer"))
         if outside:
             return jsonify({"ok": False,
-                "error": f"Outside Belgrade: {', '.join(outside[:5])}."})
+                "error": f"Outside Serbia: {', '.join(outside[:5])}."})
 
         # all_locs for matrix: [depots, original customers] (unique locations)
         # After split-delivery expansion we remap sub-order matrix indices
