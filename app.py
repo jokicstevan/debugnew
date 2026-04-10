@@ -730,7 +730,8 @@ class VRPState:
     def __init__(self, routes, depot_of, dist_mat, time_mat,
                  demands, fleet, tw, n_depots, svc=SERVICE_TIME,
                  use_tw=False, svc_map=None, demands_kg=None, obj_weights=None,
-                 use_volume_cap=True, use_weight_cap=True):
+                 use_volume_cap=True, use_weight_cap=True,
+                 fuel_price_rsd_l=None, driver_wage_rsd_h=None):
         self.routes     = routes
         self.depot_of   = depot_of
         self.dist_mat   = dist_mat
@@ -750,6 +751,8 @@ class VRPState:
         # Constraint toggles: when False, the corresponding hard constraint is ignored
         self.use_volume_cap = use_volume_cap
         self.use_weight_cap = use_weight_cap
+        self.fuel_price_rsd_l  = fuel_price_rsd_l  if fuel_price_rsd_l  is not None else FUEL_PRICE_RSD_PER_LITRE
+        self.driver_wage_rsd_h = driver_wage_rsd_h if driver_wage_rsd_h is not None else DRIVER_WAGE_RSD_PER_HOUR
 
     def fuel_per_100km(self, v, payload_kg=0.0):
         """Base fuel + linear load surcharge.
@@ -782,7 +785,8 @@ class VRPState:
             self.demands, self.fleet, self.tw,
             self.n_depots, self.svc, self.use_tw, self.svc_map, self.demands_kg,
             self.obj_weights,
-            self.use_volume_cap, self.use_weight_cap)
+            self.use_volume_cap, self.use_weight_cap,
+            self.fuel_price_rsd_l, self.driver_wage_rsd_h)
 
     def cap(self, v):
         return self.fleet[v]["capacity"] if v < len(self.fleet) else float("inf")
@@ -867,12 +871,12 @@ class VRPState:
                     self.demands_kg, self.n_depots,
                     lambda kg, _v=v: self.fuel_per_100km(_v, kg)
                 )
-                total += fuel_litres * FUEL_PRICE_RSD_PER_LITRE
+                total += fuel_litres * self.fuel_price_rsd_l
             if do_wages:
                 work_mins = route_working_minutes(
                     route, depot, self.dist_mat, self.time_mat, self.tw, self.svc,
                     start, self.svc_map)
-                total += (work_mins / 60.0) * DRIVER_WAGE_RSD_PER_HOUR
+                total += (work_mins / 60.0) * self.driver_wage_rsd_h
             if do_dist:
                 total += dist_km * DIST_RSD_PER_KM
             if do_vehicles:
@@ -1071,7 +1075,8 @@ def mins_to_hhmm(m):
 
 def optimize_nn(dist_mat, time_mat, n_depots, n_cust, tw, demands,
                 use_tw=False, svc_map=None, demands_kg=None, obj_weights=None,
-                use_volume_cap=True, use_weight_cap=True):
+                use_volume_cap=True, use_weight_cap=True,
+                fuel_price_rsd_l=None, driver_wage_rsd_h=None):
     """Single-vehicle nearest-neighbour. Returns VRPState."""
     depot = 0
     unvis = list(range(n_depots, n_depots + n_cust))
@@ -1083,17 +1088,20 @@ def optimize_nn(dist_mat, time_mat, n_depots, n_cust, tw, demands,
     return VRPState([route], [depot], dist_mat, time_mat, demands, fleet, tw, n_depots,
                     use_tw=use_tw, svc_map=svc_map, demands_kg=demands_kg,
                     obj_weights=obj_weights,
-                    use_volume_cap=use_volume_cap, use_weight_cap=use_weight_cap)
+                    use_volume_cap=use_volume_cap, use_weight_cap=use_weight_cap,
+                    fuel_price_rsd_l=fuel_price_rsd_l, driver_wage_rsd_h=driver_wage_rsd_h)
 
 
 def optimize_2opt(dist_mat, time_mat, n_depots, n_cust, tw, demands,
                   use_tw=False, svc_map=None, demands_kg=None, obj_weights=None,
-                  use_volume_cap=True, use_weight_cap=True):
+                  use_volume_cap=True, use_weight_cap=True,
+                  fuel_price_rsd_l=None, driver_wage_rsd_h=None):
     """Single-vehicle 2-opt. Returns VRPState."""
     s = optimize_nn(dist_mat, time_mat, n_depots, n_cust, tw, demands,
                     use_tw=use_tw, svc_map=svc_map, demands_kg=demands_kg,
                     obj_weights=obj_weights,
-                    use_volume_cap=use_volume_cap, use_weight_cap=use_weight_cap)
+                    use_volume_cap=use_volume_cap, use_weight_cap=use_weight_cap,
+                    fuel_price_rsd_l=fuel_price_rsd_l, driver_wage_rsd_h=driver_wage_rsd_h)
     route = s.routes[0][:]
     depot = s.depot_of[0]
 
@@ -1119,7 +1127,8 @@ def optimize_2opt(dist_mat, time_mat, n_depots, n_cust, tw, demands,
 
 def optimize_alns(dist_mat, time_mat, n_depots, n_cust, tw, demands,
                   fleet, max_iter=300, temperature=150.0, use_tw=False, svc_map=None,
-                  demands_kg=None, obj_weights=None, use_volume_cap=True, use_weight_cap=True):
+                  demands_kg=None, obj_weights=None, use_volume_cap=True, use_weight_cap=True,
+                  fuel_price_rsd_l=None, driver_wage_rsd_h=None):
     """ALNS multi-vehicle optimiser. Returns VRPState."""
     demands_kg = demands_kg or [0.0] * len(demands)
     num_v  = len(fleet)
@@ -1161,7 +1170,8 @@ def optimize_alns(dist_mat, time_mat, n_depots, n_cust, tw, demands,
                      demands, fleet, tw, n_depots,
                      use_tw=use_tw, svc_map=svc_map, demands_kg=demands_kg,
                      obj_weights=obj_weights,
-                     use_volume_cap=use_volume_cap, use_weight_cap=use_weight_cap)
+                     use_volume_cap=use_volume_cap, use_weight_cap=use_weight_cap,
+                     fuel_price_rsd_l=fuel_price_rsd_l, driver_wage_rsd_h=driver_wage_rsd_h)
     state.reassign_depots()
 
     best     = state.copy()
@@ -1232,6 +1242,9 @@ def optimize():
         # Ensure at least one component is active
         if not any(obj_weights.values()):
             obj_weights["fuel"] = obj_weights["wages"] = True
+        # Cost parameters — user-editable, fall back to Serbia defaults
+        fuel_price_rsd_l  = float(data.get("fuel_price_rsd_l",  FUEL_PRICE_RSD_PER_LITRE))
+        driver_wage_rsd_h = float(data.get("driver_wage_rsd_h", DRIVER_WAGE_RSD_PER_HOUR))
         # Hard constraint toggles
         use_volume_cap = bool(data.get("use_volume_capacity", True))
         use_weight_cap = bool(data.get("use_weight_capacity", True))
@@ -1435,19 +1448,22 @@ def optimize():
             state = optimize_nn(dist_mat, time_mat, n_depots, n_cust, tw, demands,
                                 use_tw=use_tw, svc_map=svc_map, demands_kg=demands_kg,
                                 obj_weights=obj_weights,
-                                use_volume_cap=use_volume_cap, use_weight_cap=use_weight_cap)
+                                use_volume_cap=use_volume_cap, use_weight_cap=use_weight_cap,
+                                fuel_price_rsd_l=fuel_price_rsd_l, driver_wage_rsd_h=driver_wage_rsd_h)
         elif "Model 2" in algorithm:
             state = optimize_2opt(dist_mat, time_mat, n_depots, n_cust, tw, demands,
                                   use_tw=use_tw, svc_map=svc_map, demands_kg=demands_kg,
                                   obj_weights=obj_weights,
-                                  use_volume_cap=use_volume_cap, use_weight_cap=use_weight_cap)
+                                  use_volume_cap=use_volume_cap, use_weight_cap=use_weight_cap,
+                                  fuel_price_rsd_l=fuel_price_rsd_l, driver_wage_rsd_h=driver_wage_rsd_h)
         else:
             # Model 1 (ALNS multi-vehicle) — also the default
             state = optimize_alns(dist_mat, time_mat, n_depots, n_cust, tw,
                                    demands, fleet, max_iter, temperature,
                                    use_tw=use_tw, svc_map=svc_map, demands_kg=demands_kg,
                                    obj_weights=obj_weights,
-                                   use_volume_cap=use_volume_cap, use_weight_cap=use_weight_cap)
+                                   use_volume_cap=use_volume_cap, use_weight_cap=use_weight_cap,
+                                   fuel_price_rsd_l=fuel_price_rsd_l, driver_wage_rsd_h=driver_wage_rsd_h)
 
         # Assign user fleet config to state vehicles
         for v in range(len(state.routes)):
@@ -1533,12 +1549,12 @@ def optimize():
                 demands_kg, n_depots,
                 lambda kg: base_fuel * (1.0 + FUEL_LOAD_FACTOR_PER_1000KG * kg / 1000.0)
             ), 2)
-            fuel_cost       = round(fuel_l * FUEL_PRICE_RSD_PER_LITRE, 0)
+            fuel_cost       = round(fuel_l * fuel_price_rsd_l, 0)
             work_mins   = route_working_minutes(
                 route, depot_mat, dist_mat, time_mat, tw, SERVICE_TIME, depart_min,
                 svc_map)
             work_h      = round(work_mins / 60.0, 2)
-            wage_cost   = round(work_h * DRIVER_WAGE_RSD_PER_HOUR, 0)
+            wage_cost   = round(work_h * driver_wage_rsd_h, 0)
 
             # Return-to-depot time
             if sched:
@@ -1602,8 +1618,8 @@ def optimize():
             "total_fuel_cost_rsd": total_fuel_cost_rsd,
             "total_wage_cost_rsd": total_wage_cost_rsd,
             "total_cost_rsd":      total_cost_rsd,
-            "driver_wage_rsd_h":   DRIVER_WAGE_RSD_PER_HOUR,
-            "fuel_price_rsd_l":    FUEL_PRICE_RSD_PER_LITRE,
+            "driver_wage_rsd_h":   driver_wage_rsd_h,
+            "fuel_price_rsd_l":    fuel_price_rsd_l,
             "total_time_h":        hours,
             "total_time_m":        mins,
             "total_volume":        round(total_volume, 3),

@@ -601,3 +601,34 @@ body {
   border-color:var(--accent2);
   color:var(--text);
 }
+
+/* ── COLLAPSIBLE PANELS ──────────────────────────────────────────────────── */
+.panel-title {
+  cursor: pointer;
+  user-select: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.panel-title::after {
+  content: '▾';
+  font-size: 13px;
+  color: var(--muted);
+  transition: transform .2s;
+  flex-shrink: 0;
+  margin-left: 6px;
+}
+.panel.collapsed .panel-title::after {
+  transform: rotate(-90deg);
+}
+.panel-body {
+  overflow: hidden;
+  transition: max-height .25s ease, opacity .2s ease;
+  max-height: 2000px;
+  opacity: 1;
+}
+.panel.collapsed .panel-body {
+  max-height: 0 !important;
+  opacity: 0;
+  pointer-events: none;
+}

@@ -149,6 +149,11 @@ const TRANSLATIONS = {
     volUsedOf: (used, cap) => `${used} m³ used of ${cap} m³ total capacity`,
     wtUsedOf: (used, cap) => `${used} kg used of ${cap} kg total capacity`,
     unloadPopup: min => `Unload: ${min}min`,
+    costParams: '💰 Cost Parameters',
+    costParamsHint: 'Adjust to match your local fuel price and driver wage',
+    costParamsNote: '⛽ Fuel also increases +3% per 1 000 kg payload',
+    fuelPriceLabel: '⛽ Fuel price (RSD/L)',
+    driverWageLabel: '👷 Driver wage (RSD/h)',
   },
   sr: {
     routePlanner: 'Planer ruta',
@@ -293,6 +298,11 @@ const TRANSLATIONS = {
     volUsedOf: (used, cap) => `${used} m³ iskorišćeno od ${cap} m³ ukupnog kapaciteta`,
     wtUsedOf: (used, cap) => `${used} kg iskorišćeno od ${cap} kg ukupnog kapaciteta`,
     unloadPopup: min => `Istovar: ${min}min`,
+    costParams: '💰 Parametri troškova',
+    costParamsHint: 'Prilagodite lokalnoj ceni goriva i plati vozača',
+    costParamsNote: '⛽ Gorivo raste +3% na svakih 1 000 kg tereta',
+    fuelPriceLabel: '⛽ Cena goriva (RSD/L)',
+    driverWageLabel: '👷 Plata vozača (RSD/h)',
   }
 };
 
@@ -403,6 +413,8 @@ window.addEventListener('DOMContentLoaded', () => {
 
   renderFleetCards();
   updateFleetFooter();
+  restorePanelStates();
+  updateCostHint();
 
   document.getElementById('algo-select').addEventListener('change', function() {
     document.getElementById('alns-opts').style.display =
@@ -811,6 +823,43 @@ function closeFleetModal() {
   state.editingFleetIdx = null;
 }
 
+// ─── COLLAPSIBLE PANELS ───────────────────────────────────────────────────────
+function togglePanel(id) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.classList.toggle('collapsed');
+  // persist state
+  try {
+    const states = JSON.parse(localStorage.getItem('grps_panels') || '{}');
+    states[id] = el.classList.contains('collapsed');
+    localStorage.setItem('grps_panels', JSON.stringify(states));
+  } catch(e) {}
+}
+
+function restorePanelStates() {
+  try {
+    const states = JSON.parse(localStorage.getItem('grps_panels') || '{}');
+    Object.entries(states).forEach(([id, collapsed]) => {
+      const el = document.getElementById(id);
+      if (el && collapsed) el.classList.add('collapsed');
+    });
+  } catch(e) {}
+}
+
+// ─── COST PARAMETERS ─────────────────────────────────────────────────────────
+function getCostParams() {
+  return {
+    fuel_price_rsd_l:  parseFloat(document.getElementById('fuel-price-rsd')?.value) || 200,
+    driver_wage_rsd_h: parseFloat(document.getElementById('driver-wage-rsd')?.value) || 900,
+  };
+}
+
+function updateCostHint() {
+  const p = getCostParams();
+  const el = document.getElementById('cost-hint');
+  if (el) el.textContent = `${p.fuel_price_rsd_l} RSD/L · ${p.driver_wage_rsd_h} RSD/h`;
+}
+
 // ─── OBJECTIVE SELECTOR ──────────────────────────────────────────────────────
 function getObjWeights() {
   return {
@@ -877,6 +926,7 @@ async function runOptimize() {
     pkg_sizes:      state.pkg_sizes,
     pkg_weights_kg: state.pkg_weights_kg,
     obj_weights:    getObjWeights(),
+    ...getCostParams(),
     algorithm: document.getElementById('algo-select').value,
     use_time_windows:    document.getElementById('use-tw').checked,
     use_volume_capacity: document.getElementById('use-vol-cap').checked,

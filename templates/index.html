@@ -55,9 +55,9 @@
   <aside class="sidebar" id="sidebar-left">
 
     <!-- Location controls -->
-    <section class="panel">
-      <div class="panel-title" data-i18n="locations">📍 Locations</div>
-
+    <section class="panel" id="panel-locations">
+      <div class="panel-title" data-i18n="locations" onclick="togglePanel('panel-locations')">📍 Locations</div>
+      <div class="panel-body">
       <div class="mode-tabs">
         <button class="mode-tab active" data-mode="depot" onclick="setMode('depot',this)" data-i18n="addDepot">+ Depot</button>
         <button class="mode-tab" data-mode="customer" onclick="setMode('customer',this)" data-i18n="addCustomer">+ Customer</button>
@@ -113,18 +113,22 @@
           <input type="file" id="excel-file" accept=".xlsx,.xls" style="display:none" onchange="importExcel(this)">
         </label>
       </div>
+      </div><!-- /panel-body -->
     </section>
 
     <!-- Fleet -->
-    <section class="panel">
-      <div class="panel-title" data-i18n="fleet">🚛 Fleet</div>
+    <section class="panel" id="panel-fleet">
+      <div class="panel-title" data-i18n="fleet" onclick="togglePanel('panel-fleet')">🚛 Fleet</div>
+      <div class="panel-body">
       <div id="fleet-cards" class="fleet-cards"></div>
       <div id="fleet-footer" class="fleet-footer"></div>
+      </div><!-- /panel-body -->
     </section>
 
     <!-- Package Types -->
-    <section class="panel">
-      <div class="panel-title" data-i18n="packageTypes">📦 Package Types</div>
+    <section class="panel" id="panel-pkgtypes">
+      <div class="panel-title" data-i18n="packageTypes" onclick="togglePanel('panel-pkgtypes')">📦 Package Types</div>
+      <div class="panel-body">
       <div style="font-size:9px;color:var(--muted);margin-bottom:8px;" data-i18n="volSizeHint">Volumetric size per package type</div>
       <div class="field-row">
         <label data-i18n="type1m3">Type 1 (m³)</label>
@@ -141,11 +145,13 @@
       <div id="pkg-sizes-summary" style="font-size:9px;color:var(--accent);padding:4px 6px;background:var(--bg3);border-radius:4px;font-family:var(--font-mono);">
         Sizes: 0.100 · 0.300 · 0.600 m³
       </div>
+      </div><!-- /panel-body -->
     </section>
 
     <!-- Package Weights -->
-    <section class="panel">
-      <div class="panel-title" data-i18n="packageWeights">⚖️ Package Weights</div>
+    <section class="panel" id="panel-pkgweights">
+      <div class="panel-title" data-i18n="packageWeights" onclick="togglePanel('panel-pkgweights')">⚖️ Package Weights</div>
+      <div class="panel-body">
       <div style="font-size:9px;color:var(--muted);margin-bottom:8px;">
         <span data-i18n="weightHint">Weight per package type (kg) — used for vehicle weight capacity constraints and load-dependent fuel calculation</span>
       </div>
@@ -167,11 +173,35 @@
       <div id="pkg-weights-summary" style="font-size:9px;color:var(--accent);padding:4px 6px;background:var(--bg3);border-radius:4px;font-family:var(--font-mono);">
         Weights: 5.0 · 15.0 · 30.0 kg
       </div>
+      </div><!-- /panel-body -->
+    </section>
+
+    <!-- Cost Parameters -->
+    <section class="panel" id="panel-costs">
+      <div class="panel-title" onclick="togglePanel('panel-costs')" data-i18n="costParams">💰 Cost Parameters</div>
+      <div class="panel-body">
+        <div style="font-size:9px;color:var(--muted);margin-bottom:8px;" data-i18n="costParamsHint">Adjust to match your local fuel price and driver wage</div>
+        <div class="field-row">
+          <label data-i18n="fuelPriceLabel">⛽ Fuel price (RSD/L)</label>
+          <input type="number" id="fuel-price-rsd" value="200" min="1" max="9999" step="1"
+                 title="Diesel pump price per litre in RSD" oninput="updateCostHint()">
+        </div>
+        <div class="field-row">
+          <label data-i18n="driverWageLabel">👷 Driver wage (RSD/h)</label>
+          <input type="number" id="driver-wage-rsd" value="900" min="1" max="99999" step="10"
+                 title="Gross driver wage per hour in RSD" oninput="updateCostHint()">
+        </div>
+        <div id="cost-hint" style="font-size:9px;color:var(--accent);padding:4px 6px;background:var(--bg3);border-radius:4px;font-family:var(--font-mono);margin-top:4px">
+          200 RSD/L · 900 RSD/h
+        </div>
+        <div style="font-size:9px;color:var(--muted);margin-top:4px;font-style:italic" data-i18n="costParamsNote">⛽ Fuel also increases +3% per 1 000 kg payload</div>
+      </div><!-- /panel-body -->
     </section>
 
     <!-- Algorithm -->
-    <section class="panel">
-      <div class="panel-title" data-i18n="algorithm">⚙️ Algorithm</div>
+    <section class="panel" id="panel-algo">
+      <div class="panel-title" data-i18n="algorithm" onclick="togglePanel('panel-algo')">⚙️ Algorithm</div>
+      <div class="panel-body">
       <div class="field-row">
         <label data-i18n="method">Method</label>
         <select id="algo-select">
@@ -253,6 +283,7 @@
         <div id="progress-label" class="status-line"></div>
       </div>
       <div id="routing-source-banner" style="display:none;font-size:9px;font-weight:600;padding:3px 6px;margin-top:4px;border-radius:4px;background:var(--bg3);letter-spacing:.03em"></div>
+      </div><!-- /panel-body -->
     </section>
 
   </aside>
