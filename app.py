@@ -855,19 +855,21 @@ class VRPState:
             wc = self.weight_cap(v)
             if self.use_weight_cap and wc > 0 and self.weight_load(v) > wc:
                 return float("inf")
-            # Minimum departure load penalty (soft — large but not inf so solver can converge)
+            # Minimum departure load — hard constraint: vehicle must leave depot
+            # at least min_vol_pct% full (vol) and min_wt_pct% full (weight).
+            # Returns inf so the solver never accepts these solutions.
             min_vol_pct = float(self.fleet[v].get("min_vol_pct", 0.0)) if v < len(self.fleet) else 0.0
             min_wt_pct  = float(self.fleet[v].get("min_wt_pct",  0.0)) if v < len(self.fleet) else 0.0
             if min_vol_pct > 0:
                 vol_cap = self.cap(v)
-                if vol_cap < 9990:  # skip for unlimited capacity vehicles
+                if vol_cap < 9990:  # skip for unlimited-capacity vehicles
                     vol_fill_pct = 100.0 * self.load(v) / vol_cap if vol_cap > 0 else 100.0
                     if vol_fill_pct < min_vol_pct:
-                        total += 50000.0 * (min_vol_pct - vol_fill_pct)
+                        return float("inf")
             if min_wt_pct > 0 and wc > 0:
                 wt_fill_pct = 100.0 * self.weight_load(v) / wc if wc > 0 else 100.0
                 if wt_fill_pct < min_wt_pct:
-                    total += 50000.0 * (min_wt_pct - wt_fill_pct)
+                    return float("inf")
             depot = self.depot_of[v]
             start = latest_feasible_departure(
                 route, depot, self.dist_mat, self.time_mat, self.tw, self.svc,
@@ -1182,6 +1184,52 @@ def optimize_alns(dist_mat, time_mat, n_depots, n_cust, tw, demands,
             nn = min(unvis, key=lambda x: dist_mat[cur][x])
             nr.append(nn); unvis.remove(nn); cur = nn
         ordered.append(nr)
+
+    # ── Min-load consolidation: merge under-loaded vehicles into fuller ones ──
+    # This ensures the initial state is always feasible w.r.t. min_vol_pct /
+    # min_wt_pct so the ALNS solver always starts from a valid baseline.
+    for v in range(num_v):
+        if not ordered[v]:
+            continue
+        min_vol_pct = float(fleet[v].get("min_vol_pct", 0.0))
+        min_wt_pct  = float(fleet[v].get("min_wt_pct",  0.0))
+        vol_cap = float(fleet[v].get("capacity", float("inf")))
+        wt_cap  = float(fleet[v].get("weight_capacity", 0.0))
+        vol_ok = (min_vol_pct <= 0 or vol_cap >= 9990 or
+                  (loads[v] / vol_cap * 100.0) >= min_vol_pct)
+        wt_ok  = (min_wt_pct  <= 0 or wt_cap  <= 0   or
+                  (wloads[v]  / wt_cap  * 100.0) >= min_wt_pct)
+        if vol_ok and wt_ok:
+            continue
+        # This vehicle is under-loaded — redistribute its customers to others
+        for ci in ordered[v]:
+            dem = demands[ci - n_depots]
+            kg  = demands_kg[ci - n_depots] if (ci - n_depots) < len(demands_kg) else 0.0
+            # Find best other vehicle that still fits
+            best_other = None
+            best_load  = float("inf")
+            for u in range(num_v):
+                if u == v:
+                    continue
+                vc  = float(fleet[u].get("capacity", float("inf")))
+                wcu = float(fleet[u].get("weight_capacity", 0.0))
+                vol_fits = (not use_volume_cap) or (loads[u] + dem <= vc)
+                wt_fits  = (not use_weight_cap) or (wcu == 0) or (wloads[u] + kg <= wcu)
+                if vol_fits and wt_fits and loads[u] < best_load:
+                    best_load  = loads[u]
+                    best_other = u
+            if best_other is not None:
+                ordered[best_other].append(ci)
+                loads[best_other]  += dem
+                wloads[best_other] += kg
+            else:
+                # No vehicle can absorb it — keep on original to avoid losing customers
+                ordered[v] = [ci] + [c for c in ordered[v] if c != ci]
+                continue
+        # Clear the under-loaded vehicle
+        ordered[v] = []
+        loads[v]   = 0.0
+        wloads[v]  = 0.0
 
     depot_of = [0] * num_v
     state = VRPState(ordered, depot_of, dist_mat, time_mat,
