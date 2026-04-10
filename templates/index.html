@@ -191,10 +191,15 @@
           <input type="number" id="driver-wage-rsd" value="900" min="1" max="99999" step="10"
                  title="Gross driver wage per hour in RSD" oninput="updateCostHint()">
         </div>
-        <div id="cost-hint" style="font-size:9px;color:var(--accent);padding:4px 6px;background:var(--bg3);border-radius:4px;font-family:var(--font-mono);margin-top:4px">
-          200 RSD/L · 900 RSD/h
+        <div class="field-row">
+          <label data-i18n="fuelLoadFactorLabel">📦 Fuel +% per 1 000 kg</label>
+          <input type="number" id="fuel-load-factor" value="3" min="0" max="20" step="0.5"
+                 title="How much extra fuel (%) is used per 1 000 kg of payload. Default: 3%" oninput="updateCostHint()">
         </div>
-        <div style="font-size:9px;color:var(--muted);margin-top:4px;font-style:italic" data-i18n="costParamsNote">⛽ Fuel also increases +3% per 1 000 kg payload</div>
+        <div id="cost-hint" style="font-size:9px;color:var(--accent);padding:4px 6px;background:var(--bg3);border-radius:4px;font-family:var(--font-mono);margin-top:4px">
+          200 RSD/L · 900 RSD/h · +3%/t
+        </div>
+        <div id="cost-load-note" style="font-size:9px;color:var(--muted);margin-top:4px;font-style:italic">⛽ Fuel also increases +3% per 1 000 kg payload</div>
       </div><!-- /panel-body -->
     </section>
 
@@ -385,12 +390,27 @@
       <div class="field-row">
         <label data-i18n="fuel">Fuel (L/100km)</label>
         <input type="number" id="modal-fuel" min="1" max="100" step="0.1" value="10"
-               data-i18n="titleFuelBase" data-i18n-attr="title" title="Base fuel consumption when empty. Increases linearly with load.">
+               data-i18n="titleFuelBase" data-i18n-attr="title" title="Base fuel consumption when empty. Increases linearly with load."
+               oninput="_refreshModalFuelNote(getCostParams().fuel_load_factor_pct)">
+      </div>
+      <div style="border-top:1px solid var(--border2);margin:8px 0 6px;padding-top:6px">
+        <div style="font-size:10px;color:var(--muted);margin-bottom:6px;letter-spacing:.05em;text-transform:uppercase" data-i18n="minLoadTitle">📦 Minimum departure load</div>
+        <div style="font-size:9px;color:var(--muted);margin-bottom:6px;" data-i18n="minLoadHint">Vehicles leaving the depot must carry at least this % of their capacity. Set 0 to disable.</div>
+        <div class="field-row">
+          <label data-i18n="minVolPct">Min vol load (%)</label>
+          <input type="number" id="modal-min-vol-pct" min="0" max="100" step="5" value="0"
+                 title="Minimum volume fill % before a vehicle is allowed to depart">
+        </div>
+        <div class="field-row">
+          <label data-i18n="minWtPct">Min weight load (%)</label>
+          <input type="number" id="modal-min-wt-pct" min="0" max="100" step="5" value="0"
+                 title="Minimum weight fill % before a vehicle is allowed to depart (ignored if weight cap is 0)">
+        </div>
       </div>
       <div class="field-row" id="modal-hint" style="color:var(--accent);font-size:11px;"></div>
       <div style="font-size:9px;color:var(--muted);padding:4px 6px;background:var(--bg3);border-radius:4px;line-height:1.5">
-        <span data-i18n="fuelLoadNote">⛽ Fuel usage is load-dependent: +3% per 1 000 kg payload</span><br>
-        <span data-i18n="fuelLoadExample">e.g. 10 L/100km empty → 10.3 L at 1 000 kg, 10.9 L at 3 000 kg</span>
+        <span id="modal-fuel-load-note">⛽ Fuel usage is load-dependent: +3% per 1 000 kg payload</span><br>
+        <span id="modal-fuel-load-example">e.g. 10 L/100km empty → 10.3 L at 1 000 kg, 10.9 L at 3 000 kg</span>
       </div>
     </div>
     <div class="modal-footer">

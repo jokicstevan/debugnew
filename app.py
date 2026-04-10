@@ -731,7 +731,8 @@ class VRPState:
                  demands, fleet, tw, n_depots, svc=SERVICE_TIME,
                  use_tw=False, svc_map=None, demands_kg=None, obj_weights=None,
                  use_volume_cap=True, use_weight_cap=True,
-                 fuel_price_rsd_l=None, driver_wage_rsd_h=None):
+                 fuel_price_rsd_l=None, driver_wage_rsd_h=None,
+                 fuel_load_factor=None):
         self.routes     = routes
         self.depot_of   = depot_of
         self.dist_mat   = dist_mat
@@ -753,17 +754,18 @@ class VRPState:
         self.use_weight_cap = use_weight_cap
         self.fuel_price_rsd_l  = fuel_price_rsd_l  if fuel_price_rsd_l  is not None else FUEL_PRICE_RSD_PER_LITRE
         self.driver_wage_rsd_h = driver_wage_rsd_h if driver_wage_rsd_h is not None else DRIVER_WAGE_RSD_PER_HOUR
+        self.fuel_load_factor  = fuel_load_factor  if fuel_load_factor  is not None else FUEL_LOAD_FACTOR_PER_1000KG
 
     def fuel_per_100km(self, v, payload_kg=0.0):
         """Base fuel + linear load surcharge.
         payload_kg = total cargo weight on this vehicle for this route.
-        Formula: L/100km = base * (1 + FUEL_LOAD_FACTOR_PER_1000KG * payload_kg / 1000)
+        Formula: L/100km = base * (1 + fuel_load_factor * payload_kg / 1000)
         """
         if v < len(self.fleet):
             base = float(self.fleet[v].get("fuel_consumption", 10.0))
         else:
             base = 10.0
-        surcharge = 1.0 + FUEL_LOAD_FACTOR_PER_1000KG * payload_kg / 1000.0
+        surcharge = 1.0 + self.fuel_load_factor * payload_kg / 1000.0
         return base * surcharge
 
     def weight_cap(self, v):
@@ -786,7 +788,8 @@ class VRPState:
             self.n_depots, self.svc, self.use_tw, self.svc_map, self.demands_kg,
             self.obj_weights,
             self.use_volume_cap, self.use_weight_cap,
-            self.fuel_price_rsd_l, self.driver_wage_rsd_h)
+            self.fuel_price_rsd_l, self.driver_wage_rsd_h,
+            self.fuel_load_factor)
 
     def cap(self, v):
         return self.fleet[v]["capacity"] if v < len(self.fleet) else float("inf")
@@ -852,6 +855,19 @@ class VRPState:
             wc = self.weight_cap(v)
             if self.use_weight_cap and wc > 0 and self.weight_load(v) > wc:
                 return float("inf")
+            # Minimum departure load penalty (soft — large but not inf so solver can converge)
+            min_vol_pct = float(self.fleet[v].get("min_vol_pct", 0.0)) if v < len(self.fleet) else 0.0
+            min_wt_pct  = float(self.fleet[v].get("min_wt_pct",  0.0)) if v < len(self.fleet) else 0.0
+            if min_vol_pct > 0:
+                vol_cap = self.cap(v)
+                if vol_cap < 9990:  # skip for unlimited capacity vehicles
+                    vol_fill_pct = 100.0 * self.load(v) / vol_cap if vol_cap > 0 else 100.0
+                    if vol_fill_pct < min_vol_pct:
+                        total += 50000.0 * (min_vol_pct - vol_fill_pct)
+            if min_wt_pct > 0 and wc > 0:
+                wt_fill_pct = 100.0 * self.weight_load(v) / wc if wc > 0 else 100.0
+                if wt_fill_pct < min_wt_pct:
+                    total += 50000.0 * (min_wt_pct - wt_fill_pct)
             depot = self.depot_of[v]
             start = latest_feasible_departure(
                 route, depot, self.dist_mat, self.time_mat, self.tw, self.svc,
@@ -1076,7 +1092,7 @@ def mins_to_hhmm(m):
 def optimize_nn(dist_mat, time_mat, n_depots, n_cust, tw, demands,
                 use_tw=False, svc_map=None, demands_kg=None, obj_weights=None,
                 use_volume_cap=True, use_weight_cap=True,
-                fuel_price_rsd_l=None, driver_wage_rsd_h=None):
+                fuel_price_rsd_l=None, driver_wage_rsd_h=None, fuel_load_factor=None):
     """Single-vehicle nearest-neighbour. Returns VRPState."""
     depot = 0
     unvis = list(range(n_depots, n_depots + n_cust))
@@ -1089,19 +1105,21 @@ def optimize_nn(dist_mat, time_mat, n_depots, n_cust, tw, demands,
                     use_tw=use_tw, svc_map=svc_map, demands_kg=demands_kg,
                     obj_weights=obj_weights,
                     use_volume_cap=use_volume_cap, use_weight_cap=use_weight_cap,
-                    fuel_price_rsd_l=fuel_price_rsd_l, driver_wage_rsd_h=driver_wage_rsd_h)
+                    fuel_price_rsd_l=fuel_price_rsd_l, driver_wage_rsd_h=driver_wage_rsd_h,
+                    fuel_load_factor=fuel_load_factor)
 
 
 def optimize_2opt(dist_mat, time_mat, n_depots, n_cust, tw, demands,
                   use_tw=False, svc_map=None, demands_kg=None, obj_weights=None,
                   use_volume_cap=True, use_weight_cap=True,
-                  fuel_price_rsd_l=None, driver_wage_rsd_h=None):
+                  fuel_price_rsd_l=None, driver_wage_rsd_h=None, fuel_load_factor=None):
     """Single-vehicle 2-opt. Returns VRPState."""
     s = optimize_nn(dist_mat, time_mat, n_depots, n_cust, tw, demands,
                     use_tw=use_tw, svc_map=svc_map, demands_kg=demands_kg,
                     obj_weights=obj_weights,
                     use_volume_cap=use_volume_cap, use_weight_cap=use_weight_cap,
-                    fuel_price_rsd_l=fuel_price_rsd_l, driver_wage_rsd_h=driver_wage_rsd_h)
+                    fuel_price_rsd_l=fuel_price_rsd_l, driver_wage_rsd_h=driver_wage_rsd_h,
+                    fuel_load_factor=fuel_load_factor)
     route = s.routes[0][:]
     depot = s.depot_of[0]
 
@@ -1128,7 +1146,7 @@ def optimize_2opt(dist_mat, time_mat, n_depots, n_cust, tw, demands,
 def optimize_alns(dist_mat, time_mat, n_depots, n_cust, tw, demands,
                   fleet, max_iter=300, temperature=150.0, use_tw=False, svc_map=None,
                   demands_kg=None, obj_weights=None, use_volume_cap=True, use_weight_cap=True,
-                  fuel_price_rsd_l=None, driver_wage_rsd_h=None):
+                  fuel_price_rsd_l=None, driver_wage_rsd_h=None, fuel_load_factor=None):
     """ALNS multi-vehicle optimiser. Returns VRPState."""
     demands_kg = demands_kg or [0.0] * len(demands)
     num_v  = len(fleet)
@@ -1171,7 +1189,8 @@ def optimize_alns(dist_mat, time_mat, n_depots, n_cust, tw, demands,
                      use_tw=use_tw, svc_map=svc_map, demands_kg=demands_kg,
                      obj_weights=obj_weights,
                      use_volume_cap=use_volume_cap, use_weight_cap=use_weight_cap,
-                     fuel_price_rsd_l=fuel_price_rsd_l, driver_wage_rsd_h=driver_wage_rsd_h)
+                     fuel_price_rsd_l=fuel_price_rsd_l, driver_wage_rsd_h=driver_wage_rsd_h,
+                     fuel_load_factor=fuel_load_factor)
     state.reassign_depots()
 
     best     = state.copy()
@@ -1243,8 +1262,10 @@ def optimize():
         if not any(obj_weights.values()):
             obj_weights["fuel"] = obj_weights["wages"] = True
         # Cost parameters — user-editable, fall back to Serbia defaults
-        fuel_price_rsd_l  = float(data.get("fuel_price_rsd_l",  FUEL_PRICE_RSD_PER_LITRE))
-        driver_wage_rsd_h = float(data.get("driver_wage_rsd_h", DRIVER_WAGE_RSD_PER_HOUR))
+        fuel_price_rsd_l      = float(data.get("fuel_price_rsd_l",  FUEL_PRICE_RSD_PER_LITRE))
+        driver_wage_rsd_h     = float(data.get("driver_wage_rsd_h", DRIVER_WAGE_RSD_PER_HOUR))
+        fuel_load_factor_pct  = float(data.get("fuel_load_factor_pct", FUEL_LOAD_FACTOR_PER_1000KG * 100))
+        fuel_load_factor      = fuel_load_factor_pct / 100.0   # convert % → fraction
         # Hard constraint toggles
         use_volume_cap = bool(data.get("use_volume_capacity", True))
         use_weight_cap = bool(data.get("use_weight_capacity", True))
@@ -1434,6 +1455,8 @@ def optimize():
                     "weight_capacity":  float(veh.get("weight_capacity", 0.0)),  # 0 = unlimited
                     "color":            veh.get("color", "#3b82f6"),
                     "fuel_consumption": float(veh.get("fuel_consumption", 10.0)),
+                    "min_vol_pct":      float(veh.get("min_vol_pct", 0.0)),
+                    "min_wt_pct":       float(veh.get("min_wt_pct",  0.0)),
                 })
         if not fleet:
             fleet = [{"type":"Vehicle","capacity":9999.0,"weight_capacity":0.0,
@@ -1449,13 +1472,15 @@ def optimize():
                                 use_tw=use_tw, svc_map=svc_map, demands_kg=demands_kg,
                                 obj_weights=obj_weights,
                                 use_volume_cap=use_volume_cap, use_weight_cap=use_weight_cap,
-                                fuel_price_rsd_l=fuel_price_rsd_l, driver_wage_rsd_h=driver_wage_rsd_h)
+                                fuel_price_rsd_l=fuel_price_rsd_l, driver_wage_rsd_h=driver_wage_rsd_h,
+                                fuel_load_factor=fuel_load_factor)
         elif "Model 2" in algorithm:
             state = optimize_2opt(dist_mat, time_mat, n_depots, n_cust, tw, demands,
                                   use_tw=use_tw, svc_map=svc_map, demands_kg=demands_kg,
                                   obj_weights=obj_weights,
                                   use_volume_cap=use_volume_cap, use_weight_cap=use_weight_cap,
-                                  fuel_price_rsd_l=fuel_price_rsd_l, driver_wage_rsd_h=driver_wage_rsd_h)
+                                  fuel_price_rsd_l=fuel_price_rsd_l, driver_wage_rsd_h=driver_wage_rsd_h,
+                                  fuel_load_factor=fuel_load_factor)
         else:
             # Model 1 (ALNS multi-vehicle) — also the default
             state = optimize_alns(dist_mat, time_mat, n_depots, n_cust, tw,
@@ -1463,7 +1488,8 @@ def optimize():
                                    use_tw=use_tw, svc_map=svc_map, demands_kg=demands_kg,
                                    obj_weights=obj_weights,
                                    use_volume_cap=use_volume_cap, use_weight_cap=use_weight_cap,
-                                   fuel_price_rsd_l=fuel_price_rsd_l, driver_wage_rsd_h=driver_wage_rsd_h)
+                                   fuel_price_rsd_l=fuel_price_rsd_l, driver_wage_rsd_h=driver_wage_rsd_h,
+                                   fuel_load_factor=fuel_load_factor)
 
         # Assign user fleet config to state vehicles
         for v in range(len(state.routes)):
@@ -1543,11 +1569,11 @@ def optimize():
             )
             base_fuel       = veh_cfg.get("fuel_consumption", 10.0)
             # Effective average L/100km (for display) — weight-average over the route
-            eff_fuel        = base_fuel * (1.0 + FUEL_LOAD_FACTOR_PER_1000KG * (route_weight_kg / 2.0) / 1000.0)
+            eff_fuel        = base_fuel * (1.0 + fuel_load_factor * (route_weight_kg / 2.0) / 1000.0)
             fuel_l          = round(route_fuel_litres(
                 route, depot_mat, dist_mat,
                 demands_kg, n_depots,
-                lambda kg: base_fuel * (1.0 + FUEL_LOAD_FACTOR_PER_1000KG * kg / 1000.0)
+                lambda kg: base_fuel * (1.0 + fuel_load_factor * kg / 1000.0)
             ), 2)
             fuel_cost       = round(fuel_l * fuel_price_rsd_l, 0)
             work_mins   = route_working_minutes(
@@ -1620,6 +1646,7 @@ def optimize():
             "total_cost_rsd":      total_cost_rsd,
             "driver_wage_rsd_h":   driver_wage_rsd_h,
             "fuel_price_rsd_l":    fuel_price_rsd_l,
+            "fuel_load_factor_pct": round(fuel_load_factor * 100, 2),
             "total_time_h":        hours,
             "total_time_m":        mins,
             "total_volume":        round(total_volume, 3),

@@ -144,12 +144,18 @@ const TRANSLATIONS = {
     titleLargeItem: 'Typical large item: 20–50 kg',
     titleWeightCap: 'Max payload weight in kg. Set 0 for unlimited.',
     titleFuelBase: 'Base fuel consumption when empty. Increases linearly with load.',
-    fuelLoadNote: '⛽ Fuel usage is load-dependent: +3% per 1 000 kg payload',
-    fuelLoadExample: 'e.g. 10 L/100km empty → 10.3 L at 1 000 kg, 10.9 L at 3 000 kg',
+    fuelLoadNote: pct => `⛽ Fuel usage is load-dependent: +${pct}% per 1 000 kg payload`,
+    fuelLoadExample: (pct, base) => `e.g. ${base} L/100km empty → ${(base*(1+pct/100)).toFixed(1)} L at 1 000 kg, ${(base*(1+3*pct/100)).toFixed(1)} L at 3 000 kg`,
+    fuelLoadFactorLabel: '📦 Fuel +% per 1 000 kg',
     volUsedOf: (used, cap) => `${used} m³ used of ${cap} m³ total capacity`,
     wtUsedOf: (used, cap) => `${used} kg used of ${cap} kg total capacity`,
     unloadPopup: min => `Unload: ${min}min`,
     costParams: '💰 Cost Parameters',
+    minLoadTitle: '📦 Minimum departure load',
+    minLoadHint: 'Vehicles leaving the depot must carry at least this % of their capacity. Set 0 to disable.',
+    minVolPct: 'Min vol load (%)',
+    minWtPct: 'Min weight load (%)',
+    minLoadBadge: (vp, wp) => `min ${vp}% vol${wp > 0 ? ` · ${wp}% wt` : ''}`,
     costParamsHint: 'Adjust to match your local fuel price and driver wage',
     costParamsNote: '⛽ Fuel also increases +3% per 1 000 kg payload',
     fuelPriceLabel: '⛽ Fuel price (RSD/L)',
@@ -293,12 +299,18 @@ const TRANSLATIONS = {
     titleLargeItem: 'Tipičan veliki predmet: 20–50 kg',
     titleWeightCap: 'Maks. nosivost u kg. Postavite 0 za neograničeno.',
     titleFuelBase: 'Osnovna potrošnja goriva praznog vozila. Raste linearno sa teretom.',
-    fuelLoadNote: '⛽ Potrošnja zavisi od tereta: +3% na svakih 1 000 kg',
-    fuelLoadExample: 'npr. 10 L/100km prazno → 10,3 L na 1 000 kg, 10,9 L na 3 000 kg',
+    fuelLoadNote: pct => `⛽ Potrošnja zavisi od tereta: +${pct}% na svakih 1 000 kg`,
+    fuelLoadExample: (pct, base) => `npr. ${base} L/100km prazno → ${(base*(1+pct/100)).toFixed(1)} L na 1 000 kg, ${(base*(1+3*pct/100)).toFixed(1)} L na 3 000 kg`,
+    fuelLoadFactorLabel: '📦 Gorivo +% na 1 000 kg',
     volUsedOf: (used, cap) => `${used} m³ iskorišćeno od ${cap} m³ ukupnog kapaciteta`,
     wtUsedOf: (used, cap) => `${used} kg iskorišćeno od ${cap} kg ukupnog kapaciteta`,
     unloadPopup: min => `Istovar: ${min}min`,
     costParams: '💰 Parametri troškova',
+    minLoadTitle: '📦 Minimalni teret pri polasku',
+    minLoadHint: 'Vozilo mora imati najmanje ovaj % popunjenosti pre polaska iz depoa. Postavite 0 za isključivanje.',
+    minVolPct: 'Min vol teret (%)',
+    minWtPct: 'Min težinski teret (%)',
+    minLoadBadge: (vp, wp) => `min ${vp}% vol${wp > 0 ? ` · ${wp}% tež` : ''}`,
     costParamsHint: 'Prilagodite lokalnoj ceni goriva i plati vozača',
     costParamsNote: '⛽ Gorivo raste +3% na svakih 1 000 kg tereta',
     fuelPriceLabel: '⛽ Cena goriva (RSD/L)',
@@ -764,7 +776,11 @@ function closeExcelModal() { document.getElementById('excel-modal').classList.ad
 // ─── FLEET MANAGEMENT ────────────────────────────────────────────────────────
 function renderFleetCards() {
   const emojis = ['🚐','🚚','🚛','🏎','🚜','🚑'];
-  let html = state.fleet.map((v,i) => `
+  let html = state.fleet.map((v,i) => {
+    const minBadge = (v.min_vol_pct > 0 || v.min_wt_pct > 0)
+      ? `<span class="fc-min-load" title="${t('minLoadTitle')}">▶${v.min_vol_pct}%${v.min_wt_pct > 0 ? '/'+v.min_wt_pct+'%' : ''}</span>`
+      : '';
+    return `
     <div class="fleet-card" onclick="openFleetModal(${i})" title="${t('clickToConfigure')}">
       <span class="fc-emoji">${v.emoji || emojis[i%emojis.length]}</span>
       <span class="fc-name">${esc(v.name)}</span>
@@ -772,7 +788,9 @@ function renderFleetCards() {
       <span class="fc-cap">${v.capacity} m³</span>
       <span class="fc-fuel" title="${t('fuelConsumption')}">${v.fuel_consumption} L/100km</span>
       <span class="fc-weight" title="${t('weightCapacity')}">${v.weight_capacity > 0 ? v.weight_capacity + ' kg' : '∞ kg'}</span>
-    </div>`).join('');
+      ${minBadge}
+    </div>`;
+  }).join('');
   document.getElementById('fleet-cards').innerHTML = html;
 }
 
@@ -789,21 +807,27 @@ function openFleetModal(idx) {
   state.editingFleetIdx = idx;
   const v = state.fleet[idx];
   document.getElementById('modal-title').textContent = t('configureDash')(v.name);
-  document.getElementById('modal-count').value      = v.count;
-  document.getElementById('modal-cap').value        = v.capacity;
-  document.getElementById('modal-weight-cap').value = v.weight_capacity ?? 0;
-  document.getElementById('modal-fuel').value       = v.fuel_consumption ?? 10;
+  document.getElementById('modal-count').value        = v.count;
+  document.getElementById('modal-cap').value          = v.capacity;
+  document.getElementById('modal-weight-cap').value   = v.weight_capacity ?? 0;
+  document.getElementById('modal-fuel').value         = v.fuel_consumption ?? 10;
+  document.getElementById('modal-min-vol-pct').value  = v.min_vol_pct ?? 0;
+  document.getElementById('modal-min-wt-pct').value   = v.min_wt_pct  ?? 0;
   updateModalHint();
+  _refreshModalFuelNote(getCostParams().fuel_load_factor_pct);
   document.getElementById('fleet-modal').classList.remove('hidden');
 }
 
 function updateModalHint() {
-  const cnt  = parseFloat(document.getElementById('modal-count').value)||0;
-  const cap  = parseFloat(document.getElementById('modal-cap').value)||0;
-  const wCap = parseFloat(document.getElementById('modal-weight-cap')?.value)||0;
-  const wStr = wCap > 0 ? ` · ${(cnt*wCap).toLocaleString()} kg total` : t('unlimitedWeight');
-  document.getElementById('modal-hint').textContent =
-    t('totalType')((cnt*cap).toFixed(1), cap, wStr);
+  const cnt    = parseFloat(document.getElementById('modal-count').value)||0;
+  const cap    = parseFloat(document.getElementById('modal-cap').value)||0;
+  const wCap   = parseFloat(document.getElementById('modal-weight-cap')?.value)||0;
+  const minVol = parseFloat(document.getElementById('modal-min-vol-pct')?.value)||0;
+  const minWt  = parseFloat(document.getElementById('modal-min-wt-pct')?.value)||0;
+  const wStr   = wCap > 0 ? ` · ${(cnt*wCap).toLocaleString()} kg total` : t('unlimitedWeight');
+  let hint = t('totalType')((cnt*cap).toFixed(1), cap, wStr);
+  if (minVol > 0 || minWt > 0) hint += `  ·  ${t('minLoadBadge')(minVol, minWt)}`;
+  document.getElementById('modal-hint').textContent = hint;
 }
 
 
@@ -814,6 +838,8 @@ function applyFleetModal() {
   state.fleet[idx].capacity         = parseFloat(document.getElementById('modal-cap').value)||5.0;
   state.fleet[idx].weight_capacity  = parseFloat(document.getElementById('modal-weight-cap').value)||0;
   state.fleet[idx].fuel_consumption = parseFloat(document.getElementById('modal-fuel').value)||10;
+  state.fleet[idx].min_vol_pct      = parseFloat(document.getElementById('modal-min-vol-pct').value)||0;
+  state.fleet[idx].min_wt_pct       = parseFloat(document.getElementById('modal-min-wt-pct').value)||0;
   closeFleetModal();
   renderFleetCards();
   updateFleetFooter();
@@ -849,15 +875,30 @@ function restorePanelStates() {
 // ─── COST PARAMETERS ─────────────────────────────────────────────────────────
 function getCostParams() {
   return {
-    fuel_price_rsd_l:  parseFloat(document.getElementById('fuel-price-rsd')?.value) || 200,
-    driver_wage_rsd_h: parseFloat(document.getElementById('driver-wage-rsd')?.value) || 900,
+    fuel_price_rsd_l:      parseFloat(document.getElementById('fuel-price-rsd')?.value)   || 200,
+    driver_wage_rsd_h:     parseFloat(document.getElementById('driver-wage-rsd')?.value)   || 900,
+    fuel_load_factor_pct:  parseFloat(document.getElementById('fuel-load-factor')?.value)  ?? 3,
   };
 }
 
 function updateCostHint() {
   const p = getCostParams();
   const el = document.getElementById('cost-hint');
-  if (el) el.textContent = `${p.fuel_price_rsd_l} RSD/L · ${p.driver_wage_rsd_h} RSD/h`;
+  if (el) el.textContent = `${p.fuel_price_rsd_l} RSD/L · ${p.driver_wage_rsd_h} RSD/h · +${p.fuel_load_factor_pct}%/t`;
+  // update the static note below the inputs
+  const note = document.getElementById('cost-load-note');
+  if (note) note.textContent = `⛽ ${t('fuelLoadFactorLabel')}: +${p.fuel_load_factor_pct}% per 1 000 kg`;
+  // update the note inside the vehicle modal if it's open
+  _refreshModalFuelNote(p.fuel_load_factor_pct);
+}
+
+function _refreshModalFuelNote(pct) {
+  const noteEl    = document.getElementById('modal-fuel-load-note');
+  const exampleEl = document.getElementById('modal-fuel-load-example');
+  if (!noteEl || !exampleEl) return;
+  const base = parseFloat(document.getElementById('modal-fuel')?.value) || 10;
+  noteEl.textContent    = t('fuelLoadNote')(pct);
+  exampleEl.textContent = t('fuelLoadExample')(pct, base);
 }
 
 // ─── OBJECTIVE SELECTOR ──────────────────────────────────────────────────────
