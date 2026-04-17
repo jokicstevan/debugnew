@@ -945,13 +945,28 @@ def _ins_cost(route, pos, c, state, depot):
 
 def _rand_remove(state, rng):
     s = state.copy()
+    minimise_vehicles = (state.obj_weights or {}).get("vehicles", False)
     all_c = [(v, i, c) for v, r in enumerate(s.routes) for i, c in enumerate(r)]
     if not all_c:
         return s
     n_rem = int(rng.integers(1, max(2, len(all_c)//4)))
-    chosen = [all_c[i] for i in rng.choice(len(all_c),
-                                             size=min(n_rem, len(all_c)),
-                                             replace=False)]
+    if minimise_vehicles:
+        # Bias selection toward stops on the smallest routes so we tend to
+        # fully empty the least-loaded vehicle, enabling consolidation.
+        weights = []
+        for v, i, c in all_c:
+            route_size = len(s.routes[v])
+            weights.append(1.0 / max(route_size, 1))
+        total_w = sum(weights)
+        probs = [w / total_w for w in weights]
+        chosen_idx = rng.choice(len(all_c),
+                                size=min(n_rem, len(all_c)),
+                                replace=False, p=probs)
+        chosen = [all_c[i] for i in chosen_idx]
+    else:
+        chosen = [all_c[i] for i in rng.choice(len(all_c),
+                                                 size=min(n_rem, len(all_c)),
+                                                 replace=False)]
     for v, pos, _ in sorted(chosen, key=lambda x: (x[0], x[1]), reverse=True):
         s.routes[v].pop(pos)
     return s
@@ -959,6 +974,7 @@ def _rand_remove(state, rng):
 
 def _worst_remove(state, rng):
     s = state.copy()
+    minimise_vehicles = (state.obj_weights or {}).get("vehicles", False)
     costs = []
     for v, route in enumerate(s.routes):
         d = s.depot_of[v]
@@ -967,6 +983,14 @@ def _worst_remove(state, rng):
             nxt  = route[i+1] if i < len(route)-1 else d
             saving = (s.dist_mat[prev][c] + s.dist_mat[c][nxt]
                       - s.dist_mat[prev][nxt])
+            # When minimising vehicles, boost the score for stops on small routes
+            # so we preferentially empty the least-loaded vehicles first.
+            if minimise_vehicles:
+                route_size = len(route)
+                # Stops on a single-stop route get a huge bonus → they get removed
+                # first, emptying that vehicle so the solver can consolidate.
+                consolidation_bonus = 1_000_000.0 / max(route_size, 1)
+                saving += consolidation_bonus
             costs.append((saving, v, i))
     if not costs:
         return s
@@ -1264,7 +1288,17 @@ def optimize_alns(dist_mat, time_mat, n_depots, n_cust, tw, demands,
     best     = state.copy()
     best_obj = best.objective()
     cur_obj  = best_obj
-    temp     = temperature
+    # When minimising vehicles the penalty is 1_000_000 RSD per vehicle.
+    # The default temperature of ~150 makes exp(-delta/T) ≈ 0 for any move
+    # that opens a new vehicle, so SA degenerates to pure greedy and cannot
+    # escape local optima.  Scale T to ~1% of the penalty so the solver can
+    # still accept slightly worse route costs while converging on the true
+    # minimum vehicle count.
+    minimise_vehicles_flag = (obj_weights or {}).get("vehicles", False)
+    if minimise_vehicles_flag:
+        temp = max(temperature, 10_000.0)
+    else:
+        temp = temperature
     cooling  = 0.995
 
     destroy = [_rand_remove, _worst_remove, _tw_remove, _cap_remove]
