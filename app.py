@@ -841,9 +841,9 @@ class VRPState:
         # Distance normalisation: 1 km ≈ cost of driving it with avg fuel & wages
         # Approximately: 10L/100km × 200 RSD/L = 20 RSD/km for fuel alone.
         DIST_RSD_PER_KM = 20.0
-        # Vehicle penalty: using one extra vehicle costs roughly half a work-day
-        # of wages as an overhead (depot time, admin, etc.) ≈ 4h × 900 RSD/h
-        VEHICLE_PENALTY_RSD = 3600.0
+        # Vehicle penalty: when minimising vehicles, must dominate ALL other costs
+        # so that one extra vehicle always outweighs any fuel/wage/distance saving.
+        VEHICLE_PENALTY_RSD = 1_000_000.0 if do_vehicles else 3600.0
 
         TW_PENALTY = 100.0   # RSD-equivalent penalty per late minute
         total = 0.0
@@ -1026,6 +1026,7 @@ def _greedy_insert(state, rng):
     all_cust = {state.n_depots + i for i in range(len(state.demands))}
     unrouted = list(all_cust - routed)
     rng.shuffle(unrouted)
+    minimise_vehicles = (state.obj_weights or {}).get("vehicles", False)
     for c in unrouted:
         best_v, best_pos, best_cost = -1, -1, float("inf")
         cust_kg = state.demands_kg[c - state.n_depots] if c - state.n_depots < len(state.demands_kg) else 0.0
@@ -1038,6 +1039,9 @@ def _greedy_insert(state, rng):
             d = s.depot_of[v]
             for pos in range(len(s.routes[v]) + 1):
                 cost = _ins_cost(s.routes[v], pos, c, state, d)
+                # When minimising vehicles, heavily penalise opening a new (empty) vehicle
+                if minimise_vehicles and not s.routes[v]:
+                    cost += 1_000_000.0
                 if cost < best_cost:
                     best_cost, best_v, best_pos = cost, v, pos
         if best_v != -1:
@@ -1051,6 +1055,7 @@ def _regret_insert(state, rng):
     routed   = {c for r in s.routes for c in r}
     all_cust = {state.n_depots + i for i in range(len(state.demands))}
     unrouted = list(all_cust - routed)
+    minimise_vehicles = (state.obj_weights or {}).get("vehicles", False)
     while unrouted:
         best_c, best_v, best_pos, best_reg = None, -1, -1, -float("inf")
         for c in unrouted:
@@ -1067,6 +1072,9 @@ def _regret_insert(state, rng):
                 for pos in range(len(s.routes[v]) + 1):
                     cost = _ins_cost(s.routes[v], pos, c, state, d)
                     if cost < float("inf"):
+                        # Penalise opening a new vehicle when minimising count
+                        if minimise_vehicles and not s.routes[v]:
+                            cost += 1_000_000.0
                         opts.append((cost, v, pos))
             if not opts:
                 continue
@@ -1158,6 +1166,7 @@ def optimize_alns(dist_mat, time_mat, n_depots, n_cust, tw, demands,
     routes   = [[] for _ in range(num_v)]
     loads    = [0.0] * num_v
     wloads   = [0.0] * num_v
+    minimise_vehicles = (obj_weights or {}).get("vehicles", False)
     for ci in all_ci:
         dem    = demands[ci - n_depots]
         kg     = demands_kg[ci - n_depots] if (ci - n_depots) < len(demands_kg) else 0.0
@@ -1166,8 +1175,19 @@ def optimize_alns(dist_mat, time_mat, n_depots, n_cust, tw, demands,
             wc        = fleet[v].get("weight_capacity", 0.0)
             weight_ok = (not use_weight_cap) or (wc == 0) or (wloads[v] + kg <= wc)
             return vol_ok and weight_ok
-        best_v = min(range(num_v),
-                     key=lambda v: loads[v] if fits(v) else float("inf"))
+        if minimise_vehicles:
+            # Pack into already-used vehicles first (bin-packing), only open
+            # a new vehicle when no existing one can fit this customer.
+            used_vehicles   = [v for v in range(num_v) if routes[v]]
+            unused_vehicles = [v for v in range(num_v) if not routes[v]]
+            candidates = used_vehicles + unused_vehicles
+            best_v = next((v for v in candidates if fits(v)), None)
+            if best_v is None:
+                best_v = 0   # fallback — shouldn't happen with valid fleet
+        else:
+            # Default: spread load evenly across vehicles
+            best_v = min(range(num_v),
+                         key=lambda v: loads[v] if fits(v) else float("inf"))
         routes[best_v].append(ci)
         loads[best_v]  += dem
         wloads[best_v] += kg
