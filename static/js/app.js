@@ -514,9 +514,12 @@ function placeDepot(lat, lng, name) {
   renderLocationsList();
 }
 
+// Monotonic counter — guarantees unique IDs even after deletions + rapid re-adds
+let _custSeq = 0;
+
 function placeCustomer(lat, lng, name, pkg_counts, time_window, unloading_time) {
   if (typeof L === 'undefined') { alert(t('mapNotLoaded')); return; }
-  const id = 'customer_' + Date.now() + '_' + state.customers.length;
+  const id = 'customer_' + (++_custSeq);
   const num = state.customers.length + 1;
   const cname = name || `Customer ${num}`;
   // Normalise pkg_counts to array of 3
@@ -1053,12 +1056,19 @@ function drawRoutes(data) {
     }
   });
 
-  // Highlight unserved customers in red with a warning icon
-  const servedNames = new Set(
-    (data.vehicle_routes || []).flatMap(vr => (vr.stops || []).map(s => s.name))
-  );
+  // Highlight unserved customers in red with a warning icon.
+  // Count per-name so that if two customers share a name and only one stop is
+  // served, the second is correctly flagged — not both marked served via Set.
+  const _servedCount = {};
+  (data.vehicle_routes || []).flatMap(vr => (vr.stops || []).map(s => s.name))
+    .forEach(n => { _servedCount[n] = (_servedCount[n] || 0) + 1; });
+  const _servedUsed = {};
   state.customers.forEach(c => {
-    if (!servedNames.has(c.name)) {
+    const available = _servedCount[c.name] || 0;
+    const used      = _servedUsed[c.name]  || 0;
+    const isServed  = used < available;
+    _servedUsed[c.name] = used + (isServed ? 1 : 0);
+    if (!isServed) {
       const marker = state.markers[c.id];
       if (marker) {
         const icon = L.divIcon({
@@ -1096,8 +1106,13 @@ function drawRoutes(data) {
     state.vehicleVisible[vr.vehicle_id] = true;
 
     // Update each customer marker: popup with schedule + dot colour = vehicle colour
+    // Build per-name queue so duplicate-named customers are matched in order
+    const _nameQueue = {};
+    state.customers.forEach(c => {
+      (_nameQueue[c.name] = _nameQueue[c.name] || []).push(c);
+    });
     (vr.stops || []).forEach(stop => {
-      const custEntry = state.customers.find(c => c.name === stop.name);
+      const custEntry = (_nameQueue[stop.name] || []).shift();
       if (custEntry && state.markers[custEntry.id]) {
         const flag = stop.violation > 0 ? ` ⚠️ +${stop.violation}m late`
                    : stop.wait > 0      ? ` ⏳ wait ${stop.wait}m` : ' ✅';
