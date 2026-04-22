@@ -1188,69 +1188,43 @@ def optimize_alns(dist_mat, time_mat, n_depots, n_cust, tw, demands,
     num_v  = len(fleet)
     all_ci = list(range(n_depots, n_depots + n_cust))
 
-    # Initial assignment: fill vehicles greedily by volume + weight capacity
+    # Initial assignment: always start by packing everything onto vehicle 0,
+    # only opening the next vehicle when the current one is truly full.
+    # This guarantees the solver always begins from the minimum possible number
+    # of vehicles, so "minimise vehicles" mode never needs to escape a
+    # multi-vehicle local optimum caused by a bad starting split.
+    minimise_vehicles = (obj_weights or {}).get("vehicles", False)
     routes   = [[] for _ in range(num_v)]
     loads    = [0.0] * num_v
     wloads   = [0.0] * num_v
-    minimise_vehicles = (obj_weights or {}).get("vehicles", False)
+    current_v = 0   # always start filling from vehicle 0
     for ci in all_ci:
-        dem    = demands[ci - n_depots]
-        kg     = demands_kg[ci - n_depots] if (ci - n_depots) < len(demands_kg) else 0.0
+        dem = demands[ci - n_depots]
+        kg  = demands_kg[ci - n_depots] if (ci - n_depots) < len(demands_kg) else 0.0
+
         def fits(v, dem=dem, kg=kg):
             vol_ok    = (not use_volume_cap) or (loads[v] + dem <= fleet[v]["capacity"])
             wc        = fleet[v].get("weight_capacity", 0.0)
             weight_ok = (not use_weight_cap) or (wc == 0) or (wloads[v] + kg <= wc)
             return vol_ok and weight_ok
-        if minimise_vehicles:
-            # Pack into already-used vehicles first (bin-packing), only open
-            # a new vehicle when no existing one can fit this customer.
-            used_vehicles   = [v for v in range(num_v) if routes[v]]
-            unused_vehicles = [v for v in range(num_v) if not routes[v]]
-            candidates = used_vehicles + unused_vehicles
-            best_v = next((v for v in candidates if fits(v)), None)
-            if best_v is None:
-                best_v = 0   # fallback — shouldn't happen with valid fleet
-        else:
-            # Default: bin-pack — fill already-used vehicles before opening a new one.
-            # This avoids needlessly splitting load across multiple vehicles when one
-            # vehicle has enough capacity for everything.
-            used_vehicles   = [v for v in range(num_v) if routes[v]]
-            unused_vehicles = [v for v in range(num_v) if not routes[v]]
-            candidates = used_vehicles + unused_vehicles
-            best_v = next((v for v in candidates if fits(v)), None)
-            if best_v is None:
-                best_v = 0  # fallback
-        routes[best_v].append(ci)
-        loads[best_v]  += dem
-        wloads[best_v] += kg
 
-    # ── Pre-consolidation: when minimising vehicles, try to merge all routes
-    # onto as few vehicles as possible BEFORE NN ordering.  This avoids the
-    # common failure mode where the greedy assignment spreads load across two
-    # vehicles even though the total weight/volume fits in one, leaving the
-    # ALNS stuck in a two-vehicle local optimum it can never escape (because
-    # the weight constraint blocks the repair operators from moving the last
-    # few customers off vehicle 1).
-    if minimise_vehicles:
-        # Sort vehicles: pour smallest into largest first
-        for v in sorted(range(num_v), key=lambda x: wloads[x]):
-            if not routes[v]:
-                continue
-            for u in sorted(range(num_v), key=lambda x: -wloads[x]):
-                if u == v or not routes[u]:
-                    continue
-                wcu  = fleet[u].get("weight_capacity", 0.0)
-                vc_u = fleet[u].get("capacity", float("inf"))
-                weight_fits = (wcu == 0) or (wloads[u] + wloads[v] <= wcu)
-                vol_fits    = (loads[u] + loads[v] <= vc_u)
-                if weight_fits and vol_fits:
-                    routes[u].extend(routes[v])
-                    loads[u]  += loads[v]
-                    wloads[u] += wloads[v]
-                    routes[v]  = []
-                    loads[v]   = 0.0
-                    wloads[v]  = 0.0
+        # Try current vehicle first; if full, find the next vehicle that fits,
+        # advancing current_v so subsequent customers also prefer that vehicle.
+        if not fits(current_v):
+            found = False
+            for v in range(current_v + 1, num_v):
+                if fits(v):
+                    current_v = v
+                    found = True
                     break
+            if not found:
+                # All vehicles full — fall back to the first one that fits at all
+                best_v = next((v for v in range(num_v) if fits(v)), current_v)
+                current_v = best_v
+
+        routes[current_v].append(ci)
+        loads[current_v]  += dem
+        wloads[current_v] += kg
 
     # NN order within each vehicle's initial assignment
     ordered = []
