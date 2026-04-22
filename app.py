@@ -1211,9 +1211,15 @@ def optimize_alns(dist_mat, time_mat, n_depots, n_cust, tw, demands,
             if best_v is None:
                 best_v = 0   # fallback — shouldn't happen with valid fleet
         else:
-            # Default: spread load evenly across vehicles
-            best_v = min(range(num_v),
-                         key=lambda v: loads[v] if fits(v) else float("inf"))
+            # Default: bin-pack — fill already-used vehicles before opening a new one.
+            # This avoids needlessly splitting load across multiple vehicles when one
+            # vehicle has enough capacity for everything.
+            used_vehicles   = [v for v in range(num_v) if routes[v]]
+            unused_vehicles = [v for v in range(num_v) if not routes[v]]
+            candidates = used_vehicles + unused_vehicles
+            best_v = next((v for v in candidates if fits(v)), None)
+            if best_v is None:
+                best_v = 0  # fallback
         routes[best_v].append(ci)
         loads[best_v]  += dem
         wloads[best_v] += kg
