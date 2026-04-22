@@ -776,8 +776,7 @@ class VRPState:
 
     def route_weight(self, v):
         """Total cargo weight (kg) for vehicle v."""
-        return sum(self.fleet[v].get("pkg_weights", DEFAULT_PKG_WEIGHTS_KG)[0] * 0
-                   for _ in [])  # placeholder — calculated via demands_kg
+        return self.weight_load(v)
 
     def copy(self):
         return VRPState(
@@ -935,7 +934,10 @@ def _ins_cost(route, pos, c, state, depot):
     new_r = route[:pos] + [c] + route[pos:]
     ok, _ = route_time(new_r, depot, state.dist_mat, state.time_mat, state.tw, state.svc,
                         svc_map=state.svc_map)
-    if not ok:
+    # Only hard-reject on TW infeasibility when TW constraints are actually enforced.
+    # When use_tw=False, a long route may still violate the default TW window used
+    # internally, but that must not prevent consolidation onto a single vehicle.
+    if not ok and state.use_tw:
         return float("inf")
     prev = route[pos-1] if pos > 0 else depot
     nxt  = route[pos]   if pos < len(route) else depot
@@ -1352,11 +1354,14 @@ def optimize():
         use_tw      = data.get("use_time_windows", False)
         max_iter    = int(data.get("max_iterations", 300))
         temperature = float(data.get("temperature", 150.0))
-        # Objective weights: which cost components to minimise
+        # Objective weights: which cost components to minimise.
+        # All flags default to False so that only the components explicitly
+        # sent by the frontend are active.  The fallback (fuel + wages) is
+        # only applied when the frontend sends nothing at all.
         raw_ow      = data.get("obj_weights", {})
         obj_weights = {
-            "fuel":     bool(raw_ow.get("fuel",     True)),
-            "wages":    bool(raw_ow.get("wages",    True)),
+            "fuel":     bool(raw_ow.get("fuel",     False)),
+            "wages":    bool(raw_ow.get("wages",    False)),
             "distance": bool(raw_ow.get("distance", False)),
             "vehicles": bool(raw_ow.get("vehicles", False)),
         }
