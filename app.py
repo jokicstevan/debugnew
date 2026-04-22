@@ -1224,6 +1224,34 @@ def optimize_alns(dist_mat, time_mat, n_depots, n_cust, tw, demands,
         loads[best_v]  += dem
         wloads[best_v] += kg
 
+    # ── Pre-consolidation: when minimising vehicles, try to merge all routes
+    # onto as few vehicles as possible BEFORE NN ordering.  This avoids the
+    # common failure mode where the greedy assignment spreads load across two
+    # vehicles even though the total weight/volume fits in one, leaving the
+    # ALNS stuck in a two-vehicle local optimum it can never escape (because
+    # the weight constraint blocks the repair operators from moving the last
+    # few customers off vehicle 1).
+    if minimise_vehicles:
+        # Sort vehicles: pour smallest into largest first
+        for v in sorted(range(num_v), key=lambda x: wloads[x]):
+            if not routes[v]:
+                continue
+            for u in sorted(range(num_v), key=lambda x: -wloads[x]):
+                if u == v or not routes[u]:
+                    continue
+                wcu  = fleet[u].get("weight_capacity", 0.0)
+                vc_u = fleet[u].get("capacity", float("inf"))
+                weight_fits = (wcu == 0) or (wloads[u] + wloads[v] <= wcu)
+                vol_fits    = (loads[u] + loads[v] <= vc_u)
+                if weight_fits and vol_fits:
+                    routes[u].extend(routes[v])
+                    loads[u]  += loads[v]
+                    wloads[u] += wloads[v]
+                    routes[v]  = []
+                    loads[v]   = 0.0
+                    wloads[v]  = 0.0
+                    break
+
     # NN order within each vehicle's initial assignment
     ordered = []
     for v, route in enumerate(routes):
