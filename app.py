@@ -748,7 +748,7 @@ class VRPState:
         # obj_weights: dict controlling which cost components enter the objective.
         # Keys: "fuel" (bool), "wages" (bool), "distance" (bool), "vehicles" (bool)
         # At least one must be True; the optimizer minimises the selected sum.
-        self.obj_weights = obj_weights or {"fuel": True, "wages": True, "distance": False, "vehicles": False}
+        self.obj_weights = obj_weights or {"fuel": False, "wages": False, "distance": False, "vehicles": False}
         # Constraint toggles: when False, the corresponding hard constraint is ignored
         self.use_volume_cap = use_volume_cap
         self.use_weight_cap = use_weight_cap
@@ -829,8 +829,8 @@ class VRPState:
         optimizer falls back to minimising fuel + wages.
         """
         ow          = self.obj_weights or {}
-        do_fuel     = ow.get("fuel",     True)
-        do_wages    = ow.get("wages",    True)
+        do_fuel     = ow.get("fuel",     False)
+        do_wages    = ow.get("wages",    False)
         do_dist     = ow.get("distance", False)
         do_vehicles = ow.get("vehicles", False)
         # Fallback: if user unchecked everything, use fuel+wages
