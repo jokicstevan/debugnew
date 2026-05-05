@@ -1179,37 +1179,30 @@ def optimize_2opt(dist_mat, time_mat, n_depots, n_cust, tw, demands,
     return s
 
 
-def optimize_alns(dist_mat, time_mat, n_depots, n_cust, tw, demands,
-                  fleet, max_iter=300, temperature=150.0, use_tw=False, svc_map=None,
-                  demands_kg=None, obj_weights=None, use_volume_cap=True, use_weight_cap=True,
-                  fuel_price_rsd_l=None, driver_wage_rsd_h=None, fuel_load_factor=None):
-    """ALNS multi-vehicle optimiser. Returns VRPState."""
-    demands_kg = demands_kg or [0.0] * len(demands)
-    num_v  = len(fleet)
+def _alns_optimize(fleet, dist_mat, time_mat, n_depots, n_cust, tw, demands,
+                   demands_kg, obj_weights, use_volume_cap, use_weight_cap,
+                   fuel_price_rsd_l, driver_wage_rsd_h, fuel_load_factor,
+                   temperature, max_iter, svc_map):
+    """Run a single ALNS optimisation with the given fleet (list of vehicle dicts)."""
+    num_v = len(fleet)
     all_ci = list(range(n_depots, n_depots + n_cust))
 
-    # Initial assignment: always start by packing everything onto vehicle 0,
-    # only opening the next vehicle when the current one is truly full.
-    # This guarantees the solver always begins from the minimum possible number
-    # of vehicles, so "minimise vehicles" mode never needs to escape a
-    # multi-vehicle local optimum caused by a bad starting split.
-    minimise_vehicles = (obj_weights or {}).get("vehicles", False)
-    routes   = [[] for _ in range(num_v)]
-    loads    = [0.0] * num_v
-    wloads   = [0.0] * num_v
-    current_v = 0   # always start filling from vehicle 0
+    # ── Initial assignment (pack everything onto the first vehicles) ──
+    routes = [[] for _ in range(num_v)]
+    loads = [0.0] * num_v
+    wloads = [0.0] * num_v
+    current_v = 0
+
     for ci in all_ci:
         dem = demands[ci - n_depots]
-        kg  = demands_kg[ci - n_depots] if (ci - n_depots) < len(demands_kg) else 0.0
+        kg = demands_kg[ci - n_depots] if (ci - n_depots) < len(demands_kg) else 0.0
 
         def fits(v, dem=dem, kg=kg):
-            vol_ok    = (not use_volume_cap) or (loads[v] + dem <= fleet[v]["capacity"])
-            wc        = fleet[v].get("weight_capacity", 0.0)
+            vol_ok = (not use_volume_cap) or (loads[v] + dem <= fleet[v]["capacity"])
+            wc = fleet[v].get("weight_capacity", 0.0)
             weight_ok = (not use_weight_cap) or (wc == 0) or (wloads[v] + kg <= wc)
             return vol_ok and weight_ok
 
-        # Try current vehicle first; if full, find the next vehicle that fits,
-        # advancing current_v so subsequent customers also prefer that vehicle.
         if not fits(current_v):
             found = False
             for v in range(current_v + 1, num_v):
@@ -1218,107 +1211,93 @@ def optimize_alns(dist_mat, time_mat, n_depots, n_cust, tw, demands,
                     found = True
                     break
             if not found:
-                # All vehicles full — fall back to the first one that fits at all
                 best_v = next((v for v in range(num_v) if fits(v)), current_v)
                 current_v = best_v
-
         routes[current_v].append(ci)
-        loads[current_v]  += dem
+        loads[current_v] += dem
         wloads[current_v] += kg
 
-    # NN order within each vehicle's initial assignment
+    # NN ordering within each vehicle's initial assignment
     ordered = []
     for v, route in enumerate(routes):
         if not route:
             ordered.append([])
             continue
-        depot = 0   # will be reassigned by reassign_depots
+        depot = 0
         unvis, cur, nr = route[:], depot, []
         while unvis:
             nn = min(unvis, key=lambda x: dist_mat[cur][x])
-            nr.append(nn); unvis.remove(nn); cur = nn
+            nr.append(nn)
+            unvis.remove(nn)
+            cur = nn
         ordered.append(nr)
 
-    # ── Min-load consolidation: merge under-loaded vehicles into fuller ones ──
-    # This ensures the initial state is always feasible w.r.t. min_vol_pct /
-    # min_wt_pct so the ALNS solver always starts from a valid baseline.
+    # ── Min‑load consolidation ──────────────────────────────────────────
     for v in range(num_v):
         if not ordered[v]:
             continue
         min_vol_pct = float(fleet[v].get("min_vol_pct", 0.0))
-        min_wt_pct  = float(fleet[v].get("min_wt_pct",  0.0))
+        min_wt_pct = float(fleet[v].get("min_wt_pct", 0.0))
         vol_cap = float(fleet[v].get("capacity", float("inf")))
-        wt_cap  = float(fleet[v].get("weight_capacity", 0.0))
+        wt_cap = float(fleet[v].get("weight_capacity", 0.0))
         vol_ok = (min_vol_pct <= 0 or vol_cap >= 9990 or
                   (loads[v] / vol_cap * 100.0) >= min_vol_pct)
-        wt_ok  = (min_wt_pct  <= 0 or wt_cap  <= 0   or
-                  (wloads[v]  / wt_cap  * 100.0) >= min_wt_pct)
+        wt_ok = (min_wt_pct <= 0 or wt_cap <= 0 or
+                 (wloads[v] / wt_cap * 100.0) >= min_wt_pct)
         if vol_ok and wt_ok:
             continue
-        # This vehicle is under-loaded — redistribute its customers to others
         for ci in ordered[v]:
             dem = demands[ci - n_depots]
-            kg  = demands_kg[ci - n_depots] if (ci - n_depots) < len(demands_kg) else 0.0
-            # Find best other vehicle that still fits
+            kg = demands_kg[ci - n_depots] if (ci - n_depots) < len(demands_kg) else 0.0
             best_other = None
-            best_load  = float("inf")
+            best_load = float("inf")
             for u in range(num_v):
                 if u == v:
                     continue
-                vc  = float(fleet[u].get("capacity", float("inf")))
+                vc = float(fleet[u].get("capacity", float("inf")))
                 wcu = float(fleet[u].get("weight_capacity", 0.0))
                 vol_fits = (not use_volume_cap) or (loads[u] + dem <= vc)
-                wt_fits  = (not use_weight_cap) or (wcu == 0) or (wloads[u] + kg <= wcu)
+                wt_fits = (not use_weight_cap) or (wcu == 0) or (wloads[u] + kg <= wcu)
                 if vol_fits and wt_fits and loads[u] < best_load:
-                    best_load  = loads[u]
+                    best_load = loads[u]
                     best_other = u
             if best_other is not None:
                 ordered[best_other].append(ci)
-                loads[best_other]  += dem
+                loads[best_other] += dem
                 wloads[best_other] += kg
             else:
-                # No vehicle can absorb it — keep on original to avoid losing customers
                 ordered[v] = [ci] + [c for c in ordered[v] if c != ci]
                 continue
-        # Clear the under-loaded vehicle
         ordered[v] = []
-        loads[v]   = 0.0
-        wloads[v]  = 0.0
+        loads[v] = 0.0
+        wloads[v] = 0.0
 
     depot_of = [0] * num_v
     state = VRPState(ordered, depot_of, dist_mat, time_mat,
                      demands, fleet, tw, n_depots,
-                     use_tw=use_tw, svc_map=svc_map, demands_kg=demands_kg,
+                     use_tw=False, svc_map=svc_map, demands_kg=demands_kg,
                      obj_weights=obj_weights,
                      use_volume_cap=use_volume_cap, use_weight_cap=use_weight_cap,
                      fuel_price_rsd_l=fuel_price_rsd_l, driver_wage_rsd_h=driver_wage_rsd_h,
                      fuel_load_factor=fuel_load_factor)
     state.reassign_depots()
 
-    best     = state.copy()
+    best = state.copy()
     best_obj = best.objective()
-    cur_obj  = best_obj
-    # When minimising vehicles the penalty is 1_000_000 RSD per vehicle.
-    # The default temperature of ~150 makes exp(-delta/T) ≈ 0 for any move
-    # that opens a new vehicle, so SA degenerates to pure greedy and cannot
-    # escape local optima.  Scale T to ~1% of the penalty so the solver can
-    # still accept slightly worse route costs while converging on the true
-    # minimum vehicle count.
-    minimise_vehicles_flag = (obj_weights or {}).get("vehicles", False)
-    if minimise_vehicles_flag:
-        temp = max(temperature, 10_000.0)
-    else:
-        temp = temperature
-    cooling  = 0.995
+    cur_obj = best_obj
+    temp = temperature
+    cooling = 0.995
 
     destroy = [_rand_remove, _worst_remove, _tw_remove, _cap_remove]
-    repair  = [_greedy_insert, _regret_insert]
-    dw      = [1.0] * 4
-    rw      = [1.0] * 2
-    rng     = np.random.default_rng(42)
+    repair = [_greedy_insert, _regret_insert]
+    dw = [1.0] * 4
+    rw = [1.0] * 2
+    rng = np.random.default_rng(42)
 
     def sel(w):
-        t = sum(w); r = float(rng.random()) * t; cs = 0
+        t = sum(w)
+        r = float(rng.random()) * t
+        cs = 0
         for i, wi in enumerate(w):
             cs += wi
             if cs >= r:
@@ -1326,20 +1305,60 @@ def optimize_alns(dist_mat, time_mat, n_depots, n_cust, tw, demands,
         return len(w) - 1
 
     for _ in range(max_iter):
-        di, ri   = sel(dw), sel(rw)
-        dest     = destroy[di](state, rng)
-        cand     = repair[ri](dest, rng)
+        di, ri = sel(dw), sel(rw)
+        dest = destroy[di](state, rng)
+        cand = repair[ri](dest, rng)
         cand_obj = cand.objective()
-        delta    = cand_obj - cur_obj
+        delta = cand_obj - cur_obj
         if delta < 0 or float(rng.random()) < math.exp(-delta / max(temp, 1e-9)):
             state, cur_obj = cand, cand_obj
             if cur_obj < best_obj:
                 best, best_obj = state.copy(), cur_obj
         temp *= cooling
 
-    # Final depot reassignment on the winner
     best.reassign_depots()
     return best
+
+
+def optimize_alns(dist_mat, time_mat, n_depots, n_cust, tw, demands,
+                  fleet, max_iter=300, temperature=150.0, use_tw=False, svc_map=None,
+                  demands_kg=None, obj_weights=None, use_volume_cap=True, use_weight_cap=True,
+                  fuel_price_rsd_l=None, driver_wage_rsd_h=None, fuel_load_factor=None):
+    """ALNS multi‑vehicle optimiser. When only vehicle minimisation is selected,
+    it uses the smallest possible number of vehicles, starting from 1 and increasing
+    until a feasible solution is found."""
+    demands_kg = demands_kg or [0.0] * len(demands)
+    num_v = len(fleet)
+
+    minimise_vehicles_flag = (obj_weights or {}).get("vehicles", False)
+    temp = max(temperature, 10_000.0) if minimise_vehicles_flag else temperature
+
+    only_vehicles = (
+        minimise_vehicles_flag
+        and not (obj_weights.get("fuel") or obj_weights.get("wages") or obj_weights.get("distance"))
+    )
+
+    if only_vehicles:
+        # Try with 1 vehicle, then 2, 3, … until feasible
+        for k in range(1, num_v + 1):
+            sub_fleet = fleet[:k]
+            best_state = _alns_optimize(
+                sub_fleet, dist_mat, time_mat, n_depots, n_cust, tw,
+                demands, demands_kg, obj_weights, use_volume_cap, use_weight_cap,
+                fuel_price_rsd_l, driver_wage_rsd_h, fuel_load_factor,
+                temp, max_iter, svc_map
+            )
+            if best_state.objective() < float("inf"):
+                return best_state
+        # If even the full fleet fails, return the last (infeasible) attempt
+        return best_state
+    else:
+        return _alns_optimize(
+            fleet, dist_mat, time_mat, n_depots, n_cust, tw,
+            demands, demands_kg, obj_weights, use_volume_cap, use_weight_cap,
+            fuel_price_rsd_l, driver_wage_rsd_h, fuel_load_factor,
+            temp, max_iter, svc_map
+        )
 
 
 # ─────────────────────── OPTIMIZE ENDPOINT ───────────────────────────────────
