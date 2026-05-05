@@ -1182,12 +1182,12 @@ def optimize_2opt(dist_mat, time_mat, n_depots, n_cust, tw, demands,
 def _alns_optimize(fleet, dist_mat, time_mat, n_depots, n_cust, tw, demands,
                    demands_kg, obj_weights, use_volume_cap, use_weight_cap,
                    fuel_price_rsd_l, driver_wage_rsd_h, fuel_load_factor,
-                   temperature, max_iter, svc_map):
+                   temperature, max_iter, svc_map, use_tw):
     """Run a single ALNS optimisation with the given fleet (list of vehicle dicts)."""
     num_v = len(fleet)
     all_ci = list(range(n_depots, n_depots + n_cust))
 
-    # ── Initial assignment (pack everything onto the first vehicles) ──
+    # ── Initial assignment ──
     routes = [[] for _ in range(num_v)]
     loads = [0.0] * num_v
     wloads = [0.0] * num_v
@@ -1217,7 +1217,7 @@ def _alns_optimize(fleet, dist_mat, time_mat, n_depots, n_cust, tw, demands,
         loads[current_v] += dem
         wloads[current_v] += kg
 
-    # NN ordering within each vehicle's initial assignment
+    # NN ordering
     ordered = []
     for v, route in enumerate(routes):
         if not route:
@@ -1232,7 +1232,7 @@ def _alns_optimize(fleet, dist_mat, time_mat, n_depots, n_cust, tw, demands,
             cur = nn
         ordered.append(nr)
 
-    # ── Min‑load consolidation ──────────────────────────────────────────
+    # Min‑load consolidation
     for v in range(num_v):
         if not ordered[v]:
             continue
@@ -1275,7 +1275,7 @@ def _alns_optimize(fleet, dist_mat, time_mat, n_depots, n_cust, tw, demands,
     depot_of = [0] * num_v
     state = VRPState(ordered, depot_of, dist_mat, time_mat,
                      demands, fleet, tw, n_depots,
-                     use_tw=False, svc_map=svc_map, demands_kg=demands_kg,
+                     use_tw=use_tw, svc_map=svc_map, demands_kg=demands_kg,
                      obj_weights=obj_weights,
                      use_volume_cap=use_volume_cap, use_weight_cap=use_weight_cap,
                      fuel_price_rsd_l=fuel_price_rsd_l, driver_wage_rsd_h=driver_wage_rsd_h,
@@ -1325,8 +1325,8 @@ def optimize_alns(dist_mat, time_mat, n_depots, n_cust, tw, demands,
                   demands_kg=None, obj_weights=None, use_volume_cap=True, use_weight_cap=True,
                   fuel_price_rsd_l=None, driver_wage_rsd_h=None, fuel_load_factor=None):
     """ALNS multi‑vehicle optimiser. When only vehicle minimisation is selected,
-    it uses the smallest possible number of vehicles, starting from 1 and increasing
-    until a feasible solution is found."""
+    it sorts the fleet by capacity so the largest vehicles are tried first,
+    then incrementally adds vehicles until a feasible solution is found."""
     demands_kg = demands_kg or [0.0] * len(demands)
     num_v = len(fleet)
 
@@ -1339,25 +1339,32 @@ def optimize_alns(dist_mat, time_mat, n_depots, n_cust, tw, demands,
     )
 
     if only_vehicles:
-        # Try with 1 vehicle, then 2, 3, … until feasible
+        # Sort fleet by the relevant capacity so that the largest vehicle is tried first.
+        # If only weight capacity is active, sort by weight_capacity descending.
+        # Otherwise sort by volume capacity descending.
+        if use_weight_cap and not use_volume_cap:
+            sorted_fleet = sorted(fleet, key=lambda v: v.get("weight_capacity", 0) or 0, reverse=True)
+        else:
+            sorted_fleet = sorted(fleet, key=lambda v: v.get("capacity", 0) or 0, reverse=True)
+
         for k in range(1, num_v + 1):
-            sub_fleet = fleet[:k]
+            sub_fleet = sorted_fleet[:k]
             best_state = _alns_optimize(
                 sub_fleet, dist_mat, time_mat, n_depots, n_cust, tw,
                 demands, demands_kg, obj_weights, use_volume_cap, use_weight_cap,
                 fuel_price_rsd_l, driver_wage_rsd_h, fuel_load_factor,
-                temp, max_iter, svc_map
+                temp, max_iter, svc_map, use_tw
             )
             if best_state.objective() < float("inf"):
                 return best_state
-        # If even the full fleet fails, return the last (infeasible) attempt
+        # Fallback – return the best attempt with the full fleet (even if infeasible)
         return best_state
     else:
         return _alns_optimize(
             fleet, dist_mat, time_mat, n_depots, n_cust, tw,
             demands, demands_kg, obj_weights, use_volume_cap, use_weight_cap,
             fuel_price_rsd_l, driver_wage_rsd_h, fuel_load_factor,
-            temp, max_iter, svc_map
+            temp, max_iter, svc_map, use_tw
         )
 
 
