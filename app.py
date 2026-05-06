@@ -1632,10 +1632,6 @@ def optimize():
                                    fuel_price_rsd_l=fuel_price_rsd_l, driver_wage_rsd_h=driver_wage_rsd_h,
                                    fuel_load_factor=fuel_load_factor)
 
-        # Assign user fleet config to state vehicles
-        for v in range(len(state.routes)):
-            if v < len(fleet):
-                state.fleet[v] = fleet[v]
 
         total_dist = state.total_distance()
         # total_time is computed AFTER vehicle_routes loop from actual working hours
@@ -1651,7 +1647,7 @@ def optimize():
 
             depot_mat = state.depot_of[v_idx]   # matrix index of depot
             dep_loc   = all_locs[depot_mat]
-            veh_cfg   = fleet[v_idx] if v_idx < len(fleet) else fleet[0]
+            veh_cfg   = state.fleet[v_idx]
             color     = vehicle_colors[v_idx % len(vehicle_colors)]
 
             pts       = [dep_loc] + [all_locs[c] for c in route] + [dep_loc]
