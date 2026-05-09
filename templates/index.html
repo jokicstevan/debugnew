@@ -203,6 +203,59 @@
       </div><!-- /panel-body -->
     </section>
 
+    <!-- Advanced Parameters -->
+    <section class="panel collapsed" id="panel-advanced">
+      <div class="panel-title" onclick="togglePanel('panel-advanced')" data-i18n="advancedParams">🔬 Advanced Parameters</div>
+      <div class="panel-body">
+        <div style="font-size:9px;color:var(--muted);margin-bottom:8px;" data-i18n="advancedParamsHint">Fine-tune the routing engine and solver penalties. Leave defaults unless you know what you're doing.</div>
+
+        <div style="font-size:10px;color:var(--muted);letter-spacing:.05em;text-transform:uppercase;margin-bottom:4px" data-i18n="spatialFilterTitle">📡 Spatial Filtering</div>
+        <div class="field-row">
+          <label data-i18n="kNearestLabel">K-Nearest neighbours</label>
+          <input type="number" id="adv-k-nearest" value="10" min="1" max="50" step="1"
+                 title="For each location, only the K nearest neighbours are sent to the routing API. Higher = more accurate but slower.">
+        </div>
+        <div class="field-row">
+          <label data-i18n="sentinelFactorLabel">Sentinel factor</label>
+          <input type="number" id="adv-sentinel-factor" value="2.5" min="1.0" max="10.0" step="0.1"
+                 title="Distant pairs are assigned haversine × this factor as a sentinel cost. Must be > road-to-straight-line ratio (~1.6 for Serbia).">
+        </div>
+
+        <div style="border-top:1px solid var(--border2);margin:8px 0 4px;padding-top:6px;font-size:10px;color:var(--muted);letter-spacing:.05em;text-transform:uppercase" data-i18n="overlapPenaltyTitle">🗺️ Route Overlap Penalty</div>
+        <div class="field-row">
+          <label data-i18n="overlapThresholdLabel">Overlap threshold (km)</label>
+          <input type="number" id="adv-overlap-threshold" value="3.0" min="0" max="50" step="0.5"
+                 title="Routes that interleave closer than this distance (km) are penalised. Increase for country-wide deliveries.">
+        </div>
+        <div class="field-row">
+          <label data-i18n="overlapWeightLabel">Overlap weight (RSD)</label>
+          <input type="number" id="adv-overlap-weight" value="500" min="0" max="50000" step="50"
+                 title="RSD penalty per km-under-threshold (quadratic). Higher values push the solver to separate vehicle zones more aggressively.">
+        </div>
+
+        <div style="border-top:1px solid var(--border2);margin:8px 0 4px;padding-top:6px;font-size:10px;color:var(--muted);letter-spacing:.05em;text-transform:uppercase" data-i18n="solverPenaltiesTitle">⚖️ Solver Penalties</div>
+        <div class="field-row">
+          <label data-i18n="distRsdPerKmLabel">Distance cost (RSD/km)</label>
+          <input type="number" id="adv-dist-rsd-per-km" value="20" min="0" max="9999" step="1"
+                 title="Cost per km used when 'Distance' objective is selected. Used to put distance on the same RSD scale as fuel/wages.">
+        </div>
+        <div class="field-row">
+          <label data-i18n="twPenaltyRsdLabel">TW violation penalty (RSD/min)</label>
+          <input type="number" id="adv-tw-penalty-rsd" value="100" min="0" max="99999" step="10"
+                 title="Soft penalty per minute of time-window violation (when soft TW mode is active).">
+        </div>
+        <div class="field-row">
+          <label data-i18n="alnsCoolingLabel">ALNS cooling rate</label>
+          <input type="number" id="adv-alns-cooling" value="0.995" min="0.900" max="0.9999" step="0.001"
+                 title="Simulated annealing cooling rate per iteration. Closer to 1 = slower cooling = more exploration.">
+        </div>
+
+        <div id="adv-hint" style="font-size:9px;color:var(--muted);padding:4px 6px;background:var(--bg3);border-radius:4px;margin-top:4px;font-style:italic" data-i18n="advancedParamsNote">
+          Changes take effect on the next optimization run.
+        </div>
+      </div><!-- /panel-body -->
+    </section>
+
     <!-- Algorithm -->
     <section class="panel" id="panel-algo">
       <div class="panel-title" data-i18n="algorithm" onclick="togglePanel('panel-algo')">⚙️ Algorithm</div>

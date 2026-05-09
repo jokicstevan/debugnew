@@ -160,6 +160,19 @@ const TRANSLATIONS = {
     costParamsNote: '⛽ Fuel also increases +3% per 1 000 kg payload',
     fuelPriceLabel: '⛽ Fuel price (RSD/L)',
     driverWageLabel: '👷 Driver wage (RSD/h)',
+    advancedParams: '🔬 Advanced Parameters',
+    advancedParamsHint: 'Fine-tune the routing engine and solver penalties. Leave defaults unless you know what you\'re doing.',
+    advancedParamsNote: 'Changes take effect on the next optimization run.',
+    spatialFilterTitle: '📡 Spatial Filtering',
+    kNearestLabel: 'K-Nearest neighbours',
+    sentinelFactorLabel: 'Sentinel factor',
+    overlapPenaltyTitle: '🗺️ Route Overlap Penalty',
+    overlapThresholdLabel: 'Overlap threshold (km)',
+    overlapWeightLabel: 'Overlap weight (RSD)',
+    solverPenaltiesTitle: '⚖️ Solver Penalties',
+    distRsdPerKmLabel: 'Distance cost (RSD/km)',
+    twPenaltyRsdLabel: 'TW violation penalty (RSD/min)',
+    alnsCoolingLabel: 'ALNS cooling rate',
   },
   sr: {
     routePlanner: 'Planer ruta',
@@ -315,6 +328,19 @@ const TRANSLATIONS = {
     costParamsNote: '⛽ Gorivo raste +3% na svakih 1 000 kg tereta',
     fuelPriceLabel: '⛽ Cena goriva (RSD/L)',
     driverWageLabel: '👷 Plata vozača (RSD/h)',
+    advancedParams: '🔬 Napredni parametri',
+    advancedParamsHint: 'Fino podesite mašinu za rutiranje i kazne solvera. Ostavite podrazumevane vrednosti ako niste sigurni.',
+    advancedParamsNote: 'Promene stupaju na snagu pri sledećoj optimizaciji.',
+    spatialFilterTitle: '📡 Prostorno filtriranje',
+    kNearestLabel: 'K-najbližih suseda',
+    sentinelFactorLabel: 'Sentinel faktor',
+    overlapPenaltyTitle: '🗺️ Kazna preklapanja ruta',
+    overlapThresholdLabel: 'Prag preklapanja (km)',
+    overlapWeightLabel: 'Težina preklapanja (RSD)',
+    solverPenaltiesTitle: '⚖️ Kazne solvera',
+    distRsdPerKmLabel: 'Trošak rastojanja (RSD/km)',
+    twPenaltyRsdLabel: 'Kazna kršenja vremenskog okvira (RSD/min)',
+    alnsCoolingLabel: 'ALNS stopa hlađenja',
   }
 };
 
@@ -904,6 +930,19 @@ function _refreshModalFuelNote(pct) {
   exampleEl.textContent = t('fuelLoadExample')(pct, base);
 }
 
+// ─── ADVANCED PARAMETERS ─────────────────────────────────────────────────────
+function getAdvancedParams() {
+  return {
+    k_nearest:            parseInt(document.getElementById('adv-k-nearest')?.value)        ?? 10,
+    sentinel_factor:      parseFloat(document.getElementById('adv-sentinel-factor')?.value) ?? 2.5,
+    overlap_threshold_km: parseFloat(document.getElementById('adv-overlap-threshold')?.value) ?? 3.0,
+    overlap_weight_rsd:   parseFloat(document.getElementById('adv-overlap-weight')?.value)  ?? 500,
+    dist_rsd_per_km:      parseFloat(document.getElementById('adv-dist-rsd-per-km')?.value) ?? 20,
+    tw_penalty_rsd:       parseFloat(document.getElementById('adv-tw-penalty-rsd')?.value)  ?? 100,
+    alns_cooling:         parseFloat(document.getElementById('adv-alns-cooling')?.value)    ?? 0.995,
+  };
+}
+
 // ─── OBJECTIVE SELECTOR ──────────────────────────────────────────────────────
 function getObjWeights() {
   return {
@@ -977,6 +1016,7 @@ async function runOptimize() {
     use_weight_capacity: document.getElementById('use-wt-cap').checked,
     max_iterations:   parseInt(document.getElementById('max-iter').value)||500,
     temperature:      parseFloat(document.getElementById('temperature').value)||150,
+    advanced_params:  getAdvancedParams(),
   };
 
   try {
