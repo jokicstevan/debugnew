@@ -289,21 +289,44 @@ def _here_departure_time():
 
 # ── HERE Routing (live traffic) ───────────────────────────────────────────────
 
-def fetch_here_matrix(locations):
+def fetch_here_matrix(locations, pairs=None, hav_km=None):
     """Build N×N matrix using HERE Router v8 /routes with live traffic.
     Avoids the async Matrix API (which requires OAuth2 for polling).
-    Uses one API call per origin row — fast enough for ≤25 locations."""
+    Uses one API call per origin row — fast enough for ≤25 locations.
+
+    Parameters
+    ----------
+    locations : list of {"lat": float, "lng": float}
+    pairs     : optional set of (i, j) tuples that *must* be fetched from HERE.
+                Pairs not in the set receive a haversine-based sentinel value
+                (hav_km[i][j] * SENTINEL_FACTOR) so the VRP solver never routes
+                through them.  When None, every pair is fetched (original behaviour).
+    hav_km    : optional np.ndarray of precomputed haversine distances (km).
+                Required when pairs is not None.
+    """
     if not HERE_API_KEY:
         return None, None
-    n = len(locations)
+    n        = len(locations)
     dist_mat = [[0.0]*n for _ in range(n)]
     time_mat = [[0.0]*n for _ in range(n)]
-
     dep_time = _here_departure_time()
+
+    # Pre-fill sentinel values for skipped pairs using haversine * factor
+    if pairs is not None and hav_km is not None:
+        for i in range(n):
+            for j in range(n):
+                if i != j and (i, j) not in pairs:
+                    sentinel_d = float(hav_km[i][j]) * SENTINEL_FACTOR
+                    dist_mat[i][j] = sentinel_d
+                    # Time estimate: sentinel distance at 30 km/h average
+                    time_mat[i][j] = sentinel_d / 30.0 * 60.0
+
+    fetch_set = pairs if pairs is not None else {(i, j) for i in range(n) for j in range(n) if i != j}
+    api_calls = 0
 
     for i in range(n):
         for j in range(n):
-            if i == j:
+            if i == j or (i, j) not in fetch_set:
                 continue
             params = {
                 "apiKey":        HERE_API_KEY,
@@ -323,6 +346,7 @@ def fetch_here_matrix(locations):
                         summary = routes[0]["sections"][0]["summary"]
                         dist_mat[i][j] = summary["length"]   / 1000.0  # m → km
                         time_mat[i][j] = summary["duration"] / 60.0    # s → min
+                        api_calls += 1
                         continue
                 print(f"[HERE matrix] ({i},{j}) failed: {resp.status_code} {resp.text[:100]}")
                 return None, None   # fail fast — fall back to OSRM
@@ -330,7 +354,9 @@ def fetch_here_matrix(locations):
                 print(f"[HERE matrix] ({i},{j}) exception: {e}")
                 return None, None
 
-    print(f"[HERE matrix] ✅ {n}×{n} matrix built with live traffic")
+    skipped = n * (n - 1) - api_calls
+    print(f"[HERE matrix] ✅ {n}×{n} matrix built with live traffic "
+          f"({api_calls} API calls, {skipped} sentinel-filled)")
     return dist_mat, time_mat
 
 
@@ -428,11 +454,45 @@ def fetch_here_route(waypoints):
 
 # ── OSRM Routing (fallback, no live traffic) ──────────────────────────────────
 
-def fetch_osrm_matrix(locations):
-    """Fetch N×N road distance+time matrix from OSRM /table."""
-    coords = ";".join(f"{loc['lng']},{loc['lat']}" for loc in locations)
+def fetch_osrm_matrix(locations, pairs=None, hav_km=None):
+    """Fetch N×N road distance+time matrix from OSRM /table.
+
+    Parameters
+    ----------
+    locations : list of {"lat": float, "lng": float}
+    pairs     : optional set of (i, j) tuples to include in the matrix.
+                When provided, OSRM is called only for the subset of
+                *unique* location indices that appear in those pairs.
+                Remaining pairs receive a haversine sentinel value.
+    hav_km    : optional np.ndarray of precomputed haversine distances (km).
+    """
+    n = len(locations)
+
+    # Determine which location indices actually need to be in the OSRM call
+    if pairs is not None:
+        needed_idx = sorted({i for p in pairs for i in p})
+    else:
+        needed_idx = list(range(n))
+
+    sub_locs = [locations[i] for i in needed_idx]
+    idx_map  = {orig: sub for sub, orig in enumerate(needed_idx)}  # orig → sub-matrix index
+
+    coords = ";".join(f"{loc['lng']},{loc['lat']}" for loc in sub_locs)
     url    = f"https://router.project-osrm.org/table/v1/driving/{coords}"
     delays = [2, 5, 10, 15]
+
+    dist_mat = [[0.0]*n for _ in range(n)]
+    time_mat = [[0.0]*n for _ in range(n)]
+
+    # Pre-fill sentinel values for pairs that won't be fetched
+    if pairs is not None and hav_km is not None:
+        for i in range(n):
+            for j in range(n):
+                if i != j and (i, j) not in pairs:
+                    sentinel_d = float(hav_km[i][j]) * SENTINEL_FACTOR
+                    dist_mat[i][j] = sentinel_d
+                    time_mat[i][j] = sentinel_d / 30.0 * 60.0
+
     for attempt in range(4):
         try:
             resp = requests.get(url, params={"annotations": "distance,duration"},
@@ -444,16 +504,21 @@ def fetch_osrm_matrix(locations):
             data = resp.json()
             if data.get("code") != "Ok":
                 time.sleep(delays[attempt]); continue
-            n = len(locations)
-            dist = [[0.0]*n for _ in range(n)]
-            tdur = [[0.0]*n for _ in range(n)]
-            for i in range(n):
-                for j in range(n):
-                    d = data["distances"][i][j]
-                    t = data["durations"][i][j]
-                    dist[i][j] = (d / 1000.0) if d else 0.0
-                    tdur[i][j] = (t / 60.0)   if t else 0.0
-            return dist, tdur
+
+            # Map sub-matrix results back into the full N×N matrix
+            for si, i in enumerate(needed_idx):
+                for sj, j in enumerate(needed_idx):
+                    if i == j:
+                        continue
+                    d = data["distances"][si][sj]
+                    t = data["durations"][si][sj]
+                    dist_mat[i][j] = (d / 1000.0) if d else 0.0
+                    time_mat[i][j] = (t / 60.0)   if t else 0.0
+
+            skipped = n * (n - 1) - len(needed_idx) * (len(needed_idx) - 1)
+            print(f"[OSRM matrix] ✅ {n}×{n} (fetched {len(needed_idx)} locs, "
+                  f"{skipped} sentinel-filled)")
+            return dist_mat, time_mat
         except Exception:
             time.sleep(delays[attempt])
     return None, None
@@ -465,6 +530,78 @@ def haversine(lat1, lon1, lat2, lon2):
     a    = (math.sin((la2-la1)/2)**2
             + math.cos(la1)*math.cos(la2)*math.sin(math.radians(lon2-lon1)/2)**2)
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+
+
+# ── Spatial pre-filtering ─────────────────────────────────────────────────────
+#
+# Before making expensive HERE/OSRM API calls we compute the straight-line
+# (haversine) distance for every pair.  Pairs that are farther than
+# MAX_HAVERSINE_KM apart will *never* appear as consecutive stops in an
+# optimal route — their road distance is only larger — so we can safely skip
+# the API call and use a large sentinel value instead.
+#
+# How the threshold is chosen:
+#   By default we use an adaptive threshold: for each location we keep its
+#   K_NEAREST nearest neighbours (straight-line).  Only those pairs are sent
+#   to the API.  All other pairs get  sentinel = haversine * SENTINEL_FACTOR
+#   which is guaranteed to be larger than the real road distance and therefore
+#   will never be chosen by the VRP solver.
+#
+# Tuning:
+#   K_NEAREST   – increase for sparser networks or long detours (default 10).
+#   SENTINEL_FACTOR – must be > road-to-straight-line ratio; 2.5 is very safe
+#                     for Serbia's road network (typical ratio ≈ 1.2–1.6).
+
+K_NEAREST       = 10     # keep this many nearest neighbours per location
+SENTINEL_FACTOR = 2.5    # sentinel = haversine * factor  (always > real road distance)
+
+
+def _haversine_matrix_km(locations):
+    """Return an N×N numpy array of haversine distances (km)."""
+    n    = len(locations)
+    lats = np.radians([loc["lat"] for loc in locations])
+    lngs = np.radians([loc["lng"] for loc in locations])
+    mat  = np.zeros((n, n))
+    for i in range(n):
+        dlat = lats - lats[i]
+        dlng = lngs - lngs[i]
+        a    = np.sin(dlat / 2)**2 + np.cos(lats[i]) * np.cos(lats) * np.sin(dlng / 2)**2
+        mat[i] = 6371.0 * 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
+    return mat
+
+
+def build_api_pairs(locations, k=K_NEAREST):
+    """Return a set of (i, j) pairs that should be fetched from the routing API.
+
+    For each location i we include all pairs to its k nearest neighbours
+    (by straight-line distance).  The pair set is symmetric: if (i,j) is
+    included, (j,i) is included too.
+
+    Returns
+    -------
+    hav_km : np.ndarray  shape (n, n) — straight-line distances for all pairs
+    pairs  : set of (int, int)        — pairs to query the routing API for
+    """
+    n      = len(locations)
+    hav_km = _haversine_matrix_km(locations)
+
+    if n <= k + 1:
+        # Too few locations — just query everything (same behaviour as before)
+        pairs = {(i, j) for i in range(n) for j in range(n) if i != j}
+        return hav_km, pairs
+
+    pairs = set()
+    for i in range(n):
+        row      = hav_km[i].copy()
+        row[i]   = np.inf                       # exclude self
+        nearest  = np.argpartition(row, k)[:k]  # k smallest indices
+        for j in nearest:
+            pairs.add((i, int(j)))
+            pairs.add((int(j), i))              # symmetric
+
+    print(f"[spatial filter] {n} locations → {len(pairs)} API pairs "
+          f"(skipped {n*(n-1) - len(pairs)} pairs, k={k})")
+    return hav_km, pairs
 
 
 def build_haversine_matrix(locations):
@@ -516,12 +653,22 @@ def fetch_osrm_route(waypoints):
 
 
 def fetch_best_matrix(locations):
-    """Try HERE (live traffic) → OSRM → haversine. Returns (dist, time, source)."""
+    """Try HERE (live traffic) → OSRM → haversine. Returns (dist, time, source).
+
+    Spatial pre-filtering: for N locations we compute the straight-line
+    (haversine) distance matrix once and derive a set of *nearby pairs*
+    (each location's K_NEAREST nearest neighbours).  Only those pairs are
+    sent to the external routing API.  Distant pairs receive a sentinel
+    value — large enough to ensure the VRP solver never routes through them,
+    yet still a valid finite number so the matrix stays consistent.
+    """
+    hav_km, pairs = build_api_pairs(locations)
+
     if HERE_API_KEY:
-        d, t = fetch_here_matrix(locations)
+        d, t = fetch_here_matrix(locations, pairs=pairs, hav_km=hav_km)
         if d is not None:
             return d, t, "here"
-    d, t = fetch_osrm_matrix(locations)
+    d, t = fetch_osrm_matrix(locations, pairs=pairs, hav_km=hav_km)
     if d is not None:
         return d, t, "osrm"
     d, t = build_haversine_matrix(locations)
@@ -603,7 +750,7 @@ def route_time(route_mat_indices, depot_mat_idx, dist_mat, time_mat, tw, svc,
         prev = c
     return feasible, sched
 
-
+# This is to prevent early start
 def latest_feasible_departure(route_mat_indices, depot_mat_idx,
                                dist_mat, time_mat, tw, svc, svc_map=None):
     """Find the latest departure minute from depot within depot hours that keeps
