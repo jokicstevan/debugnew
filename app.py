@@ -854,6 +854,61 @@ def route_fuel_litres(route_mat_indices, depot_mat_idx, dist_mat,
     return total_litres
 
 
+# ── Route-overlap penalty ─────────────────────────────────────────────────────
+#
+# Measures how much different vehicles' routes geographically interleave.
+# For every pair of active routes (A, B) we find the minimum straight-line
+# distance between any stop on A and any stop on B.  When that minimum is
+# smaller than OVERLAP_THRESHOLD_KM we apply a soft quadratic penalty.
+#
+# Effect: the solver is incentivised to assign geographically close stops to
+# the same vehicle rather than splitting them across vehicles — reducing
+# criss-crossing and improving driver familiarity with their zones.
+#
+# Tuning:
+#   OVERLAP_THRESHOLD_KM — routes that interleave closer than this (straight-
+#                          line, km) are penalised.  Default 3 km works well
+#                          for city-scale Belgrade routing; increase for
+#                          country-wide deliveries.
+#   OVERLAP_WEIGHT_RSD   — multiplier that puts the penalty on the same RSD
+#                          cost scale as fuel/wages.  Default 500 RSD per
+#                          km-under-threshold matches roughly 25 km of extra
+#                          driving in terms of solver pressure.
+
+OVERLAP_THRESHOLD_KM = 3.0    # km — penalise pairs closer than this
+OVERLAP_WEIGHT_RSD   = 500.0  # RSD per km-under-threshold (quadratic)
+
+
+def route_overlap_penalty(routes, dist_mat):
+    """Compute the total geographic overlap penalty across all route pairs.
+
+    For each pair of non-empty routes (A, B) the penalty contribution is:
+        sum over (a in A, b in B): max(0, OVERLAP_THRESHOLD_KM - dist[a][b])²
+                                   * OVERLAP_WEIGHT_RSD
+
+    Using the sum (not just the minimum) means a route with *many* stops near
+    another route's stops is penalised more than one with just a single
+    near-miss, which gives ALNS a gradient to work against.
+
+    Returns a float in RSD-equivalent units.
+    """
+    active = [(v, r) for v, r in enumerate(routes) if r]
+    if len(active) < 2:
+        return 0.0
+
+    penalty = 0.0
+    for idx_a in range(len(active)):
+        v_a, route_a = active[idx_a]
+        for idx_b in range(idx_a + 1, len(active)):
+            v_b, route_b = active[idx_b]
+            for a in route_a:
+                for b in route_b:
+                    gap = OVERLAP_THRESHOLD_KM - dist_mat[a][b]
+                    if gap > 0:
+                        penalty += gap * gap * OVERLAP_WEIGHT_RSD
+    return penalty
+
+
 def best_depot_for_route(route_mat_indices, n_depots, dist_mat):
     """Return the depot index (0..n_depots-1) that minimises route distance."""
     if n_depots == 1 or not route_mat_indices:
@@ -980,8 +1035,9 @@ class VRPState:
         do_wages    = ow.get("wages",    False)
         do_dist     = ow.get("distance", False)
         do_vehicles = ow.get("vehicles", False)
+        do_overlap  = ow.get("overlap",  False)
         # Fallback: if user unchecked everything, use fuel+wages
-        if not any([do_fuel, do_wages, do_dist, do_vehicles]):
+        if not any([do_fuel, do_wages, do_dist, do_vehicles, do_overlap]):
             do_fuel = do_wages = True
 
         # Distance normalisation: 1 km ≈ cost of driving it with avg fuel & wages
@@ -1047,6 +1103,8 @@ class VRPState:
                 total += VEHICLE_PENALTY_RSD
             if self.use_tw:
                 total += tw_viol * TW_PENALTY
+        if do_overlap:
+            total += route_overlap_penalty(self.routes, self.dist_mat)
         return total
 
     def total_distance(self):
@@ -1188,6 +1246,49 @@ def _cap_remove(state, rng):
         return s
     scores.sort(reverse=True)
     n_rem = int(rng.integers(1, max(2, len(scores) // 4 + 1)))
+    for _, v, pos in sorted(scores[:n_rem], key=lambda x: (x[1], x[2]), reverse=True):
+        s.routes[v].pop(pos)
+    return s
+
+
+def _overlap_remove(state, rng):
+    """Remove stops that are geographically close to stops on a *different* vehicle.
+
+    For each stop c on vehicle A, its 'overlap score' is the sum of
+    max(0, OVERLAP_THRESHOLD_KM - dist[c][b]) for all stops b on all other
+    vehicles B.  Stops with high scores sit in contested territory shared by
+    multiple routes and are the best candidates for reassignment.
+
+    This gives ALNS a targeted way to break up criss-crossing routes,
+    complementing the generic random/worst-removal operators.
+    """
+    s = state.copy()
+    active_vehicles = [(v, r) for v, r in enumerate(s.routes) if r]
+    if len(active_vehicles) < 2:
+        return s
+
+    scores = []
+    for v, route in enumerate(s.routes):
+        if not route:
+            continue
+        for i, c in enumerate(route):
+            # Sum proximity to all stops on OTHER vehicles
+            score = 0.0
+            for u, other_route in enumerate(s.routes):
+                if u == v or not other_route:
+                    continue
+                for b in other_route:
+                    gap = OVERLAP_THRESHOLD_KM - s.dist_mat[c][b]
+                    if gap > 0:
+                        score += gap * gap
+            scores.append((score, v, i))
+
+    if not scores:
+        return s
+
+    # Remove the highest-overlap stops (top quarter, at least 1)
+    scores.sort(reverse=True)
+    n_rem = max(1, int(rng.integers(1, max(2, len(scores) // 4 + 1))))
     for _, v, pos in sorted(scores[:n_rem], key=lambda x: (x[1], x[2]), reverse=True):
         s.routes[v].pop(pos)
     return s
@@ -1435,9 +1536,9 @@ def _alns_optimize(fleet, dist_mat, time_mat, n_depots, n_cust, tw, demands,
     temp = temperature
     cooling = 0.995
 
-    destroy = [_rand_remove, _worst_remove, _tw_remove, _cap_remove]
+    destroy = [_rand_remove, _worst_remove, _tw_remove, _cap_remove, _overlap_remove]
     repair = [_greedy_insert, _regret_insert]
-    dw = [1.0] * 4
+    dw = [1.0] * 5
     rw = [1.0] * 2
     rng = np.random.default_rng(42)
 
@@ -1545,6 +1646,7 @@ def optimize():
             "wages":    bool(raw_ow.get("wages",    False)),
             "distance": bool(raw_ow.get("distance", False)),
             "vehicles": bool(raw_ow.get("vehicles", False)),
+            "overlap":  bool(raw_ow.get("overlap",  False)),
         }
         # Ensure at least one component is active
         if not any(obj_weights.values()):
