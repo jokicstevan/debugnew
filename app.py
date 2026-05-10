@@ -4,10 +4,11 @@ Flask backend: auth, optimization, OSRM, PDF, Excel import
 """
 
 import os, copy, math, json, io, tempfile, threading, time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 import numpy as np
 from collections import defaultdict
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from functools import wraps
 
 from flask import (Flask, render_template, request, jsonify,
@@ -110,6 +111,30 @@ def _ensure_schema():
                 tw_start        VARCHAR(8),
                 tw_end          VARCHAR(8)
             )
+        """)
+        # ── Traffic history cache ─────────────────────────────────────────────
+        # Stores HERE historical travel times per (origin, destination) pair
+        # at 15-minute time-of-day slots.  One row = one API observation.
+        # slot_minutes: minutes since midnight (0, 15, 30, … 1425) — time-of-day only,
+        #               date information is intentionally discarded so that readings
+        #               from different days are averaged together per slot.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS grps_traffic_cache (
+                cache_id        SERIAL PRIMARY KEY,
+                orig_lat        DOUBLE PRECISION NOT NULL,
+                orig_lng        DOUBLE PRECISION NOT NULL,
+                dest_lat        DOUBLE PRECISION NOT NULL,
+                dest_lng        DOUBLE PRECISION NOT NULL,
+                slot_minutes    SMALLINT         NOT NULL,  -- 0..1425, step 15
+                travel_time_min DOUBLE PRECISION NOT NULL,
+                dist_km         DOUBLE PRECISION NOT NULL,
+                fetched_at      TIMESTAMPTZ      NOT NULL DEFAULT NOW(),
+                UNIQUE (orig_lat, orig_lng, dest_lat, dest_lng, slot_minutes, fetched_at)
+            )
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_traffic_cache_lookup
+            ON grps_traffic_cache (orig_lat, orig_lng, dest_lat, dest_lng, slot_minutes)
         """)
         conn.commit()
         conn.close()
@@ -217,6 +242,266 @@ def _save_route_to_db_async(payload: dict):
             print(f"[db] ⚠️  save failed: {exc}\n{traceback.format_exc()}")
 
     threading.Thread(target=_insert, daemon=True).start()
+
+
+# ─────────────────── HISTORICAL TRAFFIC CACHE ────────────────────────────────
+#
+# Strategy
+# ────────
+# For every pair in the k-nearest set we fetch HERE travel times for each
+# 15-minute slot of the day (96 slots × 14 days = 1,344 API calls per pair).
+# Calls are batched via a thread pool so the wall-clock time stays reasonable.
+#
+# At optimisation time we look up the *average* travel time for each pair at
+# the slot that corresponds to the expected wall-clock time when the vehicle
+# will actually drive that leg.  This per-leg predicted time replaces the
+# live-traffic snapshot in the time matrix fed to the solver, giving it a
+# more realistic cost estimate for legs driven later in the day.
+#
+# The feature degrades gracefully:
+#   • No DATABASE_URL  → skip entirely, use live/OSRM as before.
+#   • No HERE key      → skip fetch, but still read whatever is cached.
+#   • Cache miss       → fall back to the live-traffic value for that pair.
+
+_TRAFFIC_FETCH_POOL_SIZE = 4   # parallel HERE calls during pre-fetch
+_TRAFFIC_HISTORY_DAYS    = 14  # how many days back to fetch
+_TRAFFIC_SLOT_MINUTES    = 15  # resolution in minutes
+
+
+def _round_coord(v):
+    """Round coordinate to 5 decimal places for cache key consistency."""
+    return round(float(v), 5)
+
+
+def _slot_minutes(dt_utc):
+    """Return the 15-min slot (minutes since midnight, 0–1425) for a UTC datetime."""
+    total = dt_utc.hour * 60 + dt_utc.minute
+    return (total // _TRAFFIC_SLOT_MINUTES) * _TRAFFIC_SLOT_MINUTES
+
+
+def _fetch_here_for_slot(origin, destination, departure_iso):
+    """Single HERE /v8/routes call for a specific departure time.
+    Returns (travel_time_min, dist_km) or (None, None) on failure."""
+    if not HERE_API_KEY:
+        return None, None
+    params = {
+        "apiKey":        HERE_API_KEY,
+        "transportMode": "car",
+        "routingMode":   "fast",
+        "departureTime": departure_iso,
+        "origin":        f"{origin['lat']},{origin['lng']}",
+        "destination":   f"{destination['lat']},{destination['lng']}",
+        "return":        "summary",
+    }
+    try:
+        resp = requests.get("https://router.hereapi.com/v8/routes",
+                            params=params, timeout=12)
+        if resp.status_code == 200:
+            routes = resp.json().get("routes", [])
+            if routes:
+                s = routes[0]["sections"][0]["summary"]
+                return s["duration"] / 60.0, s["length"] / 1000.0
+        print(f"[traffic cache] HERE {resp.status_code} for {departure_iso}")
+    except Exception as exc:
+        print(f"[traffic cache] exception: {exc}")
+    return None, None
+
+
+def _upsert_traffic_rows(rows):
+    """Batch-insert traffic observations into grps_traffic_cache.
+    rows: list of (orig_lat, orig_lng, dest_lat, dest_lng, slot_minutes,
+                   travel_time_min, dist_km, fetched_at)
+    Silently skips on DB errors.
+    """
+    if not DATABASE_URL or not rows:
+        return
+    try:
+        conn = _get_db_conn()
+        cur  = conn.cursor()
+        cur.executemany("""
+            INSERT INTO grps_traffic_cache
+                (orig_lat, orig_lng, dest_lat, dest_lng, slot_minutes,
+                 travel_time_min, dist_km, fetched_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (orig_lat, orig_lng, dest_lat, dest_lng, slot_minutes, fetched_at)
+            DO NOTHING
+        """, rows)
+        conn.commit()
+        conn.close()
+    except Exception as exc:
+        print(f"[traffic cache] upsert failed: {exc}")
+
+
+def prefetch_traffic_history(locations, pairs):
+    """Fetch HERE historical travel times for all k-nearest pairs across the
+    last _TRAFFIC_HISTORY_DAYS days at _TRAFFIC_SLOT_MINUTES resolution.
+
+    Runs entirely in a background daemon thread — never blocks the HTTP response.
+    Each (pair, day, slot) triple is one HERE API call; work is spread across a
+    small thread pool to stay within HERE's rate limits while still completing in
+    a reasonable wall-clock time.
+
+    Already-cached (pair, slot, date) combinations are skipped so that repeated
+    optimisation runs don't re-fetch data unnecessarily.
+    """
+    if not DATABASE_URL or not HERE_API_KEY:
+        return  # nothing to do without both DB and HERE
+
+    def _run():
+        # Determine which (pair, slot, date) triples are already in the cache
+        # so we can skip them.  We query once per pair to avoid a huge IN clause.
+        already = set()
+        try:
+            conn = _get_db_conn()
+            cur  = conn.cursor()
+            for (i, j) in pairs:
+                olat = _round_coord(locations[i]["lat"])
+                olng = _round_coord(locations[i]["lng"])
+                dlat = _round_coord(locations[j]["lat"])
+                dlng = _round_coord(locations[j]["lng"])
+                cur.execute("""
+                    SELECT slot_minutes, DATE(fetched_at)
+                    FROM grps_traffic_cache
+                    WHERE orig_lat=%s AND orig_lng=%s
+                      AND dest_lat=%s AND dest_lng=%s
+                      AND fetched_at >= NOW() - INTERVAL %s
+                """, (olat, olng, dlat, dlng,
+                      f"{_TRAFFIC_HISTORY_DAYS} days"))
+                for row in cur.fetchall():
+                    already.add((i, j, int(row[0]), str(row[1])))
+            conn.close()
+        except Exception as exc:
+            print(f"[traffic cache] pre-check failed: {exc}")
+            already = set()
+
+        # Build the list of (pair, day_offset, slot) work items to fetch
+        today_utc = datetime.utcnow().date()
+        work = []
+        for (i, j) in pairs:
+            for day_offset in range(_TRAFFIC_HISTORY_DAYS):
+                day = today_utc - timedelta(days=day_offset + 1)   # yesterday back to -14 days
+                for slot in range(0, 24 * 60, _TRAFFIC_SLOT_MINUTES):
+                    if (i, j, slot, str(day)) not in already:
+                        work.append((i, j, day, slot))
+
+        if not work:
+            print("[traffic cache] ✅ All pairs already cached — nothing to fetch")
+            return
+
+        print(f"[traffic cache] Starting prefetch: {len(work)} calls "
+              f"({len(pairs)} pairs × up to {_TRAFFIC_HISTORY_DAYS} days × "
+              f"{24*60//_TRAFFIC_SLOT_MINUTES} slots)")
+
+        # Fetch in parallel; batch DB writes every 50 rows
+        batch = []
+
+        def _do_fetch(item):
+            fi, fj, fday, fslot = item
+            origin      = locations[fi]
+            destination = locations[fj]
+            # Build a specific UTC datetime for the historical slot
+            dep_dt  = datetime(fday.year, fday.month, fday.day,
+                               fslot // 60, fslot % 60, 0)
+            dep_iso = dep_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+            tt, dk  = _fetch_here_for_slot(origin, destination, dep_iso)
+            if tt is not None:
+                return (
+                    _round_coord(origin["lat"]),  _round_coord(origin["lng"]),
+                    _round_coord(destination["lat"]), _round_coord(destination["lng"]),
+                    fslot, tt, dk, dep_dt,
+                )
+            return None
+
+        fetched = succeeded = 0
+        with ThreadPoolExecutor(max_workers=_TRAFFIC_FETCH_POOL_SIZE) as pool:
+            futures = {pool.submit(_do_fetch, item): item for item in work}
+            for future in as_completed(futures):
+                fetched += 1
+                result = future.result()
+                if result:
+                    batch.append(result)
+                    succeeded += 1
+                if len(batch) >= 50:
+                    _upsert_traffic_rows(batch)
+                    batch.clear()
+                if fetched % 200 == 0:
+                    print(f"[traffic cache] …{fetched}/{len(work)} fetched, "
+                          f"{succeeded} succeeded")
+        if batch:
+            _upsert_traffic_rows(batch)
+
+        print(f"[traffic cache] ✅ Prefetch complete: {succeeded}/{len(work)} stored")
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def get_historical_time_mat(locations, departure_min, pairs):
+    """Build an N×N matrix of *predicted* travel times using historical averages.
+
+    For each pair (i, j) we look up all cached observations whose slot_minutes
+    falls within ±30 minutes of the expected wall-clock departure time for that
+    leg and average them.  The caller supplies `departure_min` (minutes since
+    midnight of the overall route departure) as the base; in practice the solver
+    uses the same value for all legs because we don't know per-leg times before
+    optimisation — a second-pass refinement could supply per-leg estimates.
+
+    Returns
+    -------
+    hist_mat : list[list[float]] | None
+        N×N matrix of predicted travel times in minutes, or None if the DB is
+        unavailable / no cache entries exist.  Pairs with no cached data keep
+        the value 0.0 so callers can detect them and fall back to the live value.
+    coverage : float
+        Fraction of requested pairs that had at least one cached reading.
+    """
+    if not DATABASE_URL:
+        return None, 0.0
+
+    n = len(locations)
+    hist_mat = [[0.0] * n for _ in range(n)]
+    hit = miss = 0
+
+    # Snap the departure time to the nearest 15-min slot
+    base_slot  = (int(departure_min) // _TRAFFIC_SLOT_MINUTES) * _TRAFFIC_SLOT_MINUTES
+    # Also include one slot each side (±15 min) for a ±30 min window
+    slot_window = {
+        base_slot,
+        (base_slot - _TRAFFIC_SLOT_MINUTES) % (24 * 60),
+        (base_slot + _TRAFFIC_SLOT_MINUTES) % (24 * 60),
+    }
+
+    try:
+        conn = _get_db_conn()
+        cur  = conn.cursor()
+        for (i, j) in pairs:
+            olat = _round_coord(locations[i]["lat"])
+            olng = _round_coord(locations[i]["lng"])
+            dlat = _round_coord(locations[j]["lat"])
+            dlng = _round_coord(locations[j]["lng"])
+            cur.execute("""
+                SELECT AVG(travel_time_min)
+                FROM grps_traffic_cache
+                WHERE orig_lat=%s AND orig_lng=%s
+                  AND dest_lat=%s AND dest_lng=%s
+                  AND slot_minutes = ANY(%s)
+            """, (olat, olng, dlat, dlng, list(slot_window)))
+            row = cur.fetchone()
+            if row and row[0] is not None:
+                hist_mat[i][j] = float(row[0])
+                hit += 1
+            else:
+                miss += 1
+        conn.close()
+    except Exception as exc:
+        print(f"[traffic cache] read failed: {exc}")
+        return None, 0.0
+
+    total     = hit + miss
+    coverage  = hit / total if total > 0 else 0.0
+    print(f"[traffic cache] historical lookup: {hit}/{total} pairs covered "
+          f"(slot window {sorted(slot_window)})")
+    return hist_mat, coverage
+
 
 # ─────────────────────────── AUTH ────────────────────────────────────────────
 
@@ -844,7 +1129,8 @@ def fetch_osrm_route(waypoints):
     return straight_line_geometry(waypoints)
 
 
-def fetch_best_matrix(locations, k_nearest=None, sentinel_factor=None):
+def fetch_best_matrix(locations, k_nearest=None, sentinel_factor=None,
+                      departure_min=None):
     """Try HERE (live traffic) → OSRM → haversine. Returns (dist, time, source).
 
     Spatial pre-filtering: for N locations we compute the straight-line
@@ -853,7 +1139,21 @@ def fetch_best_matrix(locations, k_nearest=None, sentinel_factor=None):
     sent to the external routing API.  Distant pairs receive a sentinel
     value — large enough to ensure the VRP solver never routes through them,
     yet still a valid finite number so the matrix stays consistent.
+
+    Historical blending
+    -------------------
+    When `departure_min` is provided (minutes since midnight of the planned
+    departure) and the traffic cache contains data for this set of locations,
+    the live/OSRM time matrix is blended with historical averages:
+
+        blended_time[i][j] = 0.5 * live[i][j] + 0.5 * hist[i][j]
+
+    For pairs with no historical data the live value is kept unchanged.
+    The blend weight (0.5/0.5) is a conservative default; you can tune
+    _HIST_BLEND_WEIGHT below once you have enough data to evaluate accuracy.
     """
+    _HIST_BLEND_WEIGHT = 0.5   # weight given to historical average (0=live only, 1=hist only)
+
     k  = k_nearest      if k_nearest      is not None else K_NEAREST
     sf = sentinel_factor if sentinel_factor is not None else SENTINEL_FACTOR
 
@@ -862,12 +1162,38 @@ def fetch_best_matrix(locations, k_nearest=None, sentinel_factor=None):
     if HERE_API_KEY:
         d, t = fetch_here_matrix(locations, pairs=pairs, hav_km=hav_km, sentinel_factor=sf)
         if d is not None:
+            t = _blend_historical(t, locations, departure_min, pairs, _HIST_BLEND_WEIGHT)
             return d, t, "here"
     d, t = fetch_osrm_matrix(locations, pairs=pairs, hav_km=hav_km, sentinel_factor=sf)
     if d is not None:
+        t = _blend_historical(t, locations, departure_min, pairs, _HIST_BLEND_WEIGHT)
         return d, t, "osrm"
     d, t = build_haversine_matrix(locations)
     return d, t, "haversine"
+
+
+def _blend_historical(live_time_mat, locations, departure_min, pairs, weight):
+    """Return a blended time matrix mixing live values with historical averages.
+    Pairs with no cached data are left unchanged.  departure_min=None disables
+    the blend entirely (returns the original matrix).
+    """
+    if departure_min is None or not DATABASE_URL:
+        return live_time_mat
+
+    hist_mat, coverage = get_historical_time_mat(locations, departure_min, pairs)
+    if hist_mat is None or coverage == 0.0:
+        return live_time_mat
+
+    n = len(live_time_mat)
+    blended = [row[:] for row in live_time_mat]   # shallow copy
+    blended_count = 0
+    for (i, j) in pairs:
+        if hist_mat[i][j] > 0:
+            blended[i][j] = (1 - weight) * live_time_mat[i][j] + weight * hist_mat[i][j]
+            blended_count += 1
+    print(f"[traffic cache] blended {blended_count}/{len(pairs)} pairs "
+          f"(coverage={coverage:.1%}, weight={weight})")
+    return blended
 
 
 def fetch_best_route(waypoints):
@@ -1937,9 +2263,28 @@ def optimize():
         # to the corresponding original customer row — no extra matrix rows needed.
         all_locs_orig = depots + customers
 
+        # Parse planned departure time for historical traffic blending.
+        # Frontend sends e.g. "08:00"; convert to minutes-since-midnight.
+        departure_time_str = data.get("departure_time", "")
+        departure_min = None
+        if departure_time_str:
+            try:
+                dh, dm = map(int, departure_time_str.split(":"))
+                departure_min = dh * 60 + dm
+            except Exception:
+                departure_min = None
+
         # Phase 1: distance/time matrix — HERE (live traffic) → OSRM → haversine
+        # Pass departure_min so the time matrix is blended with historical averages.
         dist_mat, time_mat, matrix_source = fetch_best_matrix(
-            all_locs_orig, k_nearest=k_nearest, sentinel_factor=sentinel_factor)
+            all_locs_orig, k_nearest=k_nearest, sentinel_factor=sentinel_factor,
+            departure_min=departure_min)
+
+        # Fire off background pre-fetch of historical traffic for this set of
+        # locations so future optimisation runs have richer cache data.
+        if HERE_API_KEY and DATABASE_URL:
+            _, pairs_for_prefetch = build_api_pairs(all_locs_orig, k=k_nearest or K_NEAREST)
+            prefetch_traffic_history(all_locs_orig, pairs_for_prefetch)
 
         # Temporary tw / all_locs for demand calculations below
         all_locs = all_locs_orig
