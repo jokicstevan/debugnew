@@ -173,6 +173,27 @@ const TRANSLATIONS = {
     distRsdPerKmLabel: 'Distance cost (RSD/km)',
     twPenaltyRsdLabel: 'TW violation penalty (RSD/min)',
     alnsCoolingLabel: 'ALNS cooling rate',
+    routeHistory: '🗄️ Route History',
+    routeHistoryHint: 'Routes saved automatically after each optimization run.',
+    refreshHistory: '🔄 Refresh',
+    routeDetail: 'Route Detail',
+    loading: 'Loading…',
+    close: 'Close',
+    deleteRoute: '🗑 Delete',
+    historyEmpty: 'No saved routes yet. Run an optimization to save routes automatically.',
+    historyError: '⚠️ Could not load history.',
+    historyNoDB: '⚠️ Database not connected — set DATABASE_URL on Render.',
+    historyDeleteConfirm: 'Delete this route permanently?',
+    historyDeleted: '✅ Route deleted.',
+    historyDeleteError: '⚠️ Delete failed: ',
+    historyColDate: 'Date',
+    historyColVehicle: 'Vehicle',
+    historyColAlgo: 'Algorithm',
+    historyColDist: 'Distance',
+    historyColCost: 'Total cost',
+    historyColStops: 'Stops',
+    historyColBy: 'Saved by',
+    historyViewBtn: 'View',
   },
   sr: {
     routePlanner: 'Planer ruta',
@@ -341,6 +362,27 @@ const TRANSLATIONS = {
     distRsdPerKmLabel: 'Trošak rastojanja (RSD/km)',
     twPenaltyRsdLabel: 'Kazna kršenja vremenskog okvira (RSD/min)',
     alnsCoolingLabel: 'ALNS stopa hlađenja',
+    routeHistory: '🗄️ Istorija ruta',
+    routeHistoryHint: 'Rute se čuvaju automatski nakon svake optimizacije.',
+    refreshHistory: '🔄 Osveži',
+    routeDetail: 'Detalji rute',
+    loading: 'Učitavanje…',
+    close: 'Zatvori',
+    deleteRoute: '🗑 Obriši',
+    historyEmpty: 'Nema sačuvanih ruta. Pokrenite optimizaciju da automatski sačuvate rute.',
+    historyError: '⚠️ Greška pri učitavanju istorije.',
+    historyNoDB: '⚠️ Baza nije povezana — podesite DATABASE_URL na Renderu.',
+    historyDeleteConfirm: 'Trajno obrisati ovu rutu?',
+    historyDeleted: '✅ Ruta obrisana.',
+    historyDeleteError: '⚠️ Greška pri brisanju: ',
+    historyColDate: 'Datum',
+    historyColVehicle: 'Vozilo',
+    historyColAlgo: 'Algoritam',
+    historyColDist: 'Rastojanje',
+    historyColCost: 'Ukupni troškovi',
+    historyColStops: 'Stanice',
+    historyColBy: 'Sačuvao',
+    historyViewBtn: 'Pregled',
   }
 };
 
@@ -1762,3 +1804,177 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
     (clientX, rect) => rect.right - clientX
   );
 })();
+
+// ─── ROUTE HISTORY ───────────────────────────────────────────────────────────
+
+let _historyCurrentId = null;
+
+async function loadRouteHistory() {
+  const listEl   = document.getElementById('history-list');
+  const statusEl = document.getElementById('history-status');
+  if (!listEl) return;
+
+  listEl.innerHTML = '';
+  statusEl.style.display = 'block';
+  statusEl.textContent = t('loading');
+
+  try {
+    const res  = await fetch('/api/routes');
+    const data = await res.json();
+
+    if (!data.ok) {
+      statusEl.textContent = data.error?.includes('not configured')
+        ? t('historyNoDB')
+        : t('historyError') + ' ' + (data.error || '');
+      return;
+    }
+
+    const routes = data.routes || [];
+    statusEl.style.display = 'none';
+
+    if (!routes.length) {
+      listEl.innerHTML = `<div style="font-size:10px;color:var(--muted);text-align:center;padding:12px">${t('historyEmpty')}</div>`;
+      return;
+    }
+
+    routes.forEach(r => {
+      const card = document.createElement('div');
+      card.style.cssText = 'background:var(--bg3);border:1px solid var(--border2);border-radius:6px;padding:7px 9px;cursor:pointer;transition:border-color .15s;font-size:10px';
+      card.onmouseenter = () => card.style.borderColor = 'var(--accent)';
+      card.onmouseleave = () => card.style.borderColor = 'var(--border2)';
+
+      const dateStr = (r.route_date || '').split('T')[0];
+      const dist    = r.total_distance_km != null ? `${Number(r.total_distance_km).toFixed(1)} km` : '—';
+      const cost    = r.total_cost_rsd    != null ? `${Math.round(r.total_cost_rsd).toLocaleString()} RSD` : '—';
+      const stops   = r.num_stops ?? '—';
+      const vtype   = r.vehicle_type || '—';
+      const algo    = r.algorithm || '—';
+      const by      = r.saved_by  || '—';
+
+      card.innerHTML = `
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:3px">
+          <span style="font-family:var(--font-syne,sans-serif);font-weight:700;font-size:11px;color:var(--fg)">#${r.route_id} · ${dateStr}</span>
+          <span style="color:var(--accent);font-weight:600">${cost}</span>
+        </div>
+        <div style="color:var(--muted);display:flex;gap:8px;flex-wrap:wrap">
+          <span>🚛 ${vtype}</span>
+          <span>📏 ${dist}</span>
+          <span>📍 ${stops} ${t('historyColStops').toLowerCase()}</span>
+          <span>⚙️ ${algo}</span>
+          <span>👤 ${by}</span>
+        </div>`;
+      card.onclick = () => openHistoryRoute(r.route_id);
+      listEl.appendChild(card);
+    });
+  } catch (e) {
+    statusEl.style.display = 'block';
+    statusEl.textContent = t('historyError');
+  }
+}
+
+async function openHistoryRoute(routeId) {
+  _historyCurrentId = routeId;
+  const modal   = document.getElementById('history-modal');
+  const bodyEl  = document.getElementById('history-modal-body');
+  const titleEl = document.getElementById('history-modal-title');
+
+  titleEl.textContent = t('routeDetail') + ` #${routeId}`;
+  bodyEl.innerHTML    = `<div class="placeholder-msg">${t('loading')}</div>`;
+  modal.classList.remove('hidden');
+
+  try {
+    const res  = await fetch(`/api/routes/${routeId}`);
+    const data = await res.json();
+    if (!data.ok) { bodyEl.innerHTML = `<div style="color:var(--danger)">${data.error}</div>`; return; }
+    const r = data.route;
+
+    const fmtNum = (v, dec=1) => v != null ? Number(v).toFixed(dec) : '—';
+    const fmtRSD = v => v != null ? Math.round(v).toLocaleString() + ' RSD' : '—';
+
+    let stopsHtml = '';
+    if (r.stops && r.stops.length) {
+      stopsHtml = `
+        <div style="margin-top:12px;font-size:10px;font-weight:700;color:var(--fg);margin-bottom:4px">${t('historyColStops')}</div>
+        <table style="width:100%;border-collapse:collapse;font-size:9px">
+          <thead>
+            <tr style="background:var(--bg3);color:var(--muted)">
+              <th style="padding:3px 5px;text-align:left">#</th>
+              <th style="padding:3px 5px;text-align:left">Customer</th>
+              <th style="padding:3px 5px;text-align:center">Arrival</th>
+              <th style="padding:3px 5px;text-align:center">Depart</th>
+              <th style="padding:3px 5px;text-align:center">Window</th>
+              <th style="padding:3px 5px;text-align:right">Vol m³</th>
+              <th style="padding:3px 5px;text-align:right">Wt kg</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${r.stops.map((s, i) => {
+              const viol = s.tw_violation_min > 0 ? ` <span style="color:var(--danger)">⚠️+${s.tw_violation_min}m</span>` : '';
+              return `<tr style="border-top:1px solid var(--border2);${i%2===1?'background:var(--bg3)':''}">
+                <td style="padding:3px 5px;color:var(--muted)">${s.stop_sequence}</td>
+                <td style="padding:3px 5px;color:var(--fg)">${s.customer_name || '—'}</td>
+                <td style="padding:3px 5px;text-align:center">${s.arrival_time || '—'}${viol}</td>
+                <td style="padding:3px 5px;text-align:center">${s.departure_time || '—'}</td>
+                <td style="padding:3px 5px;text-align:center;color:var(--muted)">${s.tw_start||'?'}–${s.tw_end||'?'}</td>
+                <td style="padding:3px 5px;text-align:right">${fmtNum(s.volume_m3,3)}</td>
+                <td style="padding:3px 5px;text-align:right">${fmtNum(s.weight_kg,1)}</td>
+              </tr>`;
+            }).join('')}
+          </tbody>
+        </table>`;
+    }
+
+    bodyEl.innerHTML = `
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px 16px;font-size:10px;margin-bottom:8px">
+        ${[
+          ['Date',        (r.route_date||'').split('T')[0]],
+          ['Vehicle',     r.vehicle_type || '—'],
+          ['Algorithm',   r.algorithm || '—'],
+          ['Matrix',      r.matrix_source || '—'],
+          ['Depot',       r.depot_name || '—'],
+          ['Saved by',    r.saved_by || '—'],
+          ['Distance',    fmtNum(r.total_distance_km) + ' km'],
+          ['Fuel',        fmtNum(r.total_fuel_litres) + ' L'],
+          ['Fuel cost',   fmtRSD(r.fuel_cost_rsd)],
+          ['Wages',       fmtRSD(r.wage_cost_rsd)],
+          ['Total cost',  fmtRSD(r.total_cost_rsd)],
+          ['Working hrs', fmtNum(r.working_hours)],
+          ['Departure',   r.departure_time || '—'],
+          ['Return',      r.return_time    || '—'],
+          ['Vol used',    fmtNum(r.volume_used_m3, 3) + ' m³'],
+          ['Wt used',     fmtNum(r.weight_used_kg, 1) + ' kg'],
+          ['Fuel price',  fmtNum(r.fuel_price_rsd_l, 0) + ' RSD/L'],
+          ['Wage rate',   fmtNum(r.driver_wage_rsd_h, 0) + ' RSD/h'],
+        ].map(([k, v]) => `
+          <div style="display:flex;justify-content:space-between;border-bottom:1px solid var(--border2);padding:2px 0">
+            <span style="color:var(--muted)">${k}</span>
+            <span style="color:var(--fg);font-weight:600">${v}</span>
+          </div>`).join('')}
+      </div>
+      ${stopsHtml}`;
+  } catch (e) {
+    bodyEl.innerHTML = `<div style="color:var(--danger)">${t('historyError')}</div>`;
+  }
+}
+
+function closeHistoryModal() {
+  document.getElementById('history-modal').classList.add('hidden');
+  _historyCurrentId = null;
+}
+
+async function deleteHistoryRoute() {
+  if (!_historyCurrentId) return;
+  if (!confirm(t('historyDeleteConfirm'))) return;
+  try {
+    const res  = await fetch(`/api/routes/${_historyCurrentId}`, { method: 'DELETE' });
+    const data = await res.json();
+    if (data.ok) {
+      closeHistoryModal();
+      loadRouteHistory();
+    } else {
+      alert(t('historyDeleteError') + (data.error || ''));
+    }
+  } catch (e) {
+    alert(t('historyDeleteError') + e.message);
+  }
+}

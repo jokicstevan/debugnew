@@ -7,7 +7,7 @@ import os, copy, math, json, io, tempfile, threading, time
 import requests
 import numpy as np
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, date
 from functools import wraps
 
 from flask import (Flask, render_template, request, jsonify,
@@ -31,6 +31,192 @@ UPLOAD_FOLDER = os.path.join(os.path.dirname(__file__), "uploads")
 REPORT_FOLDER = os.path.join(os.path.dirname(__file__), "reports")
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(REPORT_FOLDER, exist_ok=True)
+
+# ── PostgreSQL (Render managed DB) ────────────────────────────────────────────
+# Render injects DATABASE_URL automatically when a PostgreSQL database is
+# attached to this service.  All DB code is fully optional: if DATABASE_URL
+# is not set the app works exactly as before (routes are not persisted).
+
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+# Render uses the "postgres://" scheme; psycopg2 requires "postgresql://"
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+_db_ready = False   # set to True after schema is confirmed
+
+
+def _get_db_conn():
+    """Return a new psycopg2 connection, or raise if DATABASE_URL not set."""
+    import psycopg2
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL not configured")
+    return psycopg2.connect(DATABASE_URL, connect_timeout=5)
+
+
+def _ensure_schema():
+    """Create tables if they don't exist yet (idempotent, runs once on startup)."""
+    global _db_ready
+    if not DATABASE_URL:
+        return
+    try:
+        conn = _get_db_conn()
+        cur  = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS grps_routes (
+                route_id        SERIAL PRIMARY KEY,
+                route_date      DATE        NOT NULL DEFAULT CURRENT_DATE,
+                saved_by        VARCHAR(50) NOT NULL DEFAULT 'unknown',
+                algorithm       VARCHAR(30) NOT NULL DEFAULT 'ALNS',
+                matrix_source   VARCHAR(20) NOT NULL DEFAULT 'osrm',
+                depot_name      VARCHAR(100),
+                depot_lat       DOUBLE PRECISION,
+                depot_lng       DOUBLE PRECISION,
+                vehicle_type    VARCHAR(50),
+                total_distance_km  DOUBLE PRECISION,
+                total_fuel_litres  DOUBLE PRECISION,
+                fuel_cost_rsd      DOUBLE PRECISION,
+                wage_cost_rsd      DOUBLE PRECISION,
+                total_cost_rsd     DOUBLE PRECISION,
+                working_hours      DOUBLE PRECISION,
+                departure_time     VARCHAR(8),
+                return_time        VARCHAR(8),
+                volume_used_m3     DOUBLE PRECISION,
+                weight_used_kg     DOUBLE PRECISION,
+                num_stops          INTEGER,
+                fuel_price_rsd_l   DOUBLE PRECISION,
+                driver_wage_rsd_h  DOUBLE PRECISION,
+                notes              TEXT,
+                created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS grps_route_stops (
+                stop_id         SERIAL PRIMARY KEY,
+                route_id        INTEGER NOT NULL REFERENCES grps_routes(route_id) ON DELETE CASCADE,
+                stop_sequence   INTEGER NOT NULL,
+                customer_name   VARCHAR(200),
+                lat             DOUBLE PRECISION,
+                lng             DOUBLE PRECISION,
+                arrival_time    VARCHAR(8),
+                departure_time  VARCHAR(8),
+                wait_minutes    INTEGER DEFAULT 0,
+                tw_violation_min INTEGER DEFAULT 0,
+                service_time_min INTEGER DEFAULT 10,
+                packages1       DOUBLE PRECISION DEFAULT 0,
+                packages2       DOUBLE PRECISION DEFAULT 0,
+                packages3       DOUBLE PRECISION DEFAULT 0,
+                volume_m3       DOUBLE PRECISION DEFAULT 0,
+                weight_kg       DOUBLE PRECISION DEFAULT 0,
+                tw_start        VARCHAR(8),
+                tw_end          VARCHAR(8)
+            )
+        """)
+        conn.commit()
+        conn.close()
+        _db_ready = True
+        print("[db] ✅ PostgreSQL schema ready")
+    except Exception as e:
+        print(f"[db] ⚠️  Schema init failed: {e}")
+
+
+# Run schema setup in a background thread so a slow DB doesn't delay startup
+threading.Thread(target=_ensure_schema, daemon=True).start()
+
+
+def _save_route_to_db_async(payload: dict):
+    """Persist one vehicle route to PostgreSQL in a background thread.
+    Never blocks the HTTP response — failures are logged and silently swallowed.
+    """
+    if not DATABASE_URL:
+        return
+
+    def _insert():
+        try:
+            vr          = payload["vehicle_route"]
+            route_date  = payload.get("route_date", str(date.today()))
+            saved_by    = payload.get("saved_by", "unknown")
+            algorithm   = payload.get("algorithm", "ALNS")
+            matrix_src  = payload.get("matrix_source", "osrm")
+            fuel_price  = payload.get("fuel_price_rsd_l",  200.0)
+            wage_rate   = payload.get("driver_wage_rsd_h", 900.0)
+
+            conn = _get_db_conn()
+            cur  = conn.cursor()
+
+            cur.execute("""
+                INSERT INTO grps_routes
+                    (route_date, saved_by, algorithm, matrix_source,
+                     depot_name, depot_lat, depot_lng, vehicle_type,
+                     total_distance_km, total_fuel_litres, fuel_cost_rsd,
+                     wage_cost_rsd, total_cost_rsd,
+                     working_hours, departure_time, return_time,
+                     volume_used_m3, weight_used_kg, num_stops,
+                     fuel_price_rsd_l, driver_wage_rsd_h, notes)
+                VALUES
+                    (%s,%s,%s,%s, %s,%s,%s,%s, %s,%s,%s, %s,%s,
+                     %s,%s,%s, %s,%s,%s, %s,%s,%s)
+                RETURNING route_id
+            """, (
+                route_date, saved_by, algorithm, matrix_src,
+                vr.get("depot_name"),
+                vr.get("depot_lat"),
+                vr.get("depot_lng"),
+                vr.get("type"),
+                vr.get("distance"),
+                vr.get("fuel_used"),
+                vr.get("fuel_cost_rsd"),
+                vr.get("wage_cost_rsd"),
+                vr.get("total_cost_rsd"),
+                vr.get("working_hours"),
+                vr.get("departure_time"),
+                vr.get("return_time"),
+                vr.get("volume_used"),
+                vr.get("weight_used"),
+                vr.get("num_customers"),
+                fuel_price,
+                wage_rate,
+                f"Saved by: {saved_by}",
+            ))
+            route_id = cur.fetchone()[0]
+
+            # Insert stops
+            for seq, stop in enumerate(vr.get("stops", []), start=1):
+                pc = stop.get("pkg_counts", [0, 0, 0])
+                while len(pc) < 3:
+                    pc.append(0)
+                wt_kg = (pc[0] or 0) * 5.0 + (pc[1] or 0) * 15.0 + (pc[2] or 0) * 30.0
+                cur.execute("""
+                    INSERT INTO grps_route_stops
+                        (route_id, stop_sequence, customer_name, lat, lng,
+                         arrival_time, departure_time,
+                         wait_minutes, tw_violation_min, service_time_min,
+                         packages1, packages2, packages3,
+                         volume_m3, weight_kg, tw_start, tw_end)
+                    VALUES (%s,%s,%s,%s,%s, %s,%s, %s,%s,%s, %s,%s,%s, %s,%s,%s,%s)
+                """, (
+                    route_id, seq,
+                    stop.get("name", "")[:200],
+                    stop.get("lat"), stop.get("lng"),
+                    stop.get("arrival"), stop.get("depart"),
+                    int(stop.get("wait", 0)),
+                    int(stop.get("violation", 0)),
+                    int(stop.get("service_time", 10)),
+                    round(float(pc[0] or 0), 4),
+                    round(float(pc[1] or 0), 4),
+                    round(float(pc[2] or 0), 4),
+                    float(stop.get("volume", 0)),
+                    round(wt_kg, 1),
+                    stop.get("tw_start"), stop.get("tw_end"),
+                ))
+
+            conn.commit()
+            conn.close()
+            print(f"[db] ✅ RouteID={route_id} saved ({vr.get('num_customers')} stops)")
+        except Exception as exc:
+            import traceback
+            print(f"[db] ⚠️  save failed: {exc}\n{traceback.format_exc()}")
+
+    threading.Thread(target=_insert, daemon=True).start()
 
 # ─────────────────────────── AUTH ────────────────────────────────────────────
 
@@ -289,23 +475,26 @@ def _here_departure_time():
 
 # ── HERE Routing (live traffic) ───────────────────────────────────────────────
 
-def fetch_here_matrix(locations, pairs=None, hav_km=None):
+def fetch_here_matrix(locations, pairs=None, hav_km=None, sentinel_factor=None):
     """Build N×N matrix using HERE Router v8 /routes with live traffic.
     Avoids the async Matrix API (which requires OAuth2 for polling).
     Uses one API call per origin row — fast enough for ≤25 locations.
 
     Parameters
     ----------
-    locations : list of {"lat": float, "lng": float}
-    pairs     : optional set of (i, j) tuples that *must* be fetched from HERE.
-                Pairs not in the set receive a haversine-based sentinel value
-                (hav_km[i][j] * SENTINEL_FACTOR) so the VRP solver never routes
-                through them.  When None, every pair is fetched (original behaviour).
-    hav_km    : optional np.ndarray of precomputed haversine distances (km).
-                Required when pairs is not None.
+    locations        : list of {"lat": float, "lng": float}
+    pairs            : optional set of (i, j) tuples that *must* be fetched from HERE.
+                       Pairs not in the set receive a haversine-based sentinel value
+                       (hav_km[i][j] * sentinel_factor) so the VRP solver never routes
+                       through them.  When None, every pair is fetched (original behaviour).
+    hav_km           : optional np.ndarray of precomputed haversine distances (km).
+                       Required when pairs is not None.
+    sentinel_factor  : multiplier for haversine distance to produce sentinel values.
+                       Defaults to SENTINEL_FACTOR module constant.
     """
     if not HERE_API_KEY:
         return None, None
+    sf       = sentinel_factor if sentinel_factor is not None else SENTINEL_FACTOR
     n        = len(locations)
     dist_mat = [[0.0]*n for _ in range(n)]
     time_mat = [[0.0]*n for _ in range(n)]
@@ -316,7 +505,7 @@ def fetch_here_matrix(locations, pairs=None, hav_km=None):
         for i in range(n):
             for j in range(n):
                 if i != j and (i, j) not in pairs:
-                    sentinel_d = float(hav_km[i][j]) * SENTINEL_FACTOR
+                    sentinel_d = float(hav_km[i][j]) * sf
                     dist_mat[i][j] = sentinel_d
                     # Time estimate: sentinel distance at 30 km/h average
                     time_mat[i][j] = sentinel_d / 30.0 * 60.0
@@ -454,18 +643,21 @@ def fetch_here_route(waypoints):
 
 # ── OSRM Routing (fallback, no live traffic) ──────────────────────────────────
 
-def fetch_osrm_matrix(locations, pairs=None, hav_km=None):
+def fetch_osrm_matrix(locations, pairs=None, hav_km=None, sentinel_factor=None):
     """Fetch N×N road distance+time matrix from OSRM /table.
 
     Parameters
     ----------
-    locations : list of {"lat": float, "lng": float}
-    pairs     : optional set of (i, j) tuples to include in the matrix.
-                When provided, OSRM is called only for the subset of
-                *unique* location indices that appear in those pairs.
-                Remaining pairs receive a haversine sentinel value.
-    hav_km    : optional np.ndarray of precomputed haversine distances (km).
+    locations        : list of {"lat": float, "lng": float}
+    pairs            : optional set of (i, j) tuples to include in the matrix.
+                       When provided, OSRM is called only for the subset of
+                       *unique* location indices that appear in those pairs.
+                       Remaining pairs receive a haversine sentinel value.
+    hav_km           : optional np.ndarray of precomputed haversine distances (km).
+    sentinel_factor  : multiplier for haversine distance to produce sentinel values.
+                       Defaults to SENTINEL_FACTOR module constant.
     """
+    sf = sentinel_factor if sentinel_factor is not None else SENTINEL_FACTOR
     n = len(locations)
 
     # Determine which location indices actually need to be in the OSRM call
@@ -489,7 +681,7 @@ def fetch_osrm_matrix(locations, pairs=None, hav_km=None):
         for i in range(n):
             for j in range(n):
                 if i != j and (i, j) not in pairs:
-                    sentinel_d = float(hav_km[i][j]) * SENTINEL_FACTOR
+                    sentinel_d = float(hav_km[i][j]) * sf
                     dist_mat[i][j] = sentinel_d
                     time_mat[i][j] = sentinel_d / 30.0 * 60.0
 
@@ -652,7 +844,7 @@ def fetch_osrm_route(waypoints):
     return straight_line_geometry(waypoints)
 
 
-def fetch_best_matrix(locations):
+def fetch_best_matrix(locations, k_nearest=None, sentinel_factor=None):
     """Try HERE (live traffic) → OSRM → haversine. Returns (dist, time, source).
 
     Spatial pre-filtering: for N locations we compute the straight-line
@@ -662,13 +854,16 @@ def fetch_best_matrix(locations):
     value — large enough to ensure the VRP solver never routes through them,
     yet still a valid finite number so the matrix stays consistent.
     """
-    hav_km, pairs = build_api_pairs(locations)
+    k  = k_nearest      if k_nearest      is not None else K_NEAREST
+    sf = sentinel_factor if sentinel_factor is not None else SENTINEL_FACTOR
+
+    hav_km, pairs = build_api_pairs(locations, k=k)
 
     if HERE_API_KEY:
-        d, t = fetch_here_matrix(locations, pairs=pairs, hav_km=hav_km)
+        d, t = fetch_here_matrix(locations, pairs=pairs, hav_km=hav_km, sentinel_factor=sf)
         if d is not None:
             return d, t, "here"
-    d, t = fetch_osrm_matrix(locations, pairs=pairs, hav_km=hav_km)
+    d, t = fetch_osrm_matrix(locations, pairs=pairs, hav_km=hav_km, sentinel_factor=sf)
     if d is not None:
         return d, t, "osrm"
     d, t = build_haversine_matrix(locations)
@@ -879,12 +1074,13 @@ OVERLAP_THRESHOLD_KM = 3.0    # km — penalise pairs closer than this
 OVERLAP_WEIGHT_RSD   = 500.0  # RSD per km-under-threshold (quadratic)
 
 
-def route_overlap_penalty(routes, dist_mat):
+def route_overlap_penalty(routes, dist_mat,
+                          threshold_km=None, weight_rsd=None):
     """Compute the total geographic overlap penalty across all route pairs.
 
     For each pair of non-empty routes (A, B) the penalty contribution is:
-        sum over (a in A, b in B): max(0, OVERLAP_THRESHOLD_KM - dist[a][b])²
-                                   * OVERLAP_WEIGHT_RSD
+        sum over (a in A, b in B): max(0, threshold_km - dist[a][b])²
+                                   * weight_rsd
 
     Using the sum (not just the minimum) means a route with *many* stops near
     another route's stops is penalised more than one with just a single
@@ -892,6 +1088,11 @@ def route_overlap_penalty(routes, dist_mat):
 
     Returns a float in RSD-equivalent units.
     """
+    if threshold_km is None:
+        threshold_km = OVERLAP_THRESHOLD_KM
+    if weight_rsd is None:
+        weight_rsd = OVERLAP_WEIGHT_RSD
+
     active = [(v, r) for v, r in enumerate(routes) if r]
     if len(active) < 2:
         return 0.0
@@ -903,9 +1104,9 @@ def route_overlap_penalty(routes, dist_mat):
             v_b, route_b = active[idx_b]
             for a in route_a:
                 for b in route_b:
-                    gap = OVERLAP_THRESHOLD_KM - dist_mat[a][b]
+                    gap = threshold_km - dist_mat[a][b]
                     if gap > 0:
-                        penalty += gap * gap * OVERLAP_WEIGHT_RSD
+                        penalty += gap * gap * weight_rsd
     return penalty
 
 
@@ -934,7 +1135,9 @@ class VRPState:
                  use_tw=False, svc_map=None, demands_kg=None, obj_weights=None,
                  use_volume_cap=True, use_weight_cap=True,
                  fuel_price_rsd_l=None, driver_wage_rsd_h=None,
-                 fuel_load_factor=None):
+                 fuel_load_factor=None,
+                 overlap_threshold_km=None, overlap_weight_rsd=None,
+                 dist_rsd_per_km=None, tw_penalty_rsd=None):
         self.routes     = routes
         self.depot_of   = depot_of
         self.dist_mat   = dist_mat
@@ -957,6 +1160,11 @@ class VRPState:
         self.fuel_price_rsd_l  = fuel_price_rsd_l  if fuel_price_rsd_l  is not None else FUEL_PRICE_RSD_PER_LITRE
         self.driver_wage_rsd_h = driver_wage_rsd_h if driver_wage_rsd_h is not None else DRIVER_WAGE_RSD_PER_HOUR
         self.fuel_load_factor  = fuel_load_factor  if fuel_load_factor  is not None else FUEL_LOAD_FACTOR_PER_1000KG
+        # Advanced solver / penalty parameters (user-tunable)
+        self.overlap_threshold_km = overlap_threshold_km if overlap_threshold_km is not None else OVERLAP_THRESHOLD_KM
+        self.overlap_weight_rsd   = overlap_weight_rsd   if overlap_weight_rsd   is not None else OVERLAP_WEIGHT_RSD
+        self.dist_rsd_per_km      = dist_rsd_per_km      if dist_rsd_per_km      is not None else 20.0
+        self.tw_penalty_rsd       = tw_penalty_rsd       if tw_penalty_rsd       is not None else 100.0
 
     def fuel_per_100km(self, v, payload_kg=0.0):
         """Base fuel + linear load surcharge.
@@ -990,7 +1198,9 @@ class VRPState:
             self.obj_weights,
             self.use_volume_cap, self.use_weight_cap,
             self.fuel_price_rsd_l, self.driver_wage_rsd_h,
-            self.fuel_load_factor)
+            self.fuel_load_factor,
+            self.overlap_threshold_km, self.overlap_weight_rsd,
+            self.dist_rsd_per_km, self.tw_penalty_rsd)
 
     def cap(self, v):
         return self.fleet[v]["capacity"] if v < len(self.fleet) else float("inf")
@@ -1042,12 +1252,12 @@ class VRPState:
 
         # Distance normalisation: 1 km ≈ cost of driving it with avg fuel & wages
         # Approximately: 10L/100km × 200 RSD/L = 20 RSD/km for fuel alone.
-        DIST_RSD_PER_KM = 20.0
+        DIST_RSD_PER_KM = self.dist_rsd_per_km
         # Vehicle penalty: when minimising vehicles, must dominate ALL other costs
         # so that one extra vehicle always outweighs any fuel/wage/distance saving.
         VEHICLE_PENALTY_RSD = 1_000_000.0 if do_vehicles else 3600.0
 
-        TW_PENALTY = 100.0   # RSD-equivalent penalty per late minute
+        TW_PENALTY = self.tw_penalty_rsd
         total = 0.0
         for v, route in enumerate(self.routes):
             if not route:
@@ -1104,7 +1314,9 @@ class VRPState:
             if self.use_tw:
                 total += tw_viol * TW_PENALTY
         if do_overlap:
-            total += route_overlap_penalty(self.routes, self.dist_mat)
+            total += route_overlap_penalty(self.routes, self.dist_mat,
+                                           self.overlap_threshold_km,
+                                           self.overlap_weight_rsd)
         return total
 
     def total_distance(self):
@@ -1274,11 +1486,12 @@ def _overlap_remove(state, rng):
         for i, c in enumerate(route):
             # Sum proximity to all stops on OTHER vehicles
             score = 0.0
+            threshold = s.overlap_threshold_km
             for u, other_route in enumerate(s.routes):
                 if u == v or not other_route:
                     continue
                 for b in other_route:
-                    gap = OVERLAP_THRESHOLD_KM - s.dist_mat[c][b]
+                    gap = threshold - s.dist_mat[c][b]
                     if gap > 0:
                         score += gap * gap
             scores.append((score, v, i))
@@ -1376,7 +1589,9 @@ def mins_to_hhmm(m):
 def optimize_nn(dist_mat, time_mat, n_depots, n_cust, tw, demands,
                 use_tw=False, svc_map=None, demands_kg=None, obj_weights=None,
                 use_volume_cap=True, use_weight_cap=True,
-                fuel_price_rsd_l=None, driver_wage_rsd_h=None, fuel_load_factor=None):
+                fuel_price_rsd_l=None, driver_wage_rsd_h=None, fuel_load_factor=None,
+                overlap_threshold_km=None, overlap_weight_rsd=None,
+                dist_rsd_per_km=None, tw_penalty_rsd=None):
     """Single-vehicle nearest-neighbour. Returns VRPState."""
     depot = 0
     unvis = list(range(n_depots, n_depots + n_cust))
@@ -1390,20 +1605,30 @@ def optimize_nn(dist_mat, time_mat, n_depots, n_cust, tw, demands,
                     obj_weights=obj_weights,
                     use_volume_cap=use_volume_cap, use_weight_cap=use_weight_cap,
                     fuel_price_rsd_l=fuel_price_rsd_l, driver_wage_rsd_h=driver_wage_rsd_h,
-                    fuel_load_factor=fuel_load_factor)
+                    fuel_load_factor=fuel_load_factor,
+                    overlap_threshold_km=overlap_threshold_km,
+                    overlap_weight_rsd=overlap_weight_rsd,
+                    dist_rsd_per_km=dist_rsd_per_km,
+                    tw_penalty_rsd=tw_penalty_rsd)
 
 
 def optimize_2opt(dist_mat, time_mat, n_depots, n_cust, tw, demands,
                   use_tw=False, svc_map=None, demands_kg=None, obj_weights=None,
                   use_volume_cap=True, use_weight_cap=True,
-                  fuel_price_rsd_l=None, driver_wage_rsd_h=None, fuel_load_factor=None):
+                  fuel_price_rsd_l=None, driver_wage_rsd_h=None, fuel_load_factor=None,
+                  overlap_threshold_km=None, overlap_weight_rsd=None,
+                  dist_rsd_per_km=None, tw_penalty_rsd=None):
     """Single-vehicle 2-opt. Returns VRPState."""
     s = optimize_nn(dist_mat, time_mat, n_depots, n_cust, tw, demands,
                     use_tw=use_tw, svc_map=svc_map, demands_kg=demands_kg,
                     obj_weights=obj_weights,
                     use_volume_cap=use_volume_cap, use_weight_cap=use_weight_cap,
                     fuel_price_rsd_l=fuel_price_rsd_l, driver_wage_rsd_h=driver_wage_rsd_h,
-                    fuel_load_factor=fuel_load_factor)
+                    fuel_load_factor=fuel_load_factor,
+                    overlap_threshold_km=overlap_threshold_km,
+                    overlap_weight_rsd=overlap_weight_rsd,
+                    dist_rsd_per_km=dist_rsd_per_km,
+                    tw_penalty_rsd=tw_penalty_rsd)
     route = s.routes[0][:]
     depot = s.depot_of[0]
 
@@ -1430,7 +1655,9 @@ def optimize_2opt(dist_mat, time_mat, n_depots, n_cust, tw, demands,
 def _alns_optimize(fleet, dist_mat, time_mat, n_depots, n_cust, tw, demands,
                    demands_kg, obj_weights, use_volume_cap, use_weight_cap,
                    fuel_price_rsd_l, driver_wage_rsd_h, fuel_load_factor,
-                   temperature, max_iter, svc_map, use_tw):
+                   temperature, max_iter, svc_map, use_tw,
+                   overlap_threshold_km=None, overlap_weight_rsd=None,
+                   dist_rsd_per_km=None, tw_penalty_rsd=None, alns_cooling=None):
     """Run a single ALNS optimisation with the given fleet (list of vehicle dicts)."""
     num_v = len(fleet)
     all_ci = list(range(n_depots, n_depots + n_cust))
@@ -1527,14 +1754,18 @@ def _alns_optimize(fleet, dist_mat, time_mat, n_depots, n_cust, tw, demands,
                      obj_weights=obj_weights,
                      use_volume_cap=use_volume_cap, use_weight_cap=use_weight_cap,
                      fuel_price_rsd_l=fuel_price_rsd_l, driver_wage_rsd_h=driver_wage_rsd_h,
-                     fuel_load_factor=fuel_load_factor)
+                     fuel_load_factor=fuel_load_factor,
+                     overlap_threshold_km=overlap_threshold_km,
+                     overlap_weight_rsd=overlap_weight_rsd,
+                     dist_rsd_per_km=dist_rsd_per_km,
+                     tw_penalty_rsd=tw_penalty_rsd)
     state.reassign_depots()
 
     best = state.copy()
     best_obj = best.objective()
     cur_obj = best_obj
     temp = temperature
-    cooling = 0.995
+    cooling = alns_cooling if alns_cooling is not None else 0.995
 
     destroy = [_rand_remove, _worst_remove, _tw_remove, _cap_remove, _overlap_remove]
     repair = [_greedy_insert, _regret_insert]
@@ -1571,7 +1802,9 @@ def _alns_optimize(fleet, dist_mat, time_mat, n_depots, n_cust, tw, demands,
 def optimize_alns(dist_mat, time_mat, n_depots, n_cust, tw, demands,
                   fleet, max_iter=300, temperature=150.0, use_tw=False, svc_map=None,
                   demands_kg=None, obj_weights=None, use_volume_cap=True, use_weight_cap=True,
-                  fuel_price_rsd_l=None, driver_wage_rsd_h=None, fuel_load_factor=None):
+                  fuel_price_rsd_l=None, driver_wage_rsd_h=None, fuel_load_factor=None,
+                  overlap_threshold_km=None, overlap_weight_rsd=None,
+                  dist_rsd_per_km=None, tw_penalty_rsd=None, alns_cooling=None):
     """ALNS multi‑vehicle optimiser. When only vehicle minimisation is selected,
     it sorts the fleet by capacity so the largest vehicles are tried first,
     then incrementally adds vehicles until a feasible solution is found."""
@@ -1584,6 +1817,15 @@ def optimize_alns(dist_mat, time_mat, n_depots, n_cust, tw, demands,
     only_vehicles = (
         minimise_vehicles_flag
         and not (obj_weights.get("fuel") or obj_weights.get("wages") or obj_weights.get("distance"))
+    )
+
+    # Shared kwargs for all _alns_optimize calls
+    adv = dict(
+        overlap_threshold_km=overlap_threshold_km,
+        overlap_weight_rsd=overlap_weight_rsd,
+        dist_rsd_per_km=dist_rsd_per_km,
+        tw_penalty_rsd=tw_penalty_rsd,
+        alns_cooling=alns_cooling,
     )
 
     if only_vehicles:
@@ -1601,7 +1843,7 @@ def optimize_alns(dist_mat, time_mat, n_depots, n_cust, tw, demands,
                 sub_fleet, dist_mat, time_mat, n_depots, n_cust, tw,
                 demands, demands_kg, obj_weights, use_volume_cap, use_weight_cap,
                 fuel_price_rsd_l, driver_wage_rsd_h, fuel_load_factor,
-                temp, max_iter, svc_map, use_tw
+                temp, max_iter, svc_map, use_tw, **adv
             )
             if best_state.objective() < float("inf"):
                 return best_state
@@ -1612,7 +1854,7 @@ def optimize_alns(dist_mat, time_mat, n_depots, n_cust, tw, demands,
             fleet, dist_mat, time_mat, n_depots, n_cust, tw,
             demands, demands_kg, obj_weights, use_volume_cap, use_weight_cap,
             fuel_price_rsd_l, driver_wage_rsd_h, fuel_load_factor,
-            temp, max_iter, svc_map, use_tw
+            temp, max_iter, svc_map, use_tw, **adv
         )
 
 
@@ -1659,6 +1901,15 @@ def optimize():
         # Hard constraint toggles
         use_volume_cap = bool(data.get("use_volume_capacity", True))
         use_weight_cap = bool(data.get("use_weight_capacity", True))
+        # ── Advanced solver parameters (user-tunable via the Advanced panel) ──
+        adv_params = data.get("advanced_params", {})
+        k_nearest            = int(adv_params.get("k_nearest",            K_NEAREST))
+        sentinel_factor      = float(adv_params.get("sentinel_factor",    SENTINEL_FACTOR))
+        overlap_threshold_km = float(adv_params.get("overlap_threshold_km", OVERLAP_THRESHOLD_KM))
+        overlap_weight_rsd   = float(adv_params.get("overlap_weight_rsd",   OVERLAP_WEIGHT_RSD))
+        dist_rsd_per_km      = float(adv_params.get("dist_rsd_per_km",      20.0))
+        tw_penalty_rsd       = float(adv_params.get("tw_penalty_rsd",       100.0))
+        alns_cooling         = float(adv_params.get("alns_cooling",         0.995))
 
         if not depots_raw:
             return jsonify({"ok": False, "error": "No depot provided"})
@@ -1687,7 +1938,8 @@ def optimize():
         all_locs_orig = depots + customers
 
         # Phase 1: distance/time matrix — HERE (live traffic) → OSRM → haversine
-        dist_mat, time_mat, matrix_source = fetch_best_matrix(all_locs_orig)
+        dist_mat, time_mat, matrix_source = fetch_best_matrix(
+            all_locs_orig, k_nearest=k_nearest, sentinel_factor=sentinel_factor)
 
         # Temporary tw / all_locs for demand calculations below
         all_locs = all_locs_orig
@@ -1857,20 +2109,26 @@ def optimize():
               f"source={matrix_source}")
 
         # Phase 2: run optimiser → VRPState
+        adv_kwargs = dict(
+            overlap_threshold_km=overlap_threshold_km,
+            overlap_weight_rsd=overlap_weight_rsd,
+            dist_rsd_per_km=dist_rsd_per_km,
+            tw_penalty_rsd=tw_penalty_rsd,
+        )
         if "Nearest Neighbor" in algorithm:
             state = optimize_nn(dist_mat, time_mat, n_depots, n_cust, tw, demands,
                                 use_tw=use_tw, svc_map=svc_map, demands_kg=demands_kg,
                                 obj_weights=obj_weights,
                                 use_volume_cap=use_volume_cap, use_weight_cap=use_weight_cap,
                                 fuel_price_rsd_l=fuel_price_rsd_l, driver_wage_rsd_h=driver_wage_rsd_h,
-                                fuel_load_factor=fuel_load_factor)
+                                fuel_load_factor=fuel_load_factor, **adv_kwargs)
         elif "Model 2" in algorithm:
             state = optimize_2opt(dist_mat, time_mat, n_depots, n_cust, tw, demands,
                                   use_tw=use_tw, svc_map=svc_map, demands_kg=demands_kg,
                                   obj_weights=obj_weights,
                                   use_volume_cap=use_volume_cap, use_weight_cap=use_weight_cap,
                                   fuel_price_rsd_l=fuel_price_rsd_l, driver_wage_rsd_h=driver_wage_rsd_h,
-                                  fuel_load_factor=fuel_load_factor)
+                                  fuel_load_factor=fuel_load_factor, **adv_kwargs)
         else:
             # Model 1 (ALNS multi-vehicle) — also the default
             state = optimize_alns(dist_mat, time_mat, n_depots, n_cust, tw,
@@ -1879,7 +2137,8 @@ def optimize():
                                    obj_weights=obj_weights,
                                    use_volume_cap=use_volume_cap, use_weight_cap=use_weight_cap,
                                    fuel_price_rsd_l=fuel_price_rsd_l, driver_wage_rsd_h=driver_wage_rsd_h,
-                                   fuel_load_factor=fuel_load_factor)
+                                   fuel_load_factor=fuel_load_factor,
+                                   alns_cooling=alns_cooling, **adv_kwargs)
 
 
         total_dist = state.total_distance()
@@ -2020,6 +2279,18 @@ def optimize():
             "haversine": "straight-line estimates (all routers unavailable)",
         }.get(matrix_source, matrix_source)
 
+        # ── Persist each vehicle route to the personal-PC database ────────────
+        for vr in vehicle_routes:
+            _save_route_to_db_async({
+                "route_date":        str(date.today()),
+                "saved_by":          session.get("user", "unknown"),
+                "algorithm":         algorithm,
+                "matrix_source":     matrix_source,
+                "fuel_price_rsd_l":  fuel_price_rsd_l,
+                "driver_wage_rsd_h": driver_wage_rsd_h,
+                "vehicle_route":     vr,
+            })
+
         return jsonify({
             "ok":                  True,
             "matrix_source":       matrix_source,
@@ -2056,6 +2327,104 @@ def optimize():
         tb = traceback.format_exc()
         print(f"[optimize] EXCEPTION: {e}\n{tb}")
         return jsonify({"ok": False, "error": str(e)})
+
+
+# ─────────────────────── ROUTE HISTORY ──────────────────────────────────────
+
+@app.route("/api/routes", methods=["GET"])
+@login_required
+def list_routes():
+    """Return the 100 most recent saved routes (summary rows)."""
+    if not DATABASE_URL:
+        return jsonify({"ok": False, "error": "Database not configured", "routes": []})
+    try:
+        conn = _get_db_conn()
+        cur  = conn.cursor()
+        cur.execute("""
+            SELECT
+                route_id, route_date, saved_by, algorithm, matrix_source,
+                vehicle_type, depot_name,
+                total_distance_km, total_fuel_litres,
+                fuel_cost_rsd, wage_cost_rsd, total_cost_rsd,
+                working_hours, departure_time, return_time,
+                volume_used_m3, weight_used_kg, num_stops,
+                fuel_price_rsd_l, driver_wage_rsd_h,
+                created_at
+            FROM grps_routes
+            ORDER BY route_id DESC
+            LIMIT 100
+        """)
+        cols = [d[0] for d in cur.description]
+        rows = []
+        for row in cur.fetchall():
+            d = dict(zip(cols, row))
+            for k, v in d.items():
+                if hasattr(v, 'isoformat'):
+                    d[k] = v.isoformat()
+            rows.append(d)
+        conn.close()
+        return jsonify({"ok": True, "routes": rows})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e), "routes": []})
+
+
+@app.route("/api/routes/<int:route_id>", methods=["GET"])
+@login_required
+def get_route(route_id):
+    """Return full route detail including all stops."""
+    if not DATABASE_URL:
+        return jsonify({"ok": False, "error": "Database not configured"})
+    try:
+        conn = _get_db_conn()
+        cur  = conn.cursor()
+        cur.execute("SELECT * FROM grps_routes WHERE route_id = %s", (route_id,))
+        cols = [d[0] for d in cur.description]
+        row  = cur.fetchone()
+        if not row:
+            return jsonify({"ok": False, "error": "Route not found"}), 404
+        route = dict(zip(cols, row))
+        for k, v in route.items():
+            if hasattr(v, 'isoformat'):
+                route[k] = v.isoformat()
+
+        cur.execute("""
+            SELECT * FROM grps_route_stops
+            WHERE route_id = %s ORDER BY stop_sequence
+        """, (route_id,))
+        stop_cols = [d[0] for d in cur.description]
+        stops = []
+        for s in cur.fetchall():
+            sd = dict(zip(stop_cols, s))
+            for k, v in sd.items():
+                if hasattr(v, 'isoformat'):
+                    sd[k] = v.isoformat()
+            stops.append(sd)
+
+        conn.close()
+        route["stops"] = stops
+        return jsonify({"ok": True, "route": route})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/routes/<int:route_id>", methods=["DELETE"])
+@login_required
+def delete_route(route_id):
+    """Delete a saved route and its stops (cascade)."""
+    if not DATABASE_URL:
+        return jsonify({"ok": False, "error": "Database not configured"})
+    try:
+        conn = _get_db_conn()
+        cur  = conn.cursor()
+        cur.execute("DELETE FROM grps_routes WHERE route_id = %s RETURNING route_id", (route_id,))
+        deleted = cur.fetchone()
+        conn.commit()
+        conn.close()
+        if not deleted:
+            return jsonify({"ok": False, "error": "Route not found"}), 404
+        return jsonify({"ok": True, "deleted_id": route_id})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 # ─────────────────────── PDF REPORT ──────────────────────────────────────────

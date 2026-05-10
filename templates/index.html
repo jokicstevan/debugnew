@@ -415,6 +415,23 @@
       </button>
     </section>
 
+    <!-- Route History -->
+    <section class="panel collapsed" id="panel-history">
+      <div class="panel-title" onclick="togglePanel('panel-history'); if(!this.parentElement.classList.contains('collapsed')) loadRouteHistory()">
+        <span data-i18n="routeHistory">🗄️ Route History</span>
+      </div>
+      <div class="panel-body">
+        <div style="font-size:9px;color:var(--muted);margin-bottom:8px" data-i18n="routeHistoryHint">
+          Routes saved automatically after each optimization run.
+        </div>
+        <button class="btn-sm btn-secondary btn-full" onclick="loadRouteHistory()" style="margin-bottom:8px">
+          <span data-i18n="refreshHistory">🔄 Refresh</span>
+        </button>
+        <div id="history-status" style="font-size:10px;color:var(--muted);text-align:center;padding:4px 0;display:none"></div>
+        <div id="history-list" style="max-height:320px;overflow-y:auto;display:flex;flex-direction:column;gap:4px"></div>
+      </div>
+    </section>
+
   </aside>
 </div>
 
@@ -490,6 +507,23 @@
     <div class="modal-footer">
       <button class="btn-secondary" onclick="closeExcelModal()" data-i18n="cancel">Cancel</button>
       <button class="btn-primary" onclick="confirmExcelImport()" data-i18n="importAll">Import All</button>
+    </div>
+  </div>
+</div>
+
+<!-- Route History Detail Modal -->
+<div id="history-modal" class="modal-overlay hidden" onclick="if(event.target===this)closeHistoryModal()">
+  <div class="modal-box modal-wide" style="max-width:680px">
+    <div class="modal-header">
+      <span id="history-modal-title" data-i18n="routeDetail">Route Detail</span>
+      <button class="modal-close" onclick="closeHistoryModal()">✕</button>
+    </div>
+    <div class="modal-body" id="history-modal-body" style="max-height:60vh;overflow-y:auto">
+      <div class="placeholder-msg" data-i18n="loading">Loading…</div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn-secondary" onclick="closeHistoryModal()" data-i18n="close">Close</button>
+      <button class="btn-danger" id="history-delete-btn" onclick="deleteHistoryRoute()" data-i18n="deleteRoute">🗑 Delete</button>
     </div>
   </div>
 </div>
