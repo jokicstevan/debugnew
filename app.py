@@ -2618,6 +2618,327 @@ def generate_pdf():
     return send_file(buf, mimetype="application/pdf",
                      as_attachment=True, download_name=fname)
 
+# ─────────────────────── ADMIN DB BROWSER ────────────────────────────────────
+
+ADMIN_USER = os.environ.get("APP_USER", "admin")
+
+def admin_required(f):
+    """Restricts a route to the admin user only."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if "user" not in session:
+            return redirect(url_for("login"))
+        if session["user"] != ADMIN_USER:
+            abort(403)
+        return f(*args, **kwargs)
+    return decorated
+
+
+@app.route("/admin/db")
+@admin_required
+def admin_db():
+    """Admin database browser — table overview + custom SELECT queries."""
+    if not DATABASE_URL:
+        return (
+            "<h2 style='font-family:monospace;color:#e74c3c'>"
+            "DATABASE_URL is not configured on this deployment.</h2>",
+            503,
+        )
+
+    TABLES = ["grps_routes", "grps_route_stops", "grps_workspaces"]
+
+    counts   = {}
+    previews = {}   # first 5 rows per table
+    headers  = {}
+
+    try:
+        conn = _get_db_conn()
+        cur  = conn.cursor()
+        for tbl in TABLES:
+            try:
+                cur.execute(f"SELECT COUNT(*) FROM {tbl}")
+                counts[tbl] = cur.fetchone()[0]
+                cur.execute(f"SELECT * FROM {tbl} ORDER BY 1 DESC LIMIT 5")
+                col_names = [d[0] for d in cur.description]
+                headers[tbl]  = col_names
+                previews[tbl] = cur.fetchall()
+            except Exception:
+                counts[tbl]   = "—"
+                headers[tbl]  = []
+                previews[tbl] = []
+        conn.close()
+    except Exception as e:
+        return (
+            f"<h2 style='font-family:monospace;color:#e74c3c'>DB connection failed: {e}</h2>",
+            500,
+        )
+
+    # Build the HTML page inline (no extra template file needed)
+    html = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GRPS — DB Admin</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Syne:wght@700;800&display=swap" rel="stylesheet">
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0d1117;--surface:#161b22;--border:#30363d;
+  --accent:#2ecc71;--accent2:#3498db;--text:#e6edf3;
+  --muted:#8b949e;--danger:#e74c3c;--warn:#f39c12;
+}
+body{font-family:'DM Mono',monospace;background:var(--bg);color:var(--text);min-height:100vh;padding:24px 20px}
+body::before{content:'';position:fixed;inset:0;
+  background-image:linear-gradient(rgba(46,204,113,.04) 1px,transparent 1px),
+                   linear-gradient(90deg,rgba(46,204,113,.04) 1px,transparent 1px);
+  background-size:40px 40px;pointer-events:none;z-index:0}
+.wrap{position:relative;z-index:1;max-width:1200px;margin:0 auto}
+
+/* Header */
+.topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:28px}
+.logo{font-family:'Syne',sans-serif;font-size:26px;font-weight:800;color:var(--accent);letter-spacing:-1px}
+.logo span{color:var(--muted);font-size:13px;font-weight:400;margin-left:10px;font-family:'DM Mono',monospace}
+.nav-links a{color:var(--muted);text-decoration:none;font-size:12px;margin-left:16px;
+             border:1px solid var(--border);border-radius:5px;padding:5px 12px;transition:all .15s}
+.nav-links a:hover{color:var(--text);border-color:var(--text)}
+.badge{display:inline-block;background:var(--danger);color:#fff;font-size:10px;
+       padding:2px 8px;border-radius:99px;font-weight:700;margin-left:8px;vertical-align:middle}
+
+/* Stat cards */
+.cards{display:flex;gap:16px;flex-wrap:wrap;margin-bottom:28px}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:10px;
+      padding:18px 22px;flex:1;min-width:180px}
+.card-label{font-size:10px;color:var(--muted);letter-spacing:.15em;text-transform:uppercase;margin-bottom:6px}
+.card-value{font-family:'Syne',sans-serif;font-size:28px;font-weight:800;color:var(--accent)}
+.card-sub{font-size:11px;color:var(--muted);margin-top:4px}
+
+/* Section */
+h2{font-family:'Syne',sans-serif;font-size:16px;font-weight:700;margin-bottom:12px;color:var(--text)}
+.section{background:var(--surface);border:1px solid var(--border);border-radius:10px;
+         padding:20px;margin-bottom:24px;overflow:hidden}
+
+/* Table */
+.tbl-wrap{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th{background:#1c2430;color:var(--muted);font-weight:500;text-align:left;
+   padding:8px 12px;border-bottom:1px solid var(--border);white-space:nowrap}
+td{padding:7px 12px;border-bottom:1px solid #21262d;white-space:nowrap;
+   max-width:260px;overflow:hidden;text-overflow:ellipsis}
+tr:last-child td{border-bottom:none}
+tr:hover td{background:rgba(255,255,255,.03)}
+.null{color:var(--muted);font-style:italic}
+.num{color:var(--accent2)}
+
+/* SQL box */
+.sql-box{display:flex;flex-direction:column;gap:12px}
+.sql-box textarea{
+  width:100%;background:var(--bg);border:1px solid var(--border);border-radius:7px;
+  color:var(--text);font-family:'DM Mono',monospace;font-size:13px;
+  padding:12px 14px;resize:vertical;min-height:90px;outline:none;
+  transition:border-color .2s}
+.sql-box textarea:focus{border-color:var(--accent2)}
+.sql-row{display:flex;gap:10px;align-items:center}
+.btn{font-family:'Syne',sans-serif;font-weight:700;font-size:13px;
+     padding:9px 22px;border-radius:7px;border:none;cursor:pointer;transition:opacity .2s,transform .1s}
+.btn:hover{opacity:.85}.btn:active{transform:scale(.97)}
+.btn-run{background:var(--accent);color:#0d1117}
+.btn-clear{background:var(--surface);color:var(--muted);border:1px solid var(--border)}
+.hint-sql{font-size:11px;color:var(--muted)}
+.warn-note{font-size:11px;color:var(--warn);margin-left:auto}
+
+/* Result */
+#result-area{margin-top:14px}
+.result-info{font-size:11px;color:var(--muted);margin-bottom:8px}
+.error-box{background:rgba(231,76,60,.1);border:1px solid rgba(231,76,60,.3);
+           border-radius:7px;color:var(--danger);font-size:12px;padding:12px 16px}
+.spinner{display:none;color:var(--muted);font-size:12px;margin-top:8px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="topbar">
+    <div class="logo">GRPS <span>/ DB Admin <span class="badge">admin only</span></span></div>
+    <div class="nav-links">
+      <a href="/">← Back to App</a>
+      <a href="/logout">Logout</a>
+    </div>
+  </div>
+
+  <!-- Stat cards -->
+  <div class="cards">
+"""
+
+    TABLE_LABELS = {
+        "grps_routes":      ("Routes saved", "One row per optimised vehicle route"),
+        "grps_route_stops": ("Stops saved",  "One row per delivery stop"),
+        "grps_workspaces":  ("Workspaces",   "Saved workspace configs"),
+    }
+    for tbl, cnt in counts.items():
+        label, sub = TABLE_LABELS.get(tbl, (tbl, ""))
+        html += f"""    <div class="card">
+      <div class="card-label">{label}</div>
+      <div class="card-value">{cnt}</div>
+      <div class="card-sub">{sub}</div>
+    </div>\n"""
+
+    html += "  </div>\n\n"
+
+    # Table previews
+    for tbl in TABLES:
+        html += f'  <div class="section">\n    <h2>{tbl} <span style="color:var(--muted);font-size:12px;font-weight:400">(latest 5 rows)</span></h2>\n'
+        if not headers.get(tbl):
+            html += '    <div class="hint-sql">Table not found or empty.</div>\n  </div>\n\n'
+            continue
+        html += '    <div class="tbl-wrap"><table><thead><tr>'
+        for col in headers[tbl]:
+            html += f"<th>{col}</th>"
+        html += "</tr></thead><tbody>"
+        for row in previews[tbl]:
+            html += "<tr>"
+            for cell in row:
+                if cell is None:
+                    html += '<td class="null">null</td>'
+                elif isinstance(cell, (int, float)):
+                    html += f'<td class="num">{cell}</td>'
+                else:
+                    val = str(cell)[:80]
+                    html += f"<td>{val}</td>"
+            html += "</tr>"
+        if not previews[tbl]:
+            html += f'<tr><td colspan="{len(headers[tbl])}" class="null">— no rows —</td></tr>'
+        html += "</tbody></table></div>\n  </div>\n\n"
+
+    # Custom SQL box
+    html += r"""
+  <div class="section">
+    <h2>Custom SQL Query</h2>
+    <div class="sql-box">
+      <textarea id="sql" placeholder="SELECT * FROM grps_routes ORDER BY created_at DESC LIMIT 20;"></textarea>
+      <div class="sql-row">
+        <button class="btn btn-run" onclick="runSql()">▶ Run</button>
+        <button class="btn btn-clear" onclick="clearSql()">Clear</button>
+        <span class="hint-sql">SELECT-only. Results capped at 200 rows.</span>
+        <span class="warn-note">⚠ Read-only — no INSERT / UPDATE / DELETE</span>
+      </div>
+      <div class="spinner" id="spinner">⏳ Running…</div>
+      <div id="result-area"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+async function runSql() {
+  const sql = document.getElementById('sql').value.trim();
+  if (!sql) return;
+  document.getElementById('spinner').style.display = 'block';
+  document.getElementById('result-area').innerHTML = '';
+  try {
+    const r = await fetch('/admin/db/query', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({sql})
+    });
+    const d = await r.json();
+    document.getElementById('spinner').style.display = 'none';
+    if (d.error) {
+      document.getElementById('result-area').innerHTML =
+        `<div class="error-box">⚠ ${d.error}</div>`;
+      return;
+    }
+    let html = `<div class="result-info">${d.rowcount} row(s) returned in ${d.elapsed_ms} ms</div>`;
+    if (d.columns && d.rows.length > 0) {
+      html += '<div class="tbl-wrap"><table><thead><tr>';
+      d.columns.forEach(c => { html += `<th>${c}</th>`; });
+      html += '</tr></thead><tbody>';
+      d.rows.forEach(row => {
+        html += '<tr>';
+        row.forEach(cell => {
+          if (cell === null)      html += '<td class="null">null</td>';
+          else if (typeof cell === 'number') html += `<td class="num">${cell}</td>`;
+          else html += `<td>${String(cell).substring(0,120)}</td>`;
+        });
+        html += '</tr>';
+      });
+      html += '</tbody></table></div>';
+    } else if (d.rows.length === 0) {
+      html += '<div class="hint-sql">Query returned no rows.</div>';
+    }
+    document.getElementById('result-area').innerHTML = html;
+  } catch(e) {
+    document.getElementById('spinner').style.display = 'none';
+    document.getElementById('result-area').innerHTML =
+      `<div class="error-box">Network error: ${e}</div>`;
+  }
+}
+function clearSql() {
+  document.getElementById('sql').value = '';
+  document.getElementById('result-area').innerHTML = '';
+}
+document.getElementById('sql').addEventListener('keydown', e => {
+  if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') runSql();
+});
+</script>
+</body>
+</html>"""
+
+    return html
+
+
+@app.route("/admin/db/query", methods=["POST"])
+@admin_required
+def admin_db_query():
+    """Execute a read-only SQL query and return JSON results."""
+    import time as _t
+
+    if not DATABASE_URL:
+        return jsonify({"error": "DATABASE_URL not configured"}), 503
+
+    body = request.get_json(force=True, silent=True) or {}
+    sql  = (body.get("sql") or "").strip()
+
+    if not sql:
+        return jsonify({"error": "Empty query"}), 400
+
+    # Enforce read-only: block any statement that isn't SELECT (or WITH…SELECT)
+    first_token = sql.lstrip().split()[0].upper()
+    if first_token not in ("SELECT", "WITH", "EXPLAIN"):
+        return jsonify({"error": "Only SELECT / WITH / EXPLAIN queries are allowed."}), 403
+
+    # Hard cap
+    if "limit" not in sql.lower():
+        sql = f"SELECT * FROM ({sql}) _q LIMIT 200"
+
+    t0 = _t.time()
+    try:
+        conn = _get_db_conn()
+        cur  = conn.cursor()
+        cur.execute(sql)
+        cols = [d[0] for d in cur.description] if cur.description else []
+        rows = cur.fetchmany(200)
+        conn.close()
+        elapsed = round((_t.time() - t0) * 1000)
+
+        # Serialise — psycopg2 returns Python types, most are JSON-safe
+        safe_rows = []
+        for row in rows:
+            safe_rows.append([
+                str(cell) if not isinstance(cell, (int, float, bool, type(None))) else cell
+                for cell in row
+            ])
+
+        return jsonify({
+            "columns":    cols,
+            "rows":       safe_rows,
+            "rowcount":   len(safe_rows),
+            "elapsed_ms": elapsed,
+        })
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 # ─────────────────────── RUN ──────────────────────────────────────────────────
 
 if __name__ == "__main__":
