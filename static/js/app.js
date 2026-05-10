@@ -2060,8 +2060,8 @@ function _applyWorkspaceSnapshot(ws) {
   // Re-render everything
   clearRoutes();
   redrawAllMarkers();
-  renderLocations();
-  renderFleet();
+  renderLocationsList();
+  renderFleetCards();
   updatePkgSizes();
   updatePkgWeights();
   updateCostHint();
