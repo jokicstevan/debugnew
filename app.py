@@ -7,10 +7,11 @@ import os, copy, math, json, io, tempfile, threading, time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 import numpy as np
+import psycopg
 from collections import defaultdict
 from datetime import datetime, date, timedelta
 from functools import wraps
-import psycopg
+
 from flask import (Flask, render_template, request, jsonify,
                    session, redirect, url_for, send_file, abort)
 from werkzeug.utils import secure_filename
@@ -48,7 +49,6 @@ _db_ready = False   # set to True after schema is confirmed
 
 def _get_db_conn():
     """Return a new psycopg3 connection, or raise if DATABASE_URL not set."""
-    
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL not configured")
     return psycopg.connect(DATABASE_URL, connect_timeout=5)
@@ -484,45 +484,67 @@ def get_historical_time_mat(locations, departure_min, pairs):
 
     n = len(locations)
     hist_mat = [[0.0] * n for _ in range(n)]
-    hit = miss = 0
 
     # Snap the departure time to the nearest 15-min slot
-    base_slot  = (int(departure_min) // _TRAFFIC_SLOT_MINUTES) * _TRAFFIC_SLOT_MINUTES
+    base_slot   = (int(departure_min) // _TRAFFIC_SLOT_MINUTES) * _TRAFFIC_SLOT_MINUTES
     # Also include one slot each side (±15 min) for a ±30 min window
-    slot_window = {
+    slot_window = [
         base_slot,
         (base_slot - _TRAFFIC_SLOT_MINUTES) % (24 * 60),
         (base_slot + _TRAFFIC_SLOT_MINUTES) % (24 * 60),
-    }
+    ]
 
+    # Build parallel arrays for a single unnest() batch query — one row per pair.
+    pair_list = list(pairs)
+    if not pair_list:
+        return hist_mat, 0.0
+
+    olats = [_round_coord(locations[i]["lat"]) for i, j in pair_list]
+    olngs = [_round_coord(locations[i]["lng"]) for i, j in pair_list]
+    dlats = [_round_coord(locations[j]["lat"]) for i, j in pair_list]
+    dlngs = [_round_coord(locations[j]["lng"]) for i, j in pair_list]
+    ii    = [i for i, j in pair_list]
+    jj    = [j for i, j in pair_list]
+
+    hit = miss = 0
     try:
         conn = _get_db_conn()
         cur  = conn.cursor()
-        for (i, j) in pairs:
-            olat = _round_coord(locations[i]["lat"])
-            olng = _round_coord(locations[i]["lng"])
-            dlat = _round_coord(locations[j]["lat"])
-            dlng = _round_coord(locations[j]["lng"])
-            cur.execute("""
-                SELECT AVG(travel_time_min)
-                FROM grps_traffic_cache
-                WHERE orig_lat=%s AND orig_lng=%s
-                  AND dest_lat=%s AND dest_lng=%s
-                  AND slot_minutes = ANY(%s)
-            """, (olat, olng, dlat, dlng, list(slot_window)))
-            row = cur.fetchone()
-            if row and row[0] is not None:
-                hist_mat[i][j] = float(row[0])
+        # Single round-trip: join all pairs at once via unnest arrays
+        cur.execute("""
+            SELECT p.i, p.j, AVG(c.travel_time_min)
+            FROM (
+                SELECT
+                    unnest(%s::float8[]) AS olat,
+                    unnest(%s::float8[]) AS olng,
+                    unnest(%s::float8[]) AS dlat,
+                    unnest(%s::float8[]) AS dlng,
+                    unnest(%s::int[])    AS i,
+                    unnest(%s::int[])    AS j
+            ) p
+            JOIN grps_traffic_cache c
+              ON  c.orig_lat     = p.olat
+              AND c.orig_lng     = p.olng
+              AND c.dest_lat     = p.dlat
+              AND c.dest_lng     = p.dlng
+              AND c.slot_minutes = ANY(%s)
+            GROUP BY p.i, p.j
+        """, (olats, olngs, dlats, dlngs, ii, jj, slot_window))
+
+        for row in cur.fetchall():
+            ri, rj, avg_t = row
+            if avg_t is not None:
+                hist_mat[ri][rj] = float(avg_t)
                 hit += 1
-            else:
-                miss += 1
+
+        miss = len(pair_list) - hit
         conn.close()
     except Exception as exc:
         print(f"[traffic cache] read failed: {exc}")
         return None, 0.0
 
-    total     = hit + miss
-    coverage  = hit / total if total > 0 else 0.0
+    total    = hit + miss
+    coverage = hit / total if total > 0 else 0.0
     print(f"[traffic cache] historical lookup: {hit}/{total} pairs covered "
           f"(slot window {sorted(slot_window)})")
     return hist_mat, coverage
