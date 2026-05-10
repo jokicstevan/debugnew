@@ -2081,23 +2081,68 @@ function _applyWorkspaceSnapshot(ws) {
 
 function redrawAllMarkers() {
   // Clear existing markers and re-add from state
-  Object.values(state.markers || {}).forEach(m => map.removeLayer(m));
+  Object.values(state.markers || {}).forEach(m => safeRemove(m));
   state.markers = {};
-  state.depots.forEach(dep => {
-    const m = L.marker([dep.lat, dep.lng], { icon: makeIcon(DEPOT_COLOR, true) })
+
+  state.depots.forEach((dep, i) => {
+    const icon = L.divIcon({
+      className: '',
+      html: `<div style="
+        width:24px;height:24px;border-radius:50%;
+        background:${DEPOT_COLOR};border:3px solid #fff;
+        box-shadow:0 2px 6px rgba(0,0,0,.5);
+        display:flex;align-items:center;justify-content:center;
+        font-size:12px;line-height:1;color:#fff;font-weight:700;">${i + 1}</div>`,
+      iconSize:[24,24], iconAnchor:[12,12], popupAnchor:[0,-14]
+    });
+    const m = L.marker([dep.lat, dep.lng], { icon, draggable: true })
       .addTo(map)
-      .bindPopup(`<b>${dep.name}</b><br>Depot`);
+      .bindPopup(`<b>${dep.name}</b><br>${dep.lat.toFixed(5)}, ${dep.lng.toFixed(5)}`);
+    m.on('dragend', e => {
+      const p = e.target.getLatLng();
+      dep.lat = p.lat; dep.lng = p.lng;
+      m.getPopup().setContent(`<b>${dep.name}</b><br>${p.lat.toFixed(5)}, ${p.lng.toFixed(5)}`);
+    });
+    m.on('contextmenu', () => removeDepot(dep.id));
     state.markers[dep.id] = m;
   });
-  state.customers.forEach(c => {
-    const m = L.marker([c.lat, c.lng], { icon: makeIcon('#3b82f6', false) })
+
+  state.customers.forEach((c, i) => {
+    const num = i + 1;
+    const pkg = c.pkg_counts || [0, 0, 0];
+    const vol = calcVolume(pkg);
+    const unload = c.unloading_time || 10;
+    const tw = c.time_window || { start: '09:00', end: '17:00' };
+    const icon = L.divIcon({
+      className: '',
+      html: `<div style="
+        width:26px;height:26px;border-radius:50%;
+        background:#3498db;border:3px solid #fff;
+        box-shadow:0 2px 6px rgba(0,0,0,.45);
+        color:#fff;font-size:11px;font-weight:700;
+        display:flex;align-items:center;justify-content:center;
+        line-height:1;">${num}</div>`,
+      iconSize:[26,26], iconAnchor:[13,13], popupAnchor:[0,-16]
+    });
+    const m = L.marker([c.lat, c.lng], { icon, draggable: true })
       .addTo(map)
-      .bindPopup(`<b>${c.name}</b>`);
+      .bindPopup(
+        `<b>${esc(c.name)}</b><br>` +
+        `📦 P1:${pkg[0]} P2:${pkg[1]} P3:${pkg[2]}<br>` +
+        `📐 ${vol.toFixed(2)} m³ · ⚖️ ${calcWeight(pkg).toFixed(1)} kg<br>` +
+        `⏱ ${tw.start}–${tw.end}<br>` +
+        `🔧 ${t('unloadPopup')(unload)}`
+      );
+    m.on('dragend', e => {
+      const p = e.target.getLatLng();
+      c.lat = p.lat; c.lng = p.lng;
+    });
+    m.on('contextmenu', () => removeCustomer(c.id));
     state.markers[c.id] = m;
   });
+
   if (state.depots.length > 0) {
-    const d = state.depots[0];
-    map.setView([d.lat, d.lng], 12);
+    map.setView([state.depots[0].lat, state.depots[0].lng], 12);
   }
 }
 
