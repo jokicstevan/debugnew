@@ -10,7 +10,7 @@ import numpy as np
 from collections import defaultdict
 from datetime import datetime, date, timedelta
 from functools import wraps
-
+import psycopg
 from flask import (Flask, render_template, request, jsonify,
                    session, redirect, url_for, send_file, abort)
 from werkzeug.utils import secure_filename
@@ -48,7 +48,7 @@ _db_ready = False   # set to True after schema is confirmed
 
 def _get_db_conn():
     """Return a new psycopg3 connection, or raise if DATABASE_URL not set."""
-    import psycopg
+    
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL not configured")
     return psycopg.connect(DATABASE_URL, connect_timeout=5)
