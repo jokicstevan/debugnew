@@ -1978,3 +1978,306 @@ async function deleteHistoryRoute() {
     alert(t('historyDeleteError') + e.message);
   }
 }
+
+// ─── WORKSPACE MANAGEMENT ────────────────────────────────────────────────────
+
+let _workspacePendingId = null;   // id of workspace selected for load/delete
+
+function _getWorkspaceSnapshot() {
+  // Collect all current UI state into a saveable object
+  return {
+    depots:    state.depots,
+    customers: state.customers,
+    fleet:     state.fleet,
+    settings: {
+      pkg_sizes:            state.pkg_sizes,
+      pkg_weights_kg:       state.pkg_weights_kg,
+      algorithm:            document.getElementById('algo-select')?.value || 'Model 1',
+      max_iterations:       parseInt(document.getElementById('max-iter')?.value) || 500,
+      temperature:          parseFloat(document.getElementById('temperature')?.value) || 150,
+      use_time_windows:     document.getElementById('use-tw')?.checked || false,
+      use_volume_capacity:  document.getElementById('use-vol-cap')?.checked ?? true,
+      use_weight_capacity:  document.getElementById('use-wt-cap')?.checked ?? true,
+      obj_weights:          getObjWeights(),
+      ...getCostParams(),
+      advanced_params:      getAdvancedParams(),
+    },
+    result: state.lastResult || null,
+  };
+}
+
+function _applyWorkspaceSnapshot(ws) {
+  // Restore depots
+  state.depots = ws.depots || [];
+  state.customers = ws.customers || [];
+  state.fleet = ws.fleet || state.fleet;
+
+  // Restore settings
+  const s = ws.settings || {};
+  if (s.pkg_sizes)      state.pkg_sizes      = s.pkg_sizes;
+  if (s.pkg_weights_kg) state.pkg_weights_kg = s.pkg_weights_kg;
+
+  // UI inputs
+  if (s.algorithm)        document.getElementById('algo-select').value          = s.algorithm;
+  if (s.max_iterations)   document.getElementById('max-iter').value             = s.max_iterations;
+  if (s.temperature)      document.getElementById('temperature').value          = s.temperature;
+  if (s.use_time_windows !== undefined) document.getElementById('use-tw').checked          = s.use_time_windows;
+  if (s.use_volume_capacity !== undefined) document.getElementById('use-vol-cap').checked  = s.use_volume_capacity;
+  if (s.use_weight_capacity !== undefined) document.getElementById('use-wt-cap').checked   = s.use_weight_capacity;
+  if (s.fuel_price_rsd_l)    document.getElementById('fuel-price-rsd').value   = s.fuel_price_rsd_l;
+  if (s.driver_wage_rsd_h)   document.getElementById('driver-wage-rsd').value  = s.driver_wage_rsd_h;
+  if (s.fuel_load_factor_pct !== undefined) document.getElementById('fuel-load-factor').value = s.fuel_load_factor_pct;
+  if (s.obj_weights) {
+    document.getElementById('obj-fuel').checked     = !!s.obj_weights.fuel;
+    document.getElementById('obj-wages').checked    = !!s.obj_weights.wages;
+    document.getElementById('obj-distance').checked = !!s.obj_weights.distance;
+    document.getElementById('obj-vehicles').checked = !!s.obj_weights.vehicles;
+  }
+  if (s.advanced_params) {
+    const a = s.advanced_params;
+    if (a.k_nearest !== undefined)            document.getElementById('adv-k-nearest').value          = a.k_nearest;
+    if (a.sentinel_factor !== undefined)      document.getElementById('adv-sentinel-factor').value    = a.sentinel_factor;
+    if (a.overlap_threshold_km !== undefined) document.getElementById('adv-overlap-threshold').value  = a.overlap_threshold_km;
+    if (a.overlap_weight_rsd !== undefined)   document.getElementById('adv-overlap-weight').value     = a.overlap_weight_rsd;
+    if (a.dist_rsd_per_km !== undefined)      document.getElementById('adv-dist-rsd-per-km').value    = a.dist_rsd_per_km;
+    if (a.tw_penalty_rsd !== undefined)       document.getElementById('adv-tw-penalty-rsd').value     = a.tw_penalty_rsd;
+    if (a.alns_cooling !== undefined)         document.getElementById('adv-alns-cooling').value       = a.alns_cooling;
+  }
+  if (s.pkg_sizes) {
+    document.getElementById('pkg-size-1').value = s.pkg_sizes[0] || 0.10;
+    document.getElementById('pkg-size-2').value = s.pkg_sizes[1] || 0.30;
+    document.getElementById('pkg-size-3').value = s.pkg_sizes[2] || 0.60;
+  }
+  if (s.pkg_weights_kg) {
+    document.getElementById('pkg-weight-1').value = s.pkg_weights_kg[0] || 5;
+    document.getElementById('pkg-weight-2').value = s.pkg_weights_kg[1] || 15;
+    document.getElementById('pkg-weight-3').value = s.pkg_weights_kg[2] || 30;
+  }
+
+  // Restore result
+  state.lastResult = ws.result || null;
+
+  // Re-render everything
+  clearRoutes();
+  redrawAllMarkers();
+  renderLocations();
+  renderFleet();
+  updatePkgSizes();
+  updatePkgWeights();
+  updateCostHint();
+  updateObjHint();
+  updateConstraintHint();
+
+  if (state.lastResult) {
+    drawResults(state.lastResult);
+    drawRoutes(state.lastResult);
+    renderLegend(state.lastResult);
+    document.getElementById('simulate-btn').disabled = false;
+    document.getElementById('pdf-btn').disabled = false;
+  } else {
+    resetResults();
+  }
+}
+
+function redrawAllMarkers() {
+  // Clear existing markers and re-add from state
+  Object.values(state.markers || {}).forEach(m => map.removeLayer(m));
+  state.markers = {};
+  state.depots.forEach(dep => {
+    const m = L.marker([dep.lat, dep.lng], { icon: makeIcon(DEPOT_COLOR, true) })
+      .addTo(map)
+      .bindPopup(`<b>${dep.name}</b><br>Depot`);
+    state.markers[dep.id] = m;
+  });
+  state.customers.forEach(c => {
+    const m = L.marker([c.lat, c.lng], { icon: makeIcon('#3b82f6', false) })
+      .addTo(map)
+      .bindPopup(`<b>${c.name}</b>`);
+    state.markers[c.id] = m;
+  });
+  if (state.depots.length > 0) {
+    const d = state.depots[0];
+    map.setView([d.lat, d.lng], 12);
+  }
+}
+
+// ── Save modal ────────────────────────────────────────────────────────────────
+
+let _overwriteWorkspaceId = null;
+
+function openSaveWorkspaceModal(overwriteId, overwriteName) {
+  _overwriteWorkspaceId = overwriteId || null;
+  const snap = _getWorkspaceSnapshot();
+  const nD = snap.depots.length;
+  const nC = snap.customers.length;
+  const nV = snap.fleet.reduce((s, v) => s + (v.count || 1), 0);
+  const hasResult = !!snap.result;
+  document.getElementById('workspace-save-summary').innerHTML =
+    `${nD} depot${nD!==1?'s':''}, ${nC} customer${nC!==1?'s':''}, ` +
+    `${nV} vehicle${nV!==1?'s':''}` +
+    (hasResult ? ' <span style="color:var(--accent)">+ optimization result ✓</span>' : ' <span style="color:var(--muted)">(no result yet)</span>');
+  document.getElementById('workspace-modal-title').textContent = overwriteId ? '✏️ Overwrite Workspace' : '💾 Save Workspace';
+  if (overwriteName) document.getElementById('workspace-name-input').value = overwriteName;
+  document.getElementById('workspace-save-error').style.display = 'none';
+  document.getElementById('workspace-save-modal').classList.remove('hidden');
+  setTimeout(() => document.getElementById('workspace-name-input').focus(), 50);
+}
+
+function closeWorkspaceSaveModal() {
+  document.getElementById('workspace-save-modal').classList.add('hidden');
+  document.getElementById('workspace-name-input').value = '';
+  document.getElementById('workspace-desc-input').value = '';
+  _overwriteWorkspaceId = null;
+}
+
+async function confirmSaveWorkspace() {
+  const name = document.getElementById('workspace-name-input').value.trim();
+  if (!name) {
+    document.getElementById('workspace-save-error').textContent = 'Please enter a workspace name.';
+    document.getElementById('workspace-save-error').style.display = 'block';
+    return;
+  }
+  const desc = document.getElementById('workspace-desc-input').value.trim();
+  const snap = _getWorkspaceSnapshot();
+  const btn  = document.getElementById('workspace-save-btn');
+  btn.disabled = true;
+  btn.textContent = '⏳ Saving…';
+
+  try {
+    const payload = { name, description: desc, ...snap };
+    if (_overwriteWorkspaceId) payload.id = _overwriteWorkspaceId;
+    const res  = await fetch('/api/workspaces', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json();
+    if (data.ok) {
+      closeWorkspaceSaveModal();
+      loadWorkspaceList();
+      // Briefly flash the panel open
+      const panel = document.getElementById('panel-workspaces');
+      if (panel && panel.classList.contains('collapsed')) {
+        panel.classList.remove('collapsed');
+      }
+    } else {
+      document.getElementById('workspace-save-error').textContent = data.error || 'Save failed.';
+      document.getElementById('workspace-save-error').style.display = 'block';
+    }
+  } catch (e) {
+    document.getElementById('workspace-save-error').textContent = 'Network error: ' + e.message;
+    document.getElementById('workspace-save-error').style.display = 'block';
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '💾 Save';
+  }
+}
+
+// ── List ──────────────────────────────────────────────────────────────────────
+
+async function loadWorkspaceList() {
+  const listEl   = document.getElementById('workspace-list');
+  const statusEl = document.getElementById('workspace-status');
+  if (!listEl) return;
+  statusEl.textContent = 'Loading…';
+  statusEl.style.display = 'block';
+  listEl.innerHTML = '';
+  try {
+    const res  = await fetch('/api/workspaces');
+    const data = await res.json();
+    statusEl.style.display = 'none';
+    if (!data.ok) {
+      listEl.innerHTML = `<div style="font-size:11px;color:#e74c3c;padding:6px">${data.error || 'Failed to load'}</div>`;
+      return;
+    }
+    if (!data.workspaces.length) {
+      listEl.innerHTML = '<div style="font-size:11px;color:var(--muted);text-align:center;padding:8px">No workspaces saved yet.</div>';
+      return;
+    }
+    listEl.innerHTML = data.workspaces.map(w => {
+      const dt = new Date(w.updated_at).toLocaleString([], { dateStyle:'short', timeStyle:'short' });
+      return `
+        <div class="history-card" onclick="openWorkspaceLoadModal(${w.id})"
+             style="cursor:pointer;padding:8px 10px;background:var(--bg3);border:1px solid var(--border2);border-radius:6px">
+          <div style="font-weight:600;font-size:12px;color:var(--fg);margin-bottom:2px">${w.name}</div>
+          ${w.description ? `<div style="font-size:10px;color:var(--muted);margin-bottom:3px">${w.description}</div>` : ''}
+          <div style="font-size:10px;color:var(--muted)">
+            ${w.n_depots} depot${w.n_depots!==1?'s':''} · ${w.n_customers} customer${w.n_customers!==1?'s':''}
+            · by <b>${w.updated_by}</b> · ${dt}
+          </div>
+        </div>`;
+    }).join('');
+  } catch (e) {
+    statusEl.style.display = 'none';
+    listEl.innerHTML = `<div style="font-size:11px;color:#e74c3c;padding:6px">Error: ${e.message}</div>`;
+  }
+}
+
+// ── Load / Delete modal ───────────────────────────────────────────────────────
+
+async function openWorkspaceLoadModal(id) {
+  _workspacePendingId = id;
+  document.getElementById('workspace-load-body').innerHTML = '<div style="color:var(--muted);font-size:12px">Loading…</div>';
+  document.getElementById('workspace-load-modal').classList.remove('hidden');
+  try {
+    const res  = await fetch(`/api/workspaces/${id}`);
+    const data = await res.json();
+    if (!data.ok) {
+      document.getElementById('workspace-load-body').innerHTML =
+        `<div style="color:#e74c3c;font-size:12px">${data.error}</div>`;
+      return;
+    }
+    document.getElementById('workspace-load-title').textContent = `📂 ${data.name}`;
+    const dt   = new Date(data.updated_at).toLocaleString([], { dateStyle:'medium', timeStyle:'short' });
+    const nV   = (data.fleet||[]).reduce((s,v) => s + (v.count||1), 0);
+    const s    = data.settings || {};
+    document.getElementById('workspace-load-body').innerHTML = `
+      <div style="font-size:12px;line-height:1.9;color:var(--fg)">
+        ${data.description ? `<div style="color:var(--muted);font-size:11px;margin-bottom:8px">${data.description}</div>` : ''}
+        <div>📍 <b>${(data.depots||[]).length}</b> depot(s)</div>
+        <div>🏠 <b>${(data.customers||[]).length}</b> customer(s)</div>
+        <div>🚛 <b>${nV}</b> vehicle(s) in fleet</div>
+        <div>⚙️ Algorithm: <b>${s.algorithm || '—'}</b></div>
+        <div>📊 Result: <b>${data.result ? '✅ included' : '—'}</b></div>
+        <div style="margin-top:6px;font-size:10px;color:var(--muted)">Last saved by <b>${data.updated_by}</b> on ${dt}</div>
+      </div>
+      <div style="margin-top:12px;padding:8px;background:rgba(231,76,60,.08);border:1px solid rgba(231,76,60,.2);border-radius:5px;font-size:11px;color:#e74c3c">
+        ⚠️ Loading will replace your current workspace.
+      </div>`;
+    // Store data for use in confirmLoadWorkspace
+    document.getElementById('workspace-load-btn')._wsData = data;
+  } catch (e) {
+    document.getElementById('workspace-load-body').innerHTML =
+      `<div style="color:#e74c3c;font-size:12px">Error: ${e.message}</div>`;
+  }
+}
+
+function closeWorkspaceLoadModal() {
+  document.getElementById('workspace-load-modal').classList.add('hidden');
+  _workspacePendingId = null;
+}
+
+function confirmLoadWorkspace() {
+  const data = document.getElementById('workspace-load-btn')._wsData;
+  if (!data) return;
+  closeWorkspaceLoadModal();
+  clearAll();
+  _applyWorkspaceSnapshot(data);
+}
+
+async function confirmDeleteWorkspace() {
+  if (!_workspacePendingId) return;
+  if (!confirm('Delete this workspace? This cannot be undone.')) return;
+  try {
+    const res  = await fetch(`/api/workspaces/${_workspacePendingId}`, { method: 'DELETE' });
+    const data = await res.json();
+    if (data.ok) {
+      closeWorkspaceLoadModal();
+      loadWorkspaceList();
+    } else {
+      alert('Delete failed: ' + (data.error || 'Unknown error'));
+    }
+  } catch (e) {
+    alert('Delete failed: ' + e.message);
+  }
+}

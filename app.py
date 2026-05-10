@@ -112,6 +112,26 @@ def _ensure_schema():
                 tw_end          VARCHAR(8)
             )
         """)
+        # ── Workspaces ────────────────────────────────────────────────────────
+        # Stores complete snapshots: inputs (depots, customers, fleet, settings)
+        # plus the optimization result.  Shared across all users.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS grps_workspaces (
+                workspace_id   SERIAL PRIMARY KEY,
+                name           VARCHAR(200) NOT NULL,
+                description    TEXT,
+                created_by     VARCHAR(50)  NOT NULL DEFAULT 'unknown',
+                updated_by     VARCHAR(50)  NOT NULL DEFAULT 'unknown',
+                created_at     TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+                updated_at     TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+                depots         JSONB        NOT NULL DEFAULT '[]',
+                customers      JSONB        NOT NULL DEFAULT '[]',
+                fleet          JSONB        NOT NULL DEFAULT '[]',
+                settings       JSONB        NOT NULL DEFAULT '{}',
+                result         JSONB
+            )
+        """)
+
         # ── Traffic history cache ─────────────────────────────────────────────
         # Stores HERE historical travel times per (origin, destination) pair
         # at 15-minute time-of-day slots.  One row = one API observation.
@@ -263,8 +283,9 @@ def _save_route_to_db_async(payload: dict):
 #   • No HERE key      → skip fetch, but still read whatever is cached.
 #   • Cache miss       → fall back to the live-traffic value for that pair.
 
-_TRAFFIC_FETCH_POOL_SIZE = 4   # parallel HERE calls during pre-fetch
-_TRAFFIC_HISTORY_DAYS    = 14  # how many days back to fetch
+_TRAFFIC_FETCH_POOL_SIZE = 2    # parallel HERE calls during pre-fetch (keep low to avoid rate limits)
+_TRAFFIC_HISTORY_DAYS    = 14  # how many days back to fetch in total
+_TRAFFIC_FETCH_DAYS_PER_RUN = 3  # fetch at most this many days per optimize call (spreads load)
 _TRAFFIC_SLOT_MINUTES    = 15  # resolution in minutes
 
 
@@ -374,12 +395,16 @@ def prefetch_traffic_history(locations, pairs):
             print(f"[traffic cache] pre-check failed: {exc}")
             already = set()
 
-        # Build the list of (pair, day_offset, slot) work items to fetch
+        # Build the list of (pair, day_offset, slot) work items to fetch.
+        # Cap to _TRAFFIC_FETCH_DAYS_PER_RUN days per run so a single optimize
+        # call never floods the HERE API. The cache fills up over successive runs.
         today_utc = datetime.utcnow().date()
         work = []
-        for (i, j) in pairs:
-            for day_offset in range(_TRAFFIC_HISTORY_DAYS):
-                day = today_utc - timedelta(days=day_offset + 1)   # yesterday back to -14 days
+        for day_offset in range(_TRAFFIC_HISTORY_DAYS):
+            if day_offset >= _TRAFFIC_FETCH_DAYS_PER_RUN:
+                break
+            day = today_utc - timedelta(days=day_offset + 1)
+            for (i, j) in pairs:
                 for slot in range(0, 24 * 60, _TRAFFIC_SLOT_MINUTES):
                     if (i, j, slot, str(day)) not in already:
                         work.append((i, j, day, slot))
@@ -399,10 +424,10 @@ def prefetch_traffic_history(locations, pairs):
             fi, fj, fday, fslot = item
             origin      = locations[fi]
             destination = locations[fj]
-            # Build a specific UTC datetime for the historical slot
             dep_dt  = datetime(fday.year, fday.month, fday.day,
                                fslot // 60, fslot % 60, 0)
             dep_iso = dep_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+            time.sleep(0.15)   # ~6 calls/sec per thread; 2 threads → ~12 calls/sec total
             tt, dk  = _fetch_here_for_slot(origin, destination, dep_iso)
             if tt is not None:
                 return (
@@ -3282,6 +3307,166 @@ def admin_db_query():
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+# ─────────────────────── WORKSPACE API ──────────────────────────────────────
+
+@app.route("/api/workspaces", methods=["GET"])
+@login_required
+def list_workspaces():
+    """Return all workspaces (id, name, description, created_by, updated_at) — no heavy JSONB."""
+    if not DATABASE_URL:
+        return jsonify({"ok": False, "error": "Database not configured"}), 503
+    try:
+        conn = _get_db_conn()
+        cur  = conn.cursor()
+        cur.execute("""
+            SELECT workspace_id, name, description, created_by, updated_by,
+                   created_at, updated_at,
+                   jsonb_array_length(customers) AS n_customers,
+                   jsonb_array_length(depots)    AS n_depots
+            FROM grps_workspaces
+            ORDER BY updated_at DESC
+        """)
+        rows = cur.fetchall()
+        conn.close()
+        workspaces = []
+        for r in rows:
+            workspaces.append({
+                "id":          r[0],
+                "name":        r[1],
+                "description": r[2] or "",
+                "created_by":  r[3],
+                "updated_by":  r[4],
+                "created_at":  str(r[5]),
+                "updated_at":  str(r[6]),
+                "n_customers": r[7] or 0,
+                "n_depots":    r[8] or 0,
+            })
+        return jsonify({"ok": True, "workspaces": workspaces})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/workspaces", methods=["POST"])
+@login_required
+def save_workspace():
+    """Create a new workspace or overwrite an existing one (pass id to overwrite)."""
+    if not DATABASE_URL:
+        return jsonify({"ok": False, "error": "Database not configured"}), 503
+    body = request.get_json(force=True, silent=True) or {}
+    name        = (body.get("name") or "").strip()
+    description = (body.get("description") or "").strip()
+    depots      = body.get("depots", [])
+    customers   = body.get("customers", [])
+    fleet       = body.get("fleet", [])
+    settings    = body.get("settings", {})
+    result      = body.get("result")       # may be None if not yet optimised
+    ws_id       = body.get("id")           # if set → overwrite
+    user        = session.get("user", "unknown")
+
+    if not name:
+        return jsonify({"ok": False, "error": "Workspace name is required"}), 400
+
+    try:
+        conn = _get_db_conn()
+        cur  = conn.cursor()
+        if ws_id:
+            # Overwrite existing
+            cur.execute("""
+                UPDATE grps_workspaces
+                SET name=%s, description=%s, updated_by=%s, updated_at=NOW(),
+                    depots=%s, customers=%s, fleet=%s, settings=%s, result=%s
+                WHERE workspace_id=%s
+                RETURNING workspace_id
+            """, (name, description, user,
+                  json.dumps(depots), json.dumps(customers),
+                  json.dumps(fleet),  json.dumps(settings),
+                  json.dumps(result) if result is not None else None,
+                  ws_id))
+            row = cur.fetchone()
+            if not row:
+                conn.close()
+                return jsonify({"ok": False, "error": "Workspace not found"}), 404
+            new_id = row[0]
+        else:
+            # Create new
+            cur.execute("""
+                INSERT INTO grps_workspaces
+                    (name, description, created_by, updated_by,
+                     depots, customers, fleet, settings, result)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING workspace_id
+            """, (name, description, user, user,
+                  json.dumps(depots), json.dumps(customers),
+                  json.dumps(fleet),  json.dumps(settings),
+                  json.dumps(result) if result is not None else None))
+            new_id = cur.fetchone()[0]
+        conn.commit()
+        conn.close()
+        return jsonify({"ok": True, "id": new_id})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/workspaces/<int:ws_id>", methods=["GET"])
+@login_required
+def load_workspace(ws_id):
+    """Return full workspace data including depots, customers, fleet, settings, result."""
+    if not DATABASE_URL:
+        return jsonify({"ok": False, "error": "Database not configured"}), 503
+    try:
+        conn = _get_db_conn()
+        cur  = conn.cursor()
+        cur.execute("""
+            SELECT workspace_id, name, description, created_by, updated_by,
+                   created_at, updated_at,
+                   depots, customers, fleet, settings, result
+            FROM grps_workspaces
+            WHERE workspace_id = %s
+        """, (ws_id,))
+        row = cur.fetchone()
+        conn.close()
+        if not row:
+            return jsonify({"ok": False, "error": "Workspace not found"}), 404
+        return jsonify({
+            "ok":          True,
+            "id":          row[0],
+            "name":        row[1],
+            "description": row[2] or "",
+            "created_by":  row[3],
+            "updated_by":  row[4],
+            "created_at":  str(row[5]),
+            "updated_at":  str(row[6]),
+            "depots":      row[7],
+            "customers":   row[8],
+            "fleet":       row[9],
+            "settings":    row[10],
+            "result":      row[11],
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/workspaces/<int:ws_id>", methods=["DELETE"])
+@login_required
+def delete_workspace(ws_id):
+    """Delete a workspace. Any user can delete (shared workspace model)."""
+    if not DATABASE_URL:
+        return jsonify({"ok": False, "error": "Database not configured"}), 503
+    try:
+        conn = _get_db_conn()
+        cur  = conn.cursor()
+        cur.execute("DELETE FROM grps_workspaces WHERE workspace_id=%s RETURNING workspace_id",
+                    (ws_id,))
+        row = cur.fetchone()
+        conn.commit()
+        conn.close()
+        if not row:
+            return jsonify({"ok": False, "error": "Workspace not found"}), 404
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 # ─────────────────────── RUN ──────────────────────────────────────────────────
