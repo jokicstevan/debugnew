@@ -3,7 +3,7 @@ services:
     name: grps-routing
     runtime: python
     pythonVersion: "3.12"          # Pin to 3.12 — psycopg2-binary not yet compatible with 3.14
-    buildCommand: pip install -r requirements.txt
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
     startCommand: gunicorn app:app --workers 2 --timeout 120 --bind 0.0.0.0:$PORT
     envVars:
       - key: SECRET_KEY

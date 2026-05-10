@@ -47,11 +47,11 @@ _db_ready = False   # set to True after schema is confirmed
 
 
 def _get_db_conn():
-    """Return a new psycopg2 connection, or raise if DATABASE_URL not set."""
-    import psycopg2
+    """Return a new psycopg3 connection, or raise if DATABASE_URL not set."""
+    import psycopg
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL not configured")
-    return psycopg2.connect(DATABASE_URL, connect_timeout=5)
+    return psycopg.connect(DATABASE_URL, connect_timeout=5)
 
 
 def _ensure_schema():
