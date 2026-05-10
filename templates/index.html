@@ -432,10 +432,76 @@
       </div>
     </section>
 
+    <!-- Workspaces -->
+    <section class="panel collapsed" id="panel-workspaces">
+      <div class="panel-title" onclick="togglePanel('panel-workspaces'); if(!this.parentElement.classList.contains('collapsed')) loadWorkspaceList()">
+        💾 Workspaces
+      </div>
+      <div class="panel-body">
+        <div style="font-size:9px;color:var(--muted);margin-bottom:8px">
+          Save the full setup (depots, customers, fleet, settings + results) and reload it later. Shared across all users.
+        </div>
+        <button class="btn-sm btn-primary btn-full" onclick="openSaveWorkspaceModal()" style="margin-bottom:6px">
+          💾 Save current workspace
+        </button>
+        <button class="btn-sm btn-secondary btn-full" onclick="loadWorkspaceList()" style="margin-bottom:8px">
+          🔄 Refresh list
+        </button>
+        <div id="workspace-status" style="font-size:10px;color:var(--muted);text-align:center;padding:4px 0;display:none"></div>
+        <div id="workspace-list" style="max-height:340px;overflow-y:auto;display:flex;flex-direction:column;gap:4px"></div>
+      </div>
+    </section>
+
   </aside>
 </div>
 
-<!-- Fleet card modal -->
+<!-- Save Workspace Modal -->
+<div id="workspace-save-modal" class="modal-overlay hidden" onclick="if(event.target===this)closeWorkspaceSaveModal()">
+  <div class="modal-box" style="max-width:420px">
+    <div class="modal-header">
+      <span id="workspace-modal-title">💾 Save Workspace</span>
+      <button class="modal-close" onclick="closeWorkspaceSaveModal()">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="field-row" style="flex-direction:column;align-items:flex-start;gap:4px">
+        <label style="font-size:11px;color:var(--muted)">Name <span style="color:#e74c3c">*</span></label>
+        <input type="text" id="workspace-name-input" placeholder="e.g. Belgrade Monday Route"
+               style="width:100%;background:var(--bg);border:1px solid var(--border2);border-radius:6px;color:var(--fg);font-family:var(--font-mono);font-size:13px;padding:8px 10px;outline:none">
+      </div>
+      <div class="field-row" style="flex-direction:column;align-items:flex-start;gap:4px;margin-top:10px">
+        <label style="font-size:11px;color:var(--muted)">Description (optional)</label>
+        <textarea id="workspace-desc-input" placeholder="Any notes about this workspace…"
+                  style="width:100%;background:var(--bg);border:1px solid var(--border2);border-radius:6px;color:var(--fg);font-family:var(--font-mono);font-size:12px;padding:8px 10px;outline:none;resize:vertical;min-height:60px"></textarea>
+      </div>
+      <div id="workspace-save-includes" style="font-size:10px;color:var(--muted);margin-top:10px;padding:6px 8px;background:var(--bg3);border-radius:5px;line-height:1.7">
+        Will save: <span id="workspace-save-summary">—</span>
+      </div>
+      <div id="workspace-save-error" style="display:none;font-size:11px;color:#e74c3c;margin-top:8px"></div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn-secondary" onclick="closeWorkspaceSaveModal()">Cancel</button>
+      <button class="btn-primary" id="workspace-save-btn" onclick="confirmSaveWorkspace()">💾 Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- Load Workspace Confirm Modal -->
+<div id="workspace-load-modal" class="modal-overlay hidden" onclick="if(event.target===this)closeWorkspaceLoadModal()">
+  <div class="modal-box" style="max-width:480px">
+    <div class="modal-header">
+      <span id="workspace-load-title">Load Workspace</span>
+      <button class="modal-close" onclick="closeWorkspaceLoadModal()">✕</button>
+    </div>
+    <div class="modal-body" id="workspace-load-body">
+      Loading…
+    </div>
+    <div class="modal-footer">
+      <button class="btn-secondary" onclick="closeWorkspaceLoadModal()">Cancel</button>
+      <button class="btn-danger" id="workspace-delete-btn" onclick="confirmDeleteWorkspace()" style="margin-right:auto">🗑 Delete</button>
+      <button class="btn-primary" id="workspace-load-btn" onclick="confirmLoadWorkspace()">📂 Load</button>
+    </div>
+  </div>
+</div>
 <div id="fleet-modal" class="modal-overlay hidden" onclick="if(event.target===this)closeFleetModal()">
   <div class="modal-box">
     <div class="modal-header">
