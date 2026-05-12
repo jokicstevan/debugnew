@@ -250,6 +250,13 @@
                  title="Simulated annealing cooling rate per iteration. Closer to 1 = slower cooling = more exploration.">
         </div>
 
+        <div style="border-top:1px solid var(--border2);margin:8px 0 4px;padding-top:6px;font-size:10px;color:var(--muted);letter-spacing:.05em;text-transform:uppercase" data-i18n="histBlendTitle">🕑 Historical Traffic Blending</div>
+        <div class="field-row">
+          <label data-i18n="histBlendWeightLabel">Blend weight (0 = live, 1 = historical)</label>
+          <input type="number" id="adv-hist-blend-weight" value="0.5" min="0" max="1" step="0.05"
+                 title="How much historical average traffic data is blended into the live travel times. 0 = use live/OSRM only; 1 = use historical cache only; 0.5 = equal blend. Requires a departure time and cached traffic data.">
+        </div>
+
         <div id="adv-hint" style="font-size:9px;color:var(--muted);padding:4px 6px;background:var(--bg3);border-radius:4px;margin-top:4px;font-style:italic" data-i18n="advancedParamsNote">
           Changes take effect on the next optimization run.
         </div>

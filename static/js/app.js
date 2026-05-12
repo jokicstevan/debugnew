@@ -173,6 +173,8 @@ const TRANSLATIONS = {
     distRsdPerKmLabel: 'Distance cost (RSD/km)',
     twPenaltyRsdLabel: 'TW violation penalty (RSD/min)',
     alnsCoolingLabel: 'ALNS cooling rate',
+    histBlendTitle: '🕑 Historical Traffic Blending',
+    histBlendWeightLabel: 'Blend weight (0 = live, 1 = historical)',
     routeHistory: '🗄️ Route History',
     routeHistoryHint: 'Routes saved automatically after each optimization run.',
     refreshHistory: '🔄 Refresh',
@@ -362,6 +364,8 @@ const TRANSLATIONS = {
     distRsdPerKmLabel: 'Trošak rastojanja (RSD/km)',
     twPenaltyRsdLabel: 'Kazna kršenja vremenskog okvira (RSD/min)',
     alnsCoolingLabel: 'ALNS stopa hlađenja',
+    histBlendTitle: '🕑 Mešanje istorijskih podataka o saobraćaju',
+    histBlendWeightLabel: 'Težina mešanja (0 = živo, 1 = istorijsko)',
     routeHistory: '🗄️ Istorija ruta',
     routeHistoryHint: 'Rute se čuvaju automatski nakon svake optimizacije.',
     refreshHistory: '🔄 Osveži',
@@ -982,6 +986,7 @@ function getAdvancedParams() {
     dist_rsd_per_km:      parseFloat(document.getElementById('adv-dist-rsd-per-km')?.value) ?? 20,
     tw_penalty_rsd:       parseFloat(document.getElementById('adv-tw-penalty-rsd')?.value)  ?? 100,
     alns_cooling:         parseFloat(document.getElementById('adv-alns-cooling')?.value)    ?? 0.995,
+    hist_blend_weight:    parseFloat(document.getElementById('adv-hist-blend-weight')?.value) ?? 0.5,
   };
 }
 
@@ -2042,6 +2047,7 @@ function _applyWorkspaceSnapshot(ws) {
     if (a.dist_rsd_per_km !== undefined)      document.getElementById('adv-dist-rsd-per-km').value    = a.dist_rsd_per_km;
     if (a.tw_penalty_rsd !== undefined)       document.getElementById('adv-tw-penalty-rsd').value     = a.tw_penalty_rsd;
     if (a.alns_cooling !== undefined)         document.getElementById('adv-alns-cooling').value       = a.alns_cooling;
+    if (a.hist_blend_weight !== undefined)    document.getElementById('adv-hist-blend-weight').value  = a.hist_blend_weight;
   }
   if (s.pkg_sizes) {
     document.getElementById('pkg-size-1').value = s.pkg_sizes[0] || 0.10;

@@ -1177,7 +1177,7 @@ def fetch_osrm_route(waypoints):
 
 
 def fetch_best_matrix(locations, k_nearest=None, sentinel_factor=None,
-                      departure_min=None):
+                      departure_min=None, hist_blend_weight=None):
     """Try HERE (live traffic) → OSRM → haversine. Returns (dist, time, source).
 
     Spatial pre-filtering: for N locations we compute the straight-line
@@ -1193,13 +1193,15 @@ def fetch_best_matrix(locations, k_nearest=None, sentinel_factor=None,
     departure) and the traffic cache contains data for this set of locations,
     the live/OSRM time matrix is blended with historical averages:
 
-        blended_time[i][j] = 0.5 * live[i][j] + 0.5 * hist[i][j]
+        blended_time[i][j] = (1-w) * live[i][j] + w * hist[i][j]
 
+    where w = hist_blend_weight (0 = live only, 1 = historical only).
     For pairs with no historical data the live value is kept unchanged.
-    The blend weight (0.5/0.5) is a conservative default; you can tune
-    _HIST_BLEND_WEIGHT below once you have enough data to evaluate accuracy.
+    The default blend weight (0.5) is a conservative starting point; tune
+    it via the Advanced Parameters panel once you have enough cached data.
     """
-    _HIST_BLEND_WEIGHT = 0.5   # weight given to historical average (0=live only, 1=hist only)
+    _DEFAULT_HIST_BLEND_WEIGHT = 0.5   # weight given to historical average (0=live only, 1=hist only)
+    blend_w = hist_blend_weight if hist_blend_weight is not None else _DEFAULT_HIST_BLEND_WEIGHT
 
     k  = k_nearest      if k_nearest      is not None else K_NEAREST
     sf = sentinel_factor if sentinel_factor is not None else SENTINEL_FACTOR
@@ -1209,11 +1211,11 @@ def fetch_best_matrix(locations, k_nearest=None, sentinel_factor=None,
     if HERE_API_KEY:
         d, t = fetch_here_matrix(locations, pairs=pairs, hav_km=hav_km, sentinel_factor=sf)
         if d is not None:
-            t = _blend_historical(t, locations, departure_min, pairs, _HIST_BLEND_WEIGHT)
+            t = _blend_historical(t, locations, departure_min, pairs, blend_w)
             return d, t, "here"
     d, t = fetch_osrm_matrix(locations, pairs=pairs, hav_km=hav_km, sentinel_factor=sf)
     if d is not None:
-        t = _blend_historical(t, locations, departure_min, pairs, _HIST_BLEND_WEIGHT)
+        t = _blend_historical(t, locations, departure_min, pairs, blend_w)
         return d, t, "osrm"
     d, t = build_haversine_matrix(locations)
     return d, t, "haversine"
@@ -2283,6 +2285,8 @@ def optimize():
         dist_rsd_per_km      = float(adv_params.get("dist_rsd_per_km",      20.0))
         tw_penalty_rsd       = float(adv_params.get("tw_penalty_rsd",       100.0))
         alns_cooling         = float(adv_params.get("alns_cooling",         0.995))
+        hist_blend_weight    = float(adv_params.get("hist_blend_weight",    0.5))
+        hist_blend_weight    = max(0.0, min(1.0, hist_blend_weight))  # clamp to [0, 1]
 
         if not depots_raw:
             return jsonify({"ok": False, "error": "No depot provided"})
@@ -2325,7 +2329,7 @@ def optimize():
         # Pass departure_min so the time matrix is blended with historical averages.
         dist_mat, time_mat, matrix_source = fetch_best_matrix(
             all_locs_orig, k_nearest=k_nearest, sentinel_factor=sentinel_factor,
-            departure_min=departure_min)
+            departure_min=departure_min, hist_blend_weight=hist_blend_weight)
 
         # Fire off background pre-fetch of historical traffic for this set of
         # locations so future optimisation runs have richer cache data.
