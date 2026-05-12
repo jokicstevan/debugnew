@@ -380,14 +380,13 @@ def prefetch_traffic_history(locations, pairs):
                 olng = _round_coord(locations[i]["lng"])
                 dlat = _round_coord(locations[j]["lat"])
                 dlng = _round_coord(locations[j]["lng"])
-                cur.execute("""
+                cur.execute(f"""
                     SELECT slot_minutes, DATE(fetched_at)
                     FROM grps_traffic_cache
                     WHERE orig_lat=%s AND orig_lng=%s
                       AND dest_lat=%s AND dest_lng=%s
-                      AND fetched_at >= NOW() - INTERVAL %s
-                """, (olat, olng, dlat, dlng,
-                      f"{_TRAFFIC_HISTORY_DAYS} days"))
+                      AND fetched_at >= NOW() - INTERVAL '{_TRAFFIC_HISTORY_DAYS} days'
+                """, (olat, olng, dlat, dlng))
                 for row in cur.fetchall():
                     already.add((i, j, int(row[0]), str(row[1])))
             conn.close()
