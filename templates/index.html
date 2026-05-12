@@ -228,9 +228,9 @@
                  title="Routes that interleave closer than this distance (km) are penalised. Increase for country-wide deliveries.">
         </div>
         <div class="field-row">
-          <label data-i18n="overlapWeightLabel">Overlap weight (RSD)</label>
+          <label data-i18n="overlapWeightLabel">Overlap penalty (RSD/shared km)</label>
           <input type="number" id="adv-overlap-weight" value="500" min="0" max="50000" step="50"
-                 title="RSD penalty per km-under-threshold (quadratic). Higher values push the solver to separate vehicle zones more aggressively.">
+                 title="RSD penalty per shared km of road between any two routes. The total penalty is proportional to the total overlapping distance — higher values push the solver to keep vehicle zones separate.">
         </div>
 
         <div style="border-top:1px solid var(--border2);margin:8px 0 4px;padding-top:6px;font-size:10px;color:var(--muted);letter-spacing:.05em;text-transform:uppercase" data-i18n="solverPenaltiesTitle">⚖️ Solver Penalties</div>

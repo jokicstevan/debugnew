@@ -806,7 +806,8 @@ def _here_departure_time():
 
 # ── HERE Routing (live traffic) ───────────────────────────────────────────────
 
-def fetch_here_matrix(locations, pairs=None, hav_km=None, sentinel_factor=None):
+def fetch_here_matrix(locations, pairs=None, hav_km=None, sentinel_factor=None,
+                      departure_min=None):
     """Build N×N matrix using HERE Router v8 /routes with live traffic.
     Avoids the async Matrix API (which requires OAuth2 for polling).
     Uses one API call per origin row — fast enough for ≤25 locations.
@@ -829,7 +830,14 @@ def fetch_here_matrix(locations, pairs=None, hav_km=None, sentinel_factor=None):
     n        = len(locations)
     dist_mat = [[0.0]*n for _ in range(n)]
     time_mat = [[0.0]*n for _ in range(n)]
-    dep_time = _here_departure_time()
+    if departure_min is not None:
+        today = datetime.utcnow().date()
+        dh, dm = divmod(int(departure_min), 60)
+        dep_time = datetime(today.year, today.month, today.day,
+                            dh % 24, dm % 60).strftime("%Y-%m-%dT%H:%M:%SZ")
+        print(f"[HERE matrix] using planned departure time {dep_time}")
+    else:
+        dep_time = _here_departure_time()
 
     # Pre-fill sentinel values for skipped pairs using haversine * factor
     if pairs is not None and hav_km is not None:
@@ -1208,7 +1216,8 @@ def fetch_best_matrix(locations, k_nearest=None, sentinel_factor=None,
     hav_km, pairs = build_api_pairs(locations, k=k)
 
     if HERE_API_KEY:
-        d, t = fetch_here_matrix(locations, pairs=pairs, hav_km=hav_km, sentinel_factor=sf)
+        d, t = fetch_here_matrix(locations, pairs=pairs, hav_km=hav_km,
+                                  sentinel_factor=sf, departure_min=departure_min)
         if d is not None:
             t = _blend_historical(t, locations, departure_min, pairs, blend_w)
             return d, t, "here"
@@ -1425,45 +1434,43 @@ def route_fuel_litres(route_mat_indices, depot_mat_idx, dist_mat,
 
 # ── Route-overlap penalty ─────────────────────────────────────────────────────
 #
-# Measures how much different vehicles' routes geographically interleave.
-# For every pair of active routes (A, B) we find the minimum straight-line
-# distance between any stop on A and any stop on B.  When that minimum is
-# smaller than OVERLAP_THRESHOLD_KM we apply a soft quadratic penalty.
-#
-# Effect: the solver is incentivised to assign geographically close stops to
-# the same vehicle rather than splitting them across vehicles — reducing
-# criss-crossing and improving driver familiarity with their zones.
+# Penalises routes that physically share road segments.  For every pair of
+# active routes (A, B) we compare every directed edge on A (consecutive stop
+# pair i→j) against every directed edge on B.  An edge is considered shared
+# when both endpoints appear on the other route in either direction (i→j or
+# j→i), i.e. the two vehicles traverse the same stretch of road.  The penalty
+# for each shared edge is its road distance (km) × overlap_weight_rsd, so the
+# total penalty is proportional to the total overlapping km — exactly the
+# user-set parameter acts as a "RSD cost per shared km" multiplier.
 #
 # Tuning:
-#   OVERLAP_THRESHOLD_KM — routes that interleave closer than this (straight-
-#                          line, km) are penalised.  Default 3 km works well
-#                          for city-scale Belgrade routing; increase for
-#                          country-wide deliveries.
-#   OVERLAP_WEIGHT_RSD   — multiplier that puts the penalty on the same RSD
-#                          cost scale as fuel/wages.  Default 500 RSD per
-#                          km-under-threshold matches roughly 25 km of extra
-#                          driving in terms of solver pressure.
+#   OVERLAP_THRESHOLD_KM — kept for the _overlap_remove destroy operator which
+#                          uses stop-proximity scoring to pick candidates.
+#   OVERLAP_WEIGHT_RSD   — RSD penalty per shared km of road between any two
+#                          routes.  Higher → solver pushes harder to separate
+#                          vehicle zones.  Default 500 RSD/km ≈ 25 km of extra
+#                          solo driving in solver-cost terms.
 
-OVERLAP_THRESHOLD_KM = 3.0    # km — penalise pairs closer than this
-OVERLAP_WEIGHT_RSD   = 500.0  # RSD per km-under-threshold (quadratic)
+OVERLAP_THRESHOLD_KM = 3.0    # km — used by _overlap_remove heuristic
+OVERLAP_WEIGHT_RSD   = 500.0  # RSD per shared km between any route pair
 
 
-def route_overlap_penalty(routes, dist_mat,
+def route_overlap_penalty(routes, dist_mat, depot_of,
                           threshold_km=None, weight_rsd=None):
-    """Compute the total geographic overlap penalty across all route pairs.
+    """Compute the total route-overlap penalty across all route pairs.
 
-    For each pair of non-empty routes (A, B) the penalty contribution is:
-        sum over (a in A, b in B): max(0, threshold_km - dist[a][b])²
-                                   * weight_rsd
+    For each pair of active routes (A, B) every directed edge (i→j) on route A
+    is compared to every directed edge on route B.  An edge is counted as
+    shared when both matrix indices appear as an edge on the other route (in
+    either direction).  The penalty contribution is:
 
-    Using the sum (not just the minimum) means a route with *many* stops near
-    another route's stops is penalised more than one with just a single
-    near-miss, which gives ALNS a gradient to work against.
+        shared_km(edge) × weight_rsd
+
+    summed over all shared edges across all route pairs.  Each shared edge is
+    counted once per route-pair regardless of how many times it appears.
 
     Returns a float in RSD-equivalent units.
     """
-    if threshold_km is None:
-        threshold_km = OVERLAP_THRESHOLD_KM
     if weight_rsd is None:
         weight_rsd = OVERLAP_WEIGHT_RSD
 
@@ -1471,16 +1478,31 @@ def route_overlap_penalty(routes, dist_mat,
     if len(active) < 2:
         return 0.0
 
+    def route_edges(v, route):
+        """Return a set of frozensets {i, j} for every consecutive pair,
+        including depot→first and last→depot legs."""
+        d = depot_of[v]
+        full = [d] + list(route) + [d]
+        edges = set()
+        for k in range(len(full) - 1):
+            edges.add(frozenset((full[k], full[k + 1])))
+        return full, edges
+
     penalty = 0.0
+    edge_cache = {v: route_edges(v, r) for v, r in active}
+
     for idx_a in range(len(active)):
         v_a, route_a = active[idx_a]
+        full_a, edges_a = edge_cache[v_a]
         for idx_b in range(idx_a + 1, len(active)):
             v_b, route_b = active[idx_b]
-            for a in route_a:
-                for b in route_b:
-                    gap = threshold_km - dist_mat[a][b]
-                    if gap > 0:
-                        penalty += gap * gap * weight_rsd
+            full_b, edges_b = edge_cache[v_b]
+            shared = edges_a & edges_b
+            for edge in shared:
+                i, j = tuple(edge)
+                # Use average of both directions as the edge distance estimate
+                shared_km = (dist_mat[i][j] + dist_mat[j][i]) / 2.0
+                penalty += shared_km * weight_rsd
     return penalty
 
 
@@ -1689,6 +1711,7 @@ class VRPState:
                 total += tw_viol * TW_PENALTY
         if do_overlap:
             total += route_overlap_penalty(self.routes, self.dist_mat,
+                                           self.depot_of,
                                            self.overlap_threshold_km,
                                            self.overlap_weight_rsd)
         return total
@@ -2467,6 +2490,15 @@ def optimize():
                 tw[d] = (6*60, 12*60)
         else:
             tw = [(6*60, 12*60)] * n_depots + [(540, 1020)] * n_cust
+
+        # If a planned departure time was set, pin the depot TW to that exact
+        # minute.  This enforces the departure time in the solver whether or not
+        # customer time windows are active: latest_feasible_departure will find
+        # only one feasible starting point — the planned one.
+        if departure_min is not None:
+            for d in range(n_depots):
+                tw[d] = (departure_min, departure_min)
+            print(f"[optimize] depot departure pinned to {mins_to_hhmm(departure_min)}")
 
         # svc_map for expanded sub-orders
         svc_map = {}
