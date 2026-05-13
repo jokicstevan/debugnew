@@ -1302,11 +1302,15 @@ def _mat_idx(cust_i, n_depots):
 
 
 def route_time(route_mat_indices, depot_mat_idx, dist_mat, time_mat, tw, svc,
-               start_time=None, svc_map=None):
+               start_time=None, svc_map=None, no_wait=False):
     """Walk route from depot, return (feasible, schedule).
     route_mat_indices : list of matrix indices of customers in visit order.
     start_time        : departure minute from depot; defaults to depot TW open time.
     svc_map           : dict {matrix_index: unloading_minutes}; falls back to svc scalar.
+    no_wait           : when True the driver never idles at a stop — they arrive and
+                        begin service immediately regardless of TW open time.  Used
+                        when a planned departure time is set so the route is a
+                        continuous drive with no pause between clusters.
     Returns (feasible: bool, schedule: list of dicts).
     """
     sched, feasible = [], True
@@ -1318,10 +1322,14 @@ def route_time(route_mat_indices, depot_mat_idx, dist_mat, time_mat, tw, svc,
         viol  = max(0.0, t - tw_e)
         if viol > 0:
             feasible = False
-        wait       = max(0.0, tw_s - t)
+        if no_wait:
+            wait = 0.0
+            # service starts immediately on arrival; TW open time is ignored
+        else:
+            wait = max(0.0, tw_s - t)
         arrival    = t
         stop_svc   = svc_map[c] if (svc_map and c in svc_map) else svc
-        t          = max(t, tw_s) + stop_svc
+        t          = (t if no_wait else max(t, tw_s)) + stop_svc
         sched.append({"customer_mat": c, "arrival": arrival,
                        "wait": wait, "violation": viol, "depart": t,
                        "service_time": stop_svc})
@@ -1330,7 +1338,8 @@ def route_time(route_mat_indices, depot_mat_idx, dist_mat, time_mat, tw, svc,
 
 # This is to prevent early start
 def latest_feasible_departure(route_mat_indices, depot_mat_idx,
-                               dist_mat, time_mat, tw, svc, svc_map=None):
+                               dist_mat, time_mat, tw, svc, svc_map=None,
+                               no_wait=False):
     """Find the latest departure minute from depot within depot hours that keeps
     all customer TW constraints feasible (5-minute precision binary search).
     Drivers depart as late as possible to minimise wage cost.
@@ -1340,7 +1349,7 @@ def latest_feasible_departure(route_mat_indices, depot_mat_idx,
     depot_open  = tw[depot_mat_idx][0]
     depot_close = tw[depot_mat_idx][1]
     ok, _ = route_time(route_mat_indices, depot_mat_idx, dist_mat, time_mat,
-                        tw, svc, depot_open, svc_map)
+                        tw, svc, depot_open, svc_map, no_wait=no_wait)
     if not ok:
         return depot_open
     best = depot_open
@@ -1348,7 +1357,7 @@ def latest_feasible_departure(route_mat_indices, depot_mat_idx,
     while hi - lo > 5:
         mid = (lo + hi) // 2
         ok, _ = route_time(route_mat_indices, depot_mat_idx, dist_mat, time_mat,
-                            tw, svc, mid, svc_map)
+                            tw, svc, mid, svc_map, no_wait=no_wait)
         if ok:
             best = mid
             lo   = mid
@@ -1358,12 +1367,13 @@ def latest_feasible_departure(route_mat_indices, depot_mat_idx,
 
 
 def route_working_minutes(route_mat_indices, depot_mat_idx,
-                           dist_mat, time_mat, tw, svc, start_time, svc_map=None):
+                           dist_mat, time_mat, tw, svc, start_time, svc_map=None,
+                           no_wait=False):
     """Total working minutes: departure -> last customer depart -> return depot."""
     if not route_mat_indices:
         return 0.0
     _, sched = route_time(route_mat_indices, depot_mat_idx, dist_mat, time_mat,
-                           tw, svc, start_time, svc_map)
+                           tw, svc, start_time, svc_map, no_wait=no_wait)
     last_depart = sched[-1]["depart"] if sched else start_time
     return_time = last_depart + time_mat[route_mat_indices[-1]][depot_mat_idx]
     return max(0.0, return_time - start_time)
@@ -1525,6 +1535,8 @@ class VRPState:
     depot_of[v]: depot matrix index (0..n_depots-1) for vehicle v
     use_tw     : when True, TW lateness is a soft penalty (100x) not hard-inf
     svc_map    : {matrix_index: unloading_minutes} per customer
+    no_wait    : when True drivers never idle at stops — used with a pinned
+                 departure time so the route is a continuous drive
     """
     def __init__(self, routes, depot_of, dist_mat, time_mat,
                  demands, fleet, tw, n_depots, svc=SERVICE_TIME,
@@ -1533,7 +1545,8 @@ class VRPState:
                  fuel_price_rsd_l=None, driver_wage_rsd_h=None,
                  fuel_load_factor=None,
                  overlap_threshold_km=None, overlap_weight_rsd=None,
-                 dist_rsd_per_km=None, tw_penalty_rsd=None):
+                 dist_rsd_per_km=None, tw_penalty_rsd=None,
+                 no_wait=False):
         self.routes     = routes
         self.depot_of   = depot_of
         self.dist_mat   = dist_mat
@@ -1545,6 +1558,7 @@ class VRPState:
         self.n_depots   = n_depots
         self.svc        = svc
         self.use_tw     = use_tw
+        self.no_wait    = no_wait
         self.svc_map    = svc_map or {}
         # obj_weights: dict controlling which cost components enter the objective.
         # Keys: "fuel" (bool), "wages" (bool), "distance" (bool), "vehicles" (bool)
@@ -1596,7 +1610,8 @@ class VRPState:
             self.fuel_price_rsd_l, self.driver_wage_rsd_h,
             self.fuel_load_factor,
             self.overlap_threshold_km, self.overlap_weight_rsd,
-            self.dist_rsd_per_km, self.tw_penalty_rsd)
+            self.dist_rsd_per_km, self.tw_penalty_rsd,
+            self.no_wait)
 
     def cap(self, v):
         return self.fleet[v]["capacity"] if v < len(self.fleet) else float("inf")
@@ -1681,9 +1696,10 @@ class VRPState:
             depot = self.depot_of[v]
             start = latest_feasible_departure(
                 route, depot, self.dist_mat, self.time_mat, self.tw, self.svc,
-                self.svc_map)
+                self.svc_map, no_wait=self.no_wait)
             _, sched = route_time(route, depot, self.dist_mat, self.time_mat,
-                                   self.tw, self.svc, start, self.svc_map)
+                                   self.tw, self.svc, start, self.svc_map,
+                                   no_wait=self.no_wait)
             tw_viol = sum(e["violation"] for e in sched)
             if not self.use_tw and tw_viol > 0:
                 return float("inf")
@@ -1701,7 +1717,7 @@ class VRPState:
             if do_wages:
                 work_mins = route_working_minutes(
                     route, depot, self.dist_mat, self.time_mat, self.tw, self.svc,
-                    start, self.svc_map)
+                    start, self.svc_map, no_wait=self.no_wait)
                 total += (work_mins / 60.0) * self.driver_wage_rsd_h
             if do_dist:
                 total += dist_km * DIST_RSD_PER_KM
@@ -1747,7 +1763,7 @@ def _ins_cost(route, pos, c, state, depot):
     """Insertion cost of customer c at position pos in route."""
     new_r = route[:pos] + [c] + route[pos:]
     ok, _ = route_time(new_r, depot, state.dist_mat, state.time_mat, state.tw, state.svc,
-                        svc_map=state.svc_map)
+                        svc_map=state.svc_map, no_wait=state.no_wait)
     # Only hard-reject on TW infeasibility when TW constraints are actually enforced.
     # When use_tw=False, a long route may still violate the default TW window used
     # internally, but that must not prevent consolidation onto a single vehicle.
@@ -1988,7 +2004,7 @@ def optimize_nn(dist_mat, time_mat, n_depots, n_cust, tw, demands,
                 use_volume_cap=True, use_weight_cap=True,
                 fuel_price_rsd_l=None, driver_wage_rsd_h=None, fuel_load_factor=None,
                 overlap_threshold_km=None, overlap_weight_rsd=None,
-                dist_rsd_per_km=None, tw_penalty_rsd=None):
+                dist_rsd_per_km=None, tw_penalty_rsd=None, no_wait=False):
     """Single-vehicle nearest-neighbour. Returns VRPState."""
     depot = 0
     unvis = list(range(n_depots, n_depots + n_cust))
@@ -2006,7 +2022,8 @@ def optimize_nn(dist_mat, time_mat, n_depots, n_cust, tw, demands,
                     overlap_threshold_km=overlap_threshold_km,
                     overlap_weight_rsd=overlap_weight_rsd,
                     dist_rsd_per_km=dist_rsd_per_km,
-                    tw_penalty_rsd=tw_penalty_rsd)
+                    tw_penalty_rsd=tw_penalty_rsd,
+                    no_wait=no_wait)
 
 
 def optimize_2opt(dist_mat, time_mat, n_depots, n_cust, tw, demands,
@@ -2014,7 +2031,7 @@ def optimize_2opt(dist_mat, time_mat, n_depots, n_cust, tw, demands,
                   use_volume_cap=True, use_weight_cap=True,
                   fuel_price_rsd_l=None, driver_wage_rsd_h=None, fuel_load_factor=None,
                   overlap_threshold_km=None, overlap_weight_rsd=None,
-                  dist_rsd_per_km=None, tw_penalty_rsd=None):
+                  dist_rsd_per_km=None, tw_penalty_rsd=None, no_wait=False):
     """Single-vehicle 2-opt. Returns VRPState."""
     s = optimize_nn(dist_mat, time_mat, n_depots, n_cust, tw, demands,
                     use_tw=use_tw, svc_map=svc_map, demands_kg=demands_kg,
@@ -2025,7 +2042,8 @@ def optimize_2opt(dist_mat, time_mat, n_depots, n_cust, tw, demands,
                     overlap_threshold_km=overlap_threshold_km,
                     overlap_weight_rsd=overlap_weight_rsd,
                     dist_rsd_per_km=dist_rsd_per_km,
-                    tw_penalty_rsd=tw_penalty_rsd)
+                    tw_penalty_rsd=tw_penalty_rsd,
+                    no_wait=no_wait)
     route = s.routes[0][:]
     depot = s.depot_of[0]
 
@@ -2054,7 +2072,8 @@ def _alns_optimize(fleet, dist_mat, time_mat, n_depots, n_cust, tw, demands,
                    fuel_price_rsd_l, driver_wage_rsd_h, fuel_load_factor,
                    temperature, max_iter, svc_map, use_tw,
                    overlap_threshold_km=None, overlap_weight_rsd=None,
-                   dist_rsd_per_km=None, tw_penalty_rsd=None, alns_cooling=None):
+                   dist_rsd_per_km=None, tw_penalty_rsd=None, alns_cooling=None,
+                   no_wait=False):
     """Run a single ALNS optimisation with the given fleet (list of vehicle dicts)."""
     num_v = len(fleet)
     all_ci = list(range(n_depots, n_depots + n_cust))
@@ -2155,7 +2174,8 @@ def _alns_optimize(fleet, dist_mat, time_mat, n_depots, n_cust, tw, demands,
                      overlap_threshold_km=overlap_threshold_km,
                      overlap_weight_rsd=overlap_weight_rsd,
                      dist_rsd_per_km=dist_rsd_per_km,
-                     tw_penalty_rsd=tw_penalty_rsd)
+                     tw_penalty_rsd=tw_penalty_rsd,
+                     no_wait=no_wait)
     state.reassign_depots()
 
     best = state.copy()
@@ -2201,7 +2221,8 @@ def optimize_alns(dist_mat, time_mat, n_depots, n_cust, tw, demands,
                   demands_kg=None, obj_weights=None, use_volume_cap=True, use_weight_cap=True,
                   fuel_price_rsd_l=None, driver_wage_rsd_h=None, fuel_load_factor=None,
                   overlap_threshold_km=None, overlap_weight_rsd=None,
-                  dist_rsd_per_km=None, tw_penalty_rsd=None, alns_cooling=None):
+                  dist_rsd_per_km=None, tw_penalty_rsd=None, alns_cooling=None,
+                  no_wait=False):
     """ALNS multi‑vehicle optimiser. When only vehicle minimisation is selected,
     it sorts the fleet by capacity so the largest vehicles are tried first,
     then incrementally adds vehicles until a feasible solution is found."""
@@ -2223,6 +2244,7 @@ def optimize_alns(dist_mat, time_mat, n_depots, n_cust, tw, demands,
         dist_rsd_per_km=dist_rsd_per_km,
         tw_penalty_rsd=tw_penalty_rsd,
         alns_cooling=alns_cooling,
+        no_wait=no_wait,
     )
 
     if only_vehicles:
@@ -2536,11 +2558,16 @@ def optimize():
               f"source={matrix_source}")
 
         # Phase 2: run optimiser → VRPState
+        # no_wait: suppress idle waiting at stops so the route is a continuous
+        # drive.  Activated automatically whenever a departure time is set.
+        no_wait = departure_min is not None
+
         adv_kwargs = dict(
             overlap_threshold_km=overlap_threshold_km,
             overlap_weight_rsd=overlap_weight_rsd,
             dist_rsd_per_km=dist_rsd_per_km,
             tw_penalty_rsd=tw_penalty_rsd,
+            no_wait=no_wait,
         )
         if "Nearest Neighbor" in algorithm:
             state = optimize_nn(dist_mat, time_mat, n_depots, n_cust, tw, demands,
@@ -2592,10 +2619,11 @@ def optimize():
 
             # Optimal (latest feasible) departure for this driver
             depart_min = latest_feasible_departure(
-                route, depot_mat, dist_mat, time_mat, tw, SERVICE_TIME, svc_map)
+                route, depot_mat, dist_mat, time_mat, tw, SERVICE_TIME, svc_map,
+                no_wait=no_wait)
 
             _, sched = route_time(route, depot_mat, dist_mat, time_mat, tw,
-                                   SERVICE_TIME, depart_min, svc_map)
+                                   SERVICE_TIME, depart_min, svc_map, no_wait=no_wait)
             stops = []
             for entry in sched:
                 cmat     = entry["customer_mat"]
@@ -2650,7 +2678,7 @@ def optimize():
             fuel_cost       = round(fuel_l * fuel_price_rsd_l, 0)
             work_mins   = route_working_minutes(
                 route, depot_mat, dist_mat, time_mat, tw, SERVICE_TIME, depart_min,
-                svc_map)
+                svc_map, no_wait=no_wait)
             work_h      = round(work_mins / 60.0, 2)
             wage_cost   = round(work_h * driver_wage_rsd_h, 0)
 
