@@ -288,6 +288,11 @@ _TRAFFIC_HISTORY_DAYS    = 14  # how many days back to fetch in total
 _TRAFFIC_FETCH_DAYS_PER_RUN = 3  # fetch at most this many days per optimize call (spreads load)
 _TRAFFIC_SLOT_MINUTES    = 15  # resolution in minutes
 
+# Only one prefetch may run at a time.  If an optimize fires while a prefetch
+# is already in progress (e.g. workspace reload + new customers), the new
+# request is skipped rather than stacking a second thread on top.
+_prefetch_lock = threading.Lock()
+
 
 def _round_coord(v):
     """Round coordinate to 5 decimal places for cache key consistency."""
@@ -316,7 +321,7 @@ def _fetch_here_for_slot(origin, destination, departure_iso):
     }
     try:
         resp = requests.get("https://router.hereapi.com/v8/routes",
-                            params=params, timeout=12)
+                            params=params, timeout=(5, 12))
         if resp.status_code == 200:
             routes = resp.json().get("routes", [])
             if routes:
@@ -369,92 +374,98 @@ def prefetch_traffic_history(locations, pairs):
         return  # nothing to do without both DB and HERE
 
     def _run():
-        # Determine which (pair, slot, date) triples are already in the cache
-        # so we can skip them.  We query once per pair to avoid a huge IN clause.
-        already = set()
-        try:
-            conn = _get_db_conn()
-            cur  = conn.cursor()
-            for (i, j) in pairs:
-                olat = _round_coord(locations[i]["lat"])
-                olng = _round_coord(locations[i]["lng"])
-                dlat = _round_coord(locations[j]["lat"])
-                dlng = _round_coord(locations[j]["lng"])
-                cur.execute(f"""
-                    SELECT slot_minutes, DATE(fetched_at)
-                    FROM grps_traffic_cache
-                    WHERE orig_lat=%s AND orig_lng=%s
-                      AND dest_lat=%s AND dest_lng=%s
-                      AND fetched_at >= NOW() - INTERVAL '{_TRAFFIC_HISTORY_DAYS} days'
-                """, (olat, olng, dlat, dlng))
-                for row in cur.fetchall():
-                    already.add((i, j, int(row[0]), str(row[1])))
-            conn.close()
-        except Exception as exc:
-            print(f"[traffic cache] pre-check failed: {exc}")
-            already = set()
-
-        # Build the list of (pair, day_offset, slot) work items to fetch.
-        # Cap to _TRAFFIC_FETCH_DAYS_PER_RUN days per run so a single optimize
-        # call never floods the HERE API. The cache fills up over successive runs.
-        today_utc = datetime.utcnow().date()
-        work = []
-        for day_offset in range(_TRAFFIC_HISTORY_DAYS):
-            if day_offset >= _TRAFFIC_FETCH_DAYS_PER_RUN:
-                break
-            day = today_utc - timedelta(days=day_offset + 1)
-            for (i, j) in pairs:
-                for slot in range(0, 24 * 60, _TRAFFIC_SLOT_MINUTES):
-                    if (i, j, slot, str(day)) not in already:
-                        work.append((i, j, day, slot))
-
-        if not work:
-            print("[traffic cache] ✅ All pairs already cached — nothing to fetch")
+        if not _prefetch_lock.acquire(blocking=False):
+            print("[traffic cache] prefetch skipped — another prefetch already running")
             return
+        try:
+            # Determine which (pair, slot, date) triples are already in the cache
+            # so we can skip them.  We query once per pair to avoid a huge IN clause.
+            already = set()
+            try:
+                conn = _get_db_conn()
+                cur  = conn.cursor()
+                for (i, j) in pairs:
+                    olat = _round_coord(locations[i]["lat"])
+                    olng = _round_coord(locations[i]["lng"])
+                    dlat = _round_coord(locations[j]["lat"])
+                    dlng = _round_coord(locations[j]["lng"])
+                    cur.execute(f"""
+                        SELECT slot_minutes, DATE(fetched_at)
+                        FROM grps_traffic_cache
+                        WHERE orig_lat=%s AND orig_lng=%s
+                          AND dest_lat=%s AND dest_lng=%s
+                          AND fetched_at >= NOW() - INTERVAL '{_TRAFFIC_HISTORY_DAYS} days'
+                    """, (olat, olng, dlat, dlng))
+                    for row in cur.fetchall():
+                        already.add((i, j, int(row[0]), str(row[1])))
+                conn.close()
+            except Exception as exc:
+                print(f"[traffic cache] pre-check failed: {exc}")
+                already = set()
 
-        print(f"[traffic cache] Starting prefetch: {len(work)} calls "
-              f"({len(pairs)} pairs × up to {_TRAFFIC_HISTORY_DAYS} days × "
-              f"{24*60//_TRAFFIC_SLOT_MINUTES} slots)")
+            # Build the list of (pair, day_offset, slot) work items to fetch.
+            # Cap to _TRAFFIC_FETCH_DAYS_PER_RUN days per run so a single optimize
+            # call never floods the HERE API. The cache fills up over successive runs.
+            today_utc = datetime.utcnow().date()
+            work = []
+            for day_offset in range(_TRAFFIC_HISTORY_DAYS):
+                if day_offset >= _TRAFFIC_FETCH_DAYS_PER_RUN:
+                    break
+                day = today_utc - timedelta(days=day_offset + 1)
+                for (i, j) in pairs:
+                    for slot in range(0, 24 * 60, _TRAFFIC_SLOT_MINUTES):
+                        if (i, j, slot, str(day)) not in already:
+                            work.append((i, j, day, slot))
 
-        # Fetch in parallel; batch DB writes every 50 rows
-        batch = []
+            if not work:
+                print("[traffic cache] ✅ All pairs already cached — nothing to fetch")
+                return
 
-        def _do_fetch(item):
-            fi, fj, fday, fslot = item
-            origin      = locations[fi]
-            destination = locations[fj]
-            dep_dt  = datetime(fday.year, fday.month, fday.day,
-                               fslot // 60, fslot % 60, 0)
-            dep_iso = dep_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-            time.sleep(0.15)   # ~6 calls/sec per thread; 2 threads → ~12 calls/sec total
-            tt, dk  = _fetch_here_for_slot(origin, destination, dep_iso)
-            if tt is not None:
-                return (
-                    _round_coord(origin["lat"]),  _round_coord(origin["lng"]),
-                    _round_coord(destination["lat"]), _round_coord(destination["lng"]),
-                    fslot, tt, dk, dep_dt,
-                )
-            return None
+            print(f"[traffic cache] Starting prefetch: {len(work)} calls "
+                  f"({len(pairs)} pairs × up to {_TRAFFIC_HISTORY_DAYS} days × "
+                  f"{24*60//_TRAFFIC_SLOT_MINUTES} slots)")
 
-        fetched = succeeded = 0
-        with ThreadPoolExecutor(max_workers=_TRAFFIC_FETCH_POOL_SIZE) as pool:
-            futures = {pool.submit(_do_fetch, item): item for item in work}
-            for future in as_completed(futures):
-                fetched += 1
-                result = future.result()
-                if result:
-                    batch.append(result)
-                    succeeded += 1
-                if len(batch) >= 50:
-                    _upsert_traffic_rows(batch)
-                    batch.clear()
-                if fetched % 200 == 0:
-                    print(f"[traffic cache] …{fetched}/{len(work)} fetched, "
-                          f"{succeeded} succeeded")
-        if batch:
-            _upsert_traffic_rows(batch)
+            # Fetch in parallel; batch DB writes every 50 rows
+            batch = []
 
-        print(f"[traffic cache] ✅ Prefetch complete: {succeeded}/{len(work)} stored")
+            def _do_fetch(item):
+                fi, fj, fday, fslot = item
+                origin      = locations[fi]
+                destination = locations[fj]
+                dep_dt  = datetime(fday.year, fday.month, fday.day,
+                                   fslot // 60, fslot % 60, 0)
+                dep_iso = dep_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+                time.sleep(0.15)   # ~6 calls/sec per thread; 2 threads → ~12 calls/sec total
+                tt, dk  = _fetch_here_for_slot(origin, destination, dep_iso)
+                if tt is not None:
+                    return (
+                        _round_coord(origin["lat"]),  _round_coord(origin["lng"]),
+                        _round_coord(destination["lat"]), _round_coord(destination["lng"]),
+                        fslot, tt, dk, dep_dt,
+                    )
+                return None
+
+            fetched = succeeded = 0
+            with ThreadPoolExecutor(max_workers=_TRAFFIC_FETCH_POOL_SIZE) as pool:
+                futures = {pool.submit(_do_fetch, item): item for item in work}
+                for future in as_completed(futures):
+                    fetched += 1
+                    result = future.result()
+                    if result:
+                        batch.append(result)
+                        succeeded += 1
+                    if len(batch) >= 50:
+                        _upsert_traffic_rows(batch)
+                        batch.clear()
+                    if fetched % 200 == 0:
+                        print(f"[traffic cache] …{fetched}/{len(work)} fetched, "
+                              f"{succeeded} succeeded")
+            if batch:
+                _upsert_traffic_rows(batch)
+
+            print(f"[traffic cache] ✅ Prefetch complete: {succeeded}/{len(work)} stored")
+        finally:
+            _prefetch_lock.release()
 
     threading.Thread(target=_run, daemon=True).start()
 
@@ -867,7 +878,7 @@ def fetch_here_matrix(locations, pairs=None, hav_km=None, sentinel_factor=None,
             }
             try:
                 resp = requests.get("https://router.hereapi.com/v8/routes",
-                                    params=params, timeout=10)
+                                    params=params, timeout=(5, 10))
                 if resp.status_code == 200:
                     routes = resp.json().get("routes", [])
                     if routes:
@@ -948,7 +959,7 @@ def fetch_here_route(waypoints):
                                params=params).prepare()
         print(f"[HERE route] URL: {req.url[:300]}")
         resp = requests.get("https://router.hereapi.com/v8/routes",
-                            params=params, timeout=20)
+                            params=params, timeout=(5, 20))
         if resp.status_code != 200:
             print(f"[HERE route] failed: {resp.status_code} {resp.text[:200]}")
             return None, None, None
