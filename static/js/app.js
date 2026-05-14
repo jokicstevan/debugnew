@@ -1140,7 +1140,6 @@ function setProgress(pct, msg) {
 }
 
 // ─── DRAW ROUTES ON MAP (with offset for side‑by‑side overlap) ───────────────
-// ─── DRAW ROUTES ON MAP (with offset for side‑by‑side overlap, zoom‑aware) ───
 function drawRoutes(data) {
   // Reset all customer markers back to default blue before colouring served ones
   state.customers.forEach(c => {
@@ -1206,27 +1205,22 @@ function drawRoutes(data) {
   }
 
   const totalVehicles = data.vehicle_routes.length;
-  const currentZoom = map.getZoom();
-  const useOffset = (currentZoom >= MIN_ZOOM_FOR_OFFSET);  // MIN_ZOOM_FOR_OFFSET = 10
-
   data.vehicle_routes.forEach(vr => {
     if (!vr.geometry || vr.geometry.length < 2) return;
     const latlngs = vr.geometry.map(([lng, lat]) => [lat, lng]);
-    const offsetPx = useOffset ? getOffsetForVehicle(vr.vehicle_id, totalVehicles) : 0;
+    const offsetPx = getOffsetForVehicle(vr.vehicle_id, totalVehicles);
     
-    // White outline only when offset is used (avoids double lines at low zoom)
-    if (useOffset) {
-      L.polyline(latlngs, {
-        color: '#ffffff',
-        weight: 6,
-        opacity: 0.5,
-        smoothFactor: 1,
-        offset: offsetPx,
-        interactive: false
-      }).addTo(map);
-    }
+    // First draw a white outline (thicker, same offset) to improve contrast
+    L.polyline(latlngs, {
+      color: '#ffffff',
+      weight: 6,
+      opacity: 0.5,
+      smoothFactor: 1,
+      offset: offsetPx,
+      interactive: false
+    }).addTo(map);
     
-    // Main coloured line
+    // Then the coloured line on top
     const layer = L.polyline(latlngs, {
       color: vr.color,
       weight: 4,
@@ -1279,7 +1273,6 @@ function drawRoutes(data) {
       }
     });
   });
-  
   // Fit map to routes + all depot markers
   try {
     const routeLayers = Object.values(state.routeLayers).filter(l => l);
@@ -1292,34 +1285,6 @@ function drawRoutes(data) {
     }
   } catch(e) { console.warn('fitBounds:', e); }
 }
-
-function setupZoomRedraw() {
-  map.on('zoomend', () => {
-    if (state.lastResult) {
-      // Temporarily disable zoom listener to avoid recursion
-      map.off('zoomend', setupZoomRedraw);
-      // Redraw routes with new zoom level
-      drawRoutes(state.lastResult);
-      // Re‑attach listener
-      map.on('zoomend', setupZoomRedraw);
-    }
-  });
-}
-
-// Call this after map initialisation (inside DOMContentLoaded)
-window.addEventListener('DOMContentLoaded', () => {
-  // ... existing map init code ...
-  setupZoomRedraw();
-});
-
-function getOffsetForVehicle(vehicleId, totalVehicles) {
-  const step = 6;
-  const center = (totalVehicles - 1) / 2;
-  return (vehicleId - center) * step;
-}
-
-// Minimum zoom level below which we disable offset (prevents weird artefacts)
-const MIN_ZOOM_FOR_OFFSET = 10;
 
 function clearRoutes() {
   // Restore each customer marker to its original insertion-order number + blue
