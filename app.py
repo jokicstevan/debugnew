@@ -861,37 +861,60 @@ def fetch_here_matrix(locations, pairs=None, hav_km=None, sentinel_factor=None,
                     time_mat[i][j] = sentinel_d / 30.0 * 60.0
 
     fetch_set = pairs if pairs is not None else {(i, j) for i in range(n) for j in range(n) if i != j}
-    api_calls = 0
 
-    for i in range(n):
-        for j in range(n):
-            if i == j or (i, j) not in fetch_set:
-                continue
-            params = {
-                "apiKey":        HERE_API_KEY,
-                "transportMode": "car",
-                "routingMode":   "fast",
-                "departureTime": dep_time,
-                "origin":        f"{locations[i]['lat']},{locations[i]['lng']}",
-                "destination":   f"{locations[j]['lat']},{locations[j]['lng']}",
-                "return":        "summary",
-            }
-            try:
-                resp = requests.get("https://router.hereapi.com/v8/routes",
-                                    params=params, timeout=(5, 10))
-                if resp.status_code == 200:
-                    routes = resp.json().get("routes", [])
-                    if routes:
-                        summary = routes[0]["sections"][0]["summary"]
-                        dist_mat[i][j] = summary["length"]   / 1000.0  # m → km
-                        time_mat[i][j] = summary["duration"] / 60.0    # s → min
-                        api_calls += 1
-                        continue
-                print(f"[HERE matrix] ({i},{j}) failed: {resp.status_code} {resp.text[:100]}")
-                return None, None   # fail fast — fall back to OSRM
-            except Exception as e:
-                print(f"[HERE matrix] ({i},{j}) exception: {e}")
+    # ── Concurrent HERE API calls ─────────────────────────────────────────────────────────────────────
+    # Replace the old sequential loop with a thread pool so N pairs are fetched
+    # in parallel rather than one-by-one.  With MAX_HERE_WORKERS=20 threads,
+    # 150 pairs at ~2 s average → ~15 s total instead of ~300 s sequential,
+    # comfortably inside the gunicorn worker timeout.
+    MAX_HERE_WORKERS = 20
+    failed = threading.Event()   # set by any thread that gets a bad response
+
+    def _fetch_pair(i, j):
+        """Fetch a single (i, j) route from HERE.  Returns (i, j, dist_km, time_min)
+        or returns None to signal failure."""
+        if failed.is_set():
+            return None
+        params = {
+            "apiKey":        HERE_API_KEY,
+            "transportMode": "car",
+            "routingMode":   "fast",
+            "departureTime": dep_time,
+            "origin":        f"{locations[i]['lat']},{locations[i]['lng']}",
+            "destination":   f"{locations[j]['lat']},{locations[j]['lng']}",
+            "return":        "summary",
+        }
+        try:
+            resp = requests.get("https://router.hereapi.com/v8/routes",
+                                params=params, timeout=(5, 10))
+            if resp.status_code == 200:
+                routes = resp.json().get("routes", [])
+                if routes:
+                    summary = routes[0]["sections"][0]["summary"]
+                    return (i, j,
+                            summary["length"]   / 1000.0,   # m  → km
+                            summary["duration"] / 60.0)     # s  → min
+            print(f"[HERE matrix] ({i},{j}) failed: {resp.status_code} {resp.text[:100]}")
+        except Exception as e:
+            print(f"[HERE matrix] ({i},{j}) exception: {e}")
+        failed.set()
+        return None
+
+    with ThreadPoolExecutor(max_workers=MAX_HERE_WORKERS) as pool:
+        futures = {pool.submit(_fetch_pair, i, j): (i, j) for (i, j) in fetch_set}
+        api_calls = 0
+        for future in as_completed(futures):
+            if failed.is_set():
+                pool.shutdown(wait=False, cancel_futures=True)
                 return None, None
+            result = future.result()
+            if result is None:
+                pool.shutdown(wait=False, cancel_futures=True)
+                return None, None
+            i, j, dist, time_val = result
+            dist_mat[i][j] = dist
+            time_mat[i][j]  = time_val
+            api_calls += 1
 
     skipped = n * (n - 1) - api_calls
     print(f"[HERE matrix] ✅ {n}×{n} matrix built with live traffic "
