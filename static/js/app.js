@@ -1130,6 +1130,13 @@ function setProgress(pct, msg) {
   document.getElementById('progress-label').textContent = msg;
 }
 
+function getOffsetForVehicle(vehicleId, totalVehicles) {
+  // Center around zero; offset step = 4 pixels per vehicle, max ±12 px
+  const step = 4;
+  const center = (totalVehicles - 1) / 2;
+  return (vehicleId - center) * step;
+}
+
 // ─── DRAW ROUTES ON MAP ───────────────────────────────────────────────────────
 function drawRoutes(data) {
   // Reset all customer markers back to default blue before colouring served ones
@@ -1153,6 +1160,23 @@ function drawRoutes(data) {
       });
       marker.setIcon(icon);
     }
+  
+  });
+
+  const totalVehicles = data.vehicle_routes.length;
+  data.vehicle_routes.forEach(vr => {
+    if (!vr.geometry || vr.geometry.length < 2) return;
+    const latlngs = vr.geometry.map(([lng, lat]) => [lat, lng]);
+    const offsetPx = getOffsetForVehicle(vr.vehicle_id, totalVehicles);
+    const layer = L.polyline(latlngs, {
+      color: vr.color,
+      weight: 4,
+      opacity: 0.85,
+      smoothFactor: 1,
+      offset: offsetPx          // <-- side‑by‑side offset in pixels
+    }).addTo(map);
+    state.routeLayers[vr.vehicle_id] = layer;
+    state.vehicleVisible[vr.vehicle_id] = true;
   });
 
   // Highlight unserved customers in red with a warning icon.
@@ -1600,7 +1624,9 @@ async function captureVehicleMap(vr) {
 
   // 3. Route polyline
   const latlngs = vr.geometry.map(([lng, lat]) => [lat, lng]);
-  L.polyline(latlngs, { color: vr.color, weight: 5, opacity: 0.9, smoothFactor: 1 }).addTo(vMap);
+  const offsetPx = getOffsetForVehicle(vehicleIdx, totalVehicles);
+
+  L.polyline(latlngs, { color: vr.color, weight: 5, opacity: 0.9, smoothFactor: 1,offset: offsetPx  }).addTo(vMap);
 
   // 4. Depot marker
   L.circleMarker(latlngs[0], {
@@ -1614,6 +1640,14 @@ async function captureVehicleMap(vr) {
       radius: 11, color: '#fff', weight: 2.5,
       fillColor: vr.color, fillOpacity: 1,
     }).addTo(vMap);
+
+  // Then, when calling captureVehicleMap inside generatePDF, pass the index:
+  for (let i = 0; i < d.vehicle_routes.length; i++) {
+    const vr = d.vehicle_routes[i];
+    btn.textContent = t('captureVehicle')(i + 1, d.vehicle_routes.length);
+    vehicleMaps[vr.vehicle_id] = await captureVehicleMap(vr, i, d.vehicle_routes.length);
+    await sleep(200);
+  }
   });
 
   // 6. Fit to route bounds
