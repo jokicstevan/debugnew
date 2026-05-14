@@ -1794,19 +1794,30 @@ class VRPState:
 # ─── ALNS operators ──────────────────────────────────────────────────────────
 
 def _ins_cost(route, pos, c, state, depot):
-    """Insertion cost of customer c at position pos in route."""
     new_r = route[:pos] + [c] + route[pos:]
-    ok, _ = route_time(new_r, depot, state.dist_mat, state.time_mat, state.tw, state.svc,
-                        svc_map=state.svc_map, no_wait=state.no_wait)
-    # Only hard-reject on TW infeasibility when TW constraints are actually enforced.
-    # When use_tw=False, a long route may still violate the default TW window used
-    # internally, but that must not prevent consolidation onto a single vehicle.
+    ok, new_sched = route_time(new_r, depot, state.dist_mat, state.time_mat,
+                                state.tw, state.svc, svc_map=state.svc_map,
+                                no_wait=state.no_wait)
     if not ok and state.use_tw:
         return float("inf")
-    prev = route[pos-1] if pos > 0 else depot
-    nxt  = route[pos]   if pos < len(route) else depot
-    return (state.dist_mat[prev][c] + state.dist_mat[c][nxt]
-            - state.dist_mat[prev][nxt])
+
+    do_wages = (state.obj_weights or {}).get("wages", False)
+    dist_delta = (state.dist_mat[route[pos-1] if pos > 0 else depot][c]
+                + state.dist_mat[c][route[pos] if pos < len(route) else depot]
+                - state.dist_mat[route[pos-1] if pos > 0 else depot]
+                                [route[pos] if pos < len(route) else depot])
+
+    if do_wages:
+        # Extra wait introduced by this insertion
+        extra_wait_min = sum(e["wait"] for e in new_sched)
+        old_ok, old_sched = route_time(route, depot, state.dist_mat, state.time_mat,
+                                        state.tw, state.svc, svc_map=state.svc_map,
+                                        no_wait=state.no_wait)
+        old_wait = sum(e["wait"] for e in old_sched) if old_ok else 0.0
+        wait_cost = (extra_wait_min - old_wait) / 60.0 * state.driver_wage_rsd_h
+        return dist_delta + wait_cost
+
+    return dist_delta
 
 
 def _rand_remove(state, rng):
