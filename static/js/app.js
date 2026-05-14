@@ -1041,8 +1041,9 @@ function updateConstraintHint() {
 
 // ─── HELPER: compute visual offset for a vehicle (pixels) ───────────────────
 function getOffsetForVehicle(vehicleId, totalVehicles) {
-  // Center around zero; offset step = 4 pixels per vehicle, max ±12 px
-  const step = 4;
+  // Symmetric offsets: centre line = 0, step = 6 pixels
+  // Example: 3 vehicles → offsets: -6, 0, +6
+  const step = 6;
   const center = (totalVehicles - 1) / 2;
   return (vehicleId - center) * step;
 }
@@ -1208,10 +1209,26 @@ function drawRoutes(data) {
     if (!vr.geometry || vr.geometry.length < 2) return;
     const latlngs = vr.geometry.map(([lng, lat]) => [lat, lng]);
     const offsetPx = getOffsetForVehicle(vr.vehicle_id, totalVehicles);
-    const layer = L.polyline(latlngs, {
-      color: vr.color, weight: 4, opacity: 0.85, smoothFactor: 1,
-      offset: offsetPx          // <-- side‑by‑side offset in pixels
+    
+    // First draw a white outline (thicker, same offset) to improve contrast
+    L.polyline(latlngs, {
+      color: '#ffffff',
+      weight: 6,
+      opacity: 0.5,
+      smoothFactor: 1,
+      offset: offsetPx,
+      interactive: false
     }).addTo(map);
+    
+    // Then the coloured line on top
+    const layer = L.polyline(latlngs, {
+      color: vr.color,
+      weight: 4,
+      opacity: 0.85,
+      smoothFactor: 1,
+      offset: offsetPx
+    }).addTo(map);
+    
     state.routeLayers[vr.vehicle_id] = layer;
     state.vehicleVisible[vr.vehicle_id] = true;
 
@@ -1609,12 +1626,27 @@ async function captureVehicleMap(vr, vehicleIdx, totalVehicles) {
     maxZoom: 19, crossOrigin: true,
   }).addTo(vMap);
 
-  // 3. Route polyline with side‑by‑side offset
+  // 3. Route polyline with side‑by‑side offset (add white outline for PDF as well)
   const latlngs = vr.geometry.map(([lng, lat]) => [lat, lng]);
   const offsetPx = getOffsetForVehicle(vehicleIdx, totalVehicles);
+  
+  // White outline (thicker)
   L.polyline(latlngs, {
-    color: vr.color, weight: 5, opacity: 0.9, smoothFactor: 1,
-    offset: offsetPx               // same offset for consistent PDF visuals
+    color: '#ffffff',
+    weight: 7,
+    opacity: 0.6,
+    smoothFactor: 1,
+    offset: offsetPx,
+    interactive: false
+  }).addTo(vMap);
+  
+  // Coloured line
+  L.polyline(latlngs, {
+    color: vr.color,
+    weight: 5,
+    opacity: 0.9,
+    smoothFactor: 1,
+    offset: offsetPx
   }).addTo(vMap);
 
   // 4. Depot marker
@@ -1973,7 +2005,7 @@ async function openHistoryRoute(routeId) {
               <th style="padding:3px 5px;text-align:center">Window</th>
               <th style="padding:3px 5px;text-align:right">Vol m³</th>
               <th style="padding:3px 5px;text-align:right">Wt kg</th>
-            <tr>
+            </tr>
           </thead>
           <tbody>
             ${r.stops.map((s, i) => {
