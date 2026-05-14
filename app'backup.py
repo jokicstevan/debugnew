@@ -1790,68 +1790,34 @@ class VRPState:
             for v, r in enumerate(self.routes) if r)
 
 
+
 # ─── ALNS operators ──────────────────────────────────────────────────────────
 
 def _ins_cost(route, pos, c, state, depot):
-    """Improved insertion cost that accounts for optimal departure time shift.
-    Returns the delta in the objective value (wages + optional distance).
-    """
-    # Build new route with customer inserted at pos
-    new_route = route[:pos] + [c] + route[pos:]
-    old_route = route
-
-    # Compute total working minutes for old route (using optimal departure)
-    old_start = latest_feasible_departure(
-        old_route, depot, state.dist_mat, state.time_mat,
-        state.tw, state.svc, state.svc_map, no_wait=state.no_wait
-    )
-    old_work_mins = route_working_minutes(
-        old_route, depot, state.dist_mat, state.time_mat,
-        state.tw, state.svc, old_start, state.svc_map, no_wait=state.no_wait
-    ) if old_route else 0.0
-
-    # Compute total working minutes for new route
-    new_start = latest_feasible_departure(
-        new_route, depot, state.dist_mat, state.time_mat,
-        state.tw, state.svc, state.svc_map, no_wait=state.no_wait
-    )
-    new_work_mins = route_working_minutes(
-        new_route, depot, state.dist_mat, state.time_mat,
-        state.tw, state.svc, new_start, state.svc_map, no_wait=state.no_wait
-    )
-
-    # Distance delta (only matters if distance is in the objective)
-    # Compute total distance for old and new routes
-    old_dist = route_dist(old_route, depot, state.dist_mat) if old_route else 0.0
-    new_dist = route_dist(new_route, depot, state.dist_mat)
-
-    # Objective weights
-    ow = state.obj_weights or {}
-    do_wages = ow.get("wages", False)
-    do_dist = ow.get("distance", False)
-    do_fuel = ow.get("fuel", False)   # fuel not directly in insertion cost – approximated by distance
-
-    cost = 0.0
-    if do_wages:
-        cost += ((new_work_mins - old_work_mins) / 60.0) * state.driver_wage_rsd_h
-    if do_dist:
-        cost += (new_dist - old_dist) * state.dist_rsd_per_km
-    if do_fuel:
-        # Rough approximation: 10 L/100km * fuel price
-        fuel_per_km = 10.0 / 100.0 * state.fuel_price_rsd_l
-        cost += (new_dist - old_dist) * fuel_per_km
-
-    # If the new route is infeasible (e.g., violates time windows when use_tw=False)
-    # the working minutes calculation would have returned inf? Actually `latest_feasible_departure`
-    # returns depot open if infeasible, but we need a clear signal.
-    # We can check feasibility by calling route_time with new_start.
-    feasible, _ = route_time(
-        new_route, depot, state.dist_mat, state.time_mat,
-        state.tw, state.svc, new_start, state.svc_map, no_wait=state.no_wait
-    )
-    if not feasible and state.use_tw:
+    new_r = route[:pos] + [c] + route[pos:]
+    ok, new_sched = route_time(new_r, depot, state.dist_mat, state.time_mat,
+                                state.tw, state.svc, svc_map=state.svc_map,
+                                no_wait=state.no_wait)
+    if not ok and state.use_tw:
         return float("inf")
-    return cost
+
+    do_wages = (state.obj_weights or {}).get("wages", False)
+    dist_delta = (state.dist_mat[route[pos-1] if pos > 0 else depot][c]
+                + state.dist_mat[c][route[pos] if pos < len(route) else depot]
+                - state.dist_mat[route[pos-1] if pos > 0 else depot]
+                                [route[pos] if pos < len(route) else depot])
+
+    if do_wages:
+        # Extra wait introduced by this insertion
+        extra_wait_min = sum(e["wait"] for e in new_sched)
+        old_ok, old_sched = route_time(route, depot, state.dist_mat, state.time_mat,
+                                        state.tw, state.svc, svc_map=state.svc_map,
+                                        no_wait=state.no_wait)
+        old_wait = sum(e["wait"] for e in old_sched) if old_ok else 0.0
+        wait_cost = (extra_wait_min - old_wait) / 60.0 * state.driver_wage_rsd_h
+        return dist_delta + wait_cost
+
+    return dist_delta
 
 
 def _rand_remove(state, rng):
@@ -1996,70 +1962,6 @@ def _overlap_remove(state, rng):
     n_rem = max(1, int(rng.integers(1, max(2, len(scores) // 4 + 1))))
     for _, v, pos in sorted(scores[:n_rem], key=lambda x: (x[1], x[2]), reverse=True):
         s.routes[v].pop(pos)
-    return s
-
-
-def _wait_remove(state, rng):
-    """Remove customers that cause the most idle waiting time in their routes.
-    For each customer, we compute the waiting minutes that would be eliminated
-    if that customer were removed (i.e., the difference in total route waiting
-    before and after removal). High-wait customers are removed first.
-    """
-    s = state.copy()
-    if not any(s.routes):
-        return s
-
-    # Precompute for each vehicle: waiting minutes per stop (approx)
-    # We'll compute total waiting of current route, then simulate removal.
-    waiting_scores = []  # (score, vehicle_idx, stop_position, customer_mat)
-    for v, route in enumerate(s.routes):
-        if not route:
-            continue
-        depot = s.depot_of[v]
-        # Compute baseline waiting for this route
-        start = latest_feasible_departure(
-            route, depot, s.dist_mat, s.time_mat,
-            s.tw, s.svc, s.svc_map, no_wait=s.no_wait
-        )
-        _, sched = route_time(
-            route, depot, s.dist_mat, s.time_mat,
-            s.tw, s.svc, start, s.svc_map, no_wait=s.no_wait
-        )
-        baseline_wait = sum(stop.get("wait", 0) for stop in sched)
-
-        # For each stop, compute waiting after removal
-        for i, c in enumerate(route):
-            # Create route without this stop
-            reduced_route = route[:i] + route[i+1:]
-            if not reduced_route:
-                # Removing the only stop eliminates all waiting
-                wait_reduction = baseline_wait
-            else:
-                new_start = latest_feasible_departure(
-                    reduced_route, depot, s.dist_mat, s.time_mat,
-                    s.tw, s.svc, s.svc_map, no_wait=s.no_wait
-                )
-                _, new_sched = route_time(
-                    reduced_route, depot, s.dist_mat, s.time_mat,
-                    s.tw, s.svc, new_start, s.svc_map, no_wait=s.no_wait
-                )
-                new_wait = sum(stop.get("wait", 0) for stop in new_sched)
-                wait_reduction = baseline_wait - new_wait
-            waiting_scores.append((wait_reduction, v, i, c))
-
-    if not waiting_scores:
-        return s
-
-    # Sort by wait reduction (largest first)
-    waiting_scores.sort(reverse=True, key=lambda x: x[0])
-    # Remove a random number (1 to 25% of total stops, at least 1)
-    n_rem = max(1, int(rng.integers(1, max(2, len(waiting_scores)//4 + 1))))
-    # Take top n_rem customers
-    to_remove = waiting_scores[:n_rem]
-    # Remove from routes (in reverse order to keep indices valid)
-    for _, v, i, _ in sorted(to_remove, key=lambda x: (x[1], x[2]), reverse=True):
-        if i < len(s.routes[v]):
-            s.routes[v].pop(i)
     return s
 
 
@@ -2327,9 +2229,9 @@ def _alns_optimize(fleet, dist_mat, time_mat, n_depots, n_cust, tw, demands,
     temp = temperature
     cooling = alns_cooling if alns_cooling is not None else 0.995
 
-    destroy = [_rand_remove, _worst_remove, _tw_remove, _cap_remove, _overlap_remove, _wait_remove]
+    destroy = [_rand_remove, _worst_remove, _tw_remove, _cap_remove, _overlap_remove]
     repair = [_greedy_insert, _regret_insert]
-    dw = [1.0] * 6   # one weight per destroy operator
+    dw = [1.0] * 5
     rw = [1.0] * 2
     rng = np.random.default_rng(42)
 
@@ -3392,7 +3294,7 @@ tr:hover td{background:rgba(255,255,255,.03)}
         html += '    <div class="tbl-wrap"><table><thead><tr>'
         for col in headers[tbl]:
             html += f"<th>{col}</th>"
-        html += "</table></thead><tbody>"
+        html += "</tr></thead><tbody>"
         for row in previews[tbl]:
             html += "<tr>"
             for cell in row:
