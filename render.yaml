@@ -2,30 +2,39 @@ services:
   - type: web
     name: grps-routing
     runtime: python
-    pythonVersion: "3.12"          # Pin to 3.12 — psycopg2-binary not yet compatible with 3.14
+    pythonVersion: "3.12"
     buildCommand: pip install --upgrade pip && pip install -r requirements.txt
-    startCommand: gunicorn app:app --workers 2 --timeout 600 --bind 0.0.0.0:$PORT
+    startCommand: >
+      gunicorn app:app
+      --workers 2
+      --timeout 900
+      --graceful-timeout 30
+      --keep-alive 5
+      --max-requests 1000
+      --max-requests-jitter 100
+      --bind 0.0.0.0:$PORT
     envVars:
       - key: SECRET_KEY
-        generateValue: true        # Render auto-generates a secure random value
+        generateValue: true
       - key: HERE_API_KEY
-        sync: false                # Get your free key at developer.here.com
+        sync: false
       - key: APP_USER
-        value: admin               # Change this to your preferred username
+        value: admin
       - key: APP_PASS
-        sync: false                # Render will prompt you to set this secretly
+        sync: false
       - key: APP_USER2
         value: dispatcher
       - key: APP_PASS2
-        sync: false                # Render will prompt you to set this secretly
+        sync: false
       - key: DATABASE_URL
         fromDatabase:
-          name: grps-db            # Must match the database name below
+          name: grps-db
           property: connectionString
+      - key: PYTHONUNBUFFERED
+        value: "1"
 
 databases:
   - name: grps-db
-    plan: free                     # Free tier: 1 GB storage, deleted after 90 days
-    # plan: starter                # $7/month: persistent, daily backups, 1 GB storage
+    plan: free
     databaseName: grps
     user: grps_user
