@@ -673,7 +673,11 @@ function renderLocationsList() {
   state.customers.forEach(c => {
     html += `<div class="loc-item">
       <span class="loc-dot customer"></span>
-      <span class="loc-name">👤 C${c.customer_id}: ${esc(c.name)} [${calcVolume(c.pkg_counts).toFixed(2)}m³]</span>
+      <span class="loc-name">👤 ${
+        c.route_visit_num != null
+          ? `<span style="color:${c.route_vehicle_color};font-weight:700">V${c.route_vehicle_num}:#${c.route_visit_num}</span>`
+          : `C${c.customer_id}`
+      }: ${esc(c.name)} [${calcVolume(c.pkg_counts).toFixed(2)}m³]</span>
       <button class="loc-del" onclick="removeCustomer('${c.id}')">✕</button>
     </div>`;
   });
@@ -1130,6 +1134,10 @@ function setProgress(pct, msg) {
 function drawRoutes(data) {
   // Reset all customer markers back to default blue before colouring served ones
   state.customers.forEach(c => {
+    // Clear any route-visit numbering from a previous run
+    c.route_visit_num    = null;
+    c.route_vehicle_num  = null;
+    c.route_vehicle_color = null;
     const marker = state.markers[c.id];
     if (marker) {
       const icon = L.divIcon({
@@ -1202,7 +1210,7 @@ function drawRoutes(data) {
     state.customers.forEach(c => {
       (_nameQueue[c.name] = _nameQueue[c.name] || []).push(c);
     });
-    (vr.stops || []).forEach(stop => {
+    (vr.stops || []).forEach((stop, stopIdx) => {
       const custEntry = (_nameQueue[stop.name] || []).shift();
       if (custEntry && state.markers[custEntry.id]) {
         const flag = stop.violation > 0 ? ` ⚠️ +${stop.violation}m late`
@@ -1216,10 +1224,24 @@ function drawRoutes(data) {
           `🚪 Departs: ${stop.depart}<br>` +
           `⏱ Window: ${stop.tw_start}–${stop.tw_end}${flag}`
         );
-        try {
-          const el = state.markers[custEntry.id].getElement();
-          if (el) { const dot = el.querySelector('div'); if (dot) dot.style.background = vr.color; }
-        } catch(e) {}
+        // Update marker: show visit-order number (1 = first stop on this route)
+        // in the vehicle's colour so it's easy to see which route each stop belongs to.
+        const visitNum = stopIdx + 1;
+        custEntry.route_visit_num    = visitNum;
+        custEntry.route_vehicle_num  = vr.vehicle_id + 1;
+        custEntry.route_vehicle_color = vr.color;
+        const routeIcon = L.divIcon({
+          className: '',
+          html: `<div style="
+            width:26px;height:26px;border-radius:50%;
+            background:${vr.color};border:3px solid #fff;
+            box-shadow:0 2px 6px rgba(0,0,0,.45);
+            color:#fff;font-size:11px;font-weight:700;
+            display:flex;align-items:center;justify-content:center;
+            line-height:1;">${visitNum}</div>`,
+          iconSize:[26,26], iconAnchor:[13,13], popupAnchor:[0,-16]
+        });
+        state.markers[custEntry.id].setIcon(routeIcon);
       }
     });
   });
@@ -1237,6 +1259,26 @@ function drawRoutes(data) {
 }
 
 function clearRoutes() {
+  // Restore each customer marker to its original insertion-order number + blue
+  state.customers.forEach(c => {
+    c.route_visit_num    = null;
+    c.route_vehicle_num  = null;
+    c.route_vehicle_color = null;
+    const marker = state.markers[c.id];
+    if (marker) {
+      marker.setIcon(L.divIcon({
+        className: '',
+        html: `<div style="
+          width:26px;height:26px;border-radius:50%;
+          background:#3498db;border:3px solid #fff;
+          box-shadow:0 2px 6px rgba(0,0,0,.45);
+          color:#fff;font-size:11px;font-weight:700;
+          display:flex;align-items:center;justify-content:center;
+          line-height:1;">${c.customer_id}</div>`,
+        iconSize:[26,26], iconAnchor:[13,13], popupAnchor:[0,-16]
+      }));
+    }
+  });
   Object.values(state.routeLayers).forEach(l => safeRemove(l));
   state.routeLayers = {};
   state.vehicleVisible = {};
