@@ -788,7 +788,7 @@ async function importExcel(input) {
 }
 
 function showExcelPreview(rows) {
-  let th = '<tr><th>#</th><th>Customer</th><th>Address</th><th>Pkg#1</th><th>Pkg#2</th><th>Pkg#3</th><th>Vol (m³)</th><th>Unload (min)</th><th>Time</th></tr>';
+  let th = '<thead><tr><th>#</th><th>Customer</th><th>Address</th><th>Pkg#1</th><th>Pkg#2</th><th>Pkg#3</th><th>Vol (m³)</th><th>Unload (min)</th><th>Time</th></tr></thead>';
   let td = rows.map((r,i) => {
     const pc = r.pkg_counts || [r.packages||0, 0, 0];
     const vol = calcVolume(pc).toFixed(2);
@@ -800,7 +800,7 @@ function showExcelPreview(rows) {
     </tr>`;
   }).join('');
   document.getElementById('excel-table-wrap').innerHTML =
-    `<table class="excel-preview-table"><thead>${th}</thead><tbody>${td}</tbody></table>`;
+    `<table class="excel-preview-table">${th}<tbody>${td}</tbody></table>`;
   document.getElementById('excel-modal').classList.remove('hidden');
 }
 
@@ -1039,6 +1039,14 @@ function updateConstraintHint() {
   }
 }
 
+// ─── HELPER: compute visual offset for a vehicle (pixels) ───────────────────
+function getOffsetForVehicle(vehicleId, totalVehicles) {
+  // Center around zero; offset step = 4 pixels per vehicle, max ±12 px
+  const step = 4;
+  const center = (totalVehicles - 1) / 2;
+  return (vehicleId - center) * step;
+}
+
 // ─── OPTIMIZATION ────────────────────────────────────────────────────────────
 async function runOptimize() {
   if (state.depots.length === 0) { alert(t('addDepotFirst')); return; }
@@ -1130,14 +1138,7 @@ function setProgress(pct, msg) {
   document.getElementById('progress-label').textContent = msg;
 }
 
-function getOffsetForVehicle(vehicleId, totalVehicles) {
-  // Center around zero; offset step = 4 pixels per vehicle, max ±12 px
-  const step = 4;
-  const center = (totalVehicles - 1) / 2;
-  return (vehicleId - center) * step;
-}
-
-// ─── DRAW ROUTES ON MAP ───────────────────────────────────────────────────────
+// ─── DRAW ROUTES ON MAP (with offset for side‑by‑side overlap) ───────────────
 function drawRoutes(data) {
   // Reset all customer markers back to default blue before colouring served ones
   state.customers.forEach(c => {
@@ -1160,23 +1161,6 @@ function drawRoutes(data) {
       });
       marker.setIcon(icon);
     }
-  
-  });
-
-  const totalVehicles = data.vehicle_routes.length;
-  data.vehicle_routes.forEach(vr => {
-    if (!vr.geometry || vr.geometry.length < 2) return;
-    const latlngs = vr.geometry.map(([lng, lat]) => [lat, lng]);
-    const offsetPx = getOffsetForVehicle(vr.vehicle_id, totalVehicles);
-    const layer = L.polyline(latlngs, {
-      color: vr.color,
-      weight: 4,
-      opacity: 0.85,
-      smoothFactor: 1,
-      offset: offsetPx          // <-- side‑by‑side offset in pixels
-    }).addTo(map);
-    state.routeLayers[vr.vehicle_id] = layer;
-    state.vehicleVisible[vr.vehicle_id] = true;
   });
 
   // Highlight unserved customers in red with a warning icon.
@@ -1219,11 +1203,14 @@ function drawRoutes(data) {
     st.style.color = '#e74c3c';
   }
 
+  const totalVehicles = data.vehicle_routes.length;
   data.vehicle_routes.forEach(vr => {
     if (!vr.geometry || vr.geometry.length < 2) return;
     const latlngs = vr.geometry.map(([lng, lat]) => [lat, lng]);
+    const offsetPx = getOffsetForVehicle(vr.vehicle_id, totalVehicles);
     const layer = L.polyline(latlngs, {
-      color: vr.color, weight: 4, opacity: 0.85, smoothFactor: 1
+      color: vr.color, weight: 4, opacity: 0.85, smoothFactor: 1,
+      offset: offsetPx          // <-- side‑by‑side offset in pixels
     }).addTo(map);
     state.routeLayers[vr.vehicle_id] = layer;
     state.vehicleVisible[vr.vehicle_id] = true;
@@ -1598,7 +1585,7 @@ async function captureMapCanvas() {
  * draw only its route + stop markers, capture it, then tear it down.
  * This never touches the main map at all.
  */
-async function captureVehicleMap(vr) {
+async function captureVehicleMap(vr, vehicleIdx, totalVehicles) {
   if (!vr.geometry || vr.geometry.length < 2) return null;
 
   const W = 900, H = 500;
@@ -1622,11 +1609,13 @@ async function captureVehicleMap(vr) {
     maxZoom: 19, crossOrigin: true,
   }).addTo(vMap);
 
-  // 3. Route polyline
+  // 3. Route polyline with side‑by‑side offset
   const latlngs = vr.geometry.map(([lng, lat]) => [lat, lng]);
   const offsetPx = getOffsetForVehicle(vehicleIdx, totalVehicles);
-
-  L.polyline(latlngs, { color: vr.color, weight: 5, opacity: 0.9, smoothFactor: 1,offset: offsetPx  }).addTo(vMap);
+  L.polyline(latlngs, {
+    color: vr.color, weight: 5, opacity: 0.9, smoothFactor: 1,
+    offset: offsetPx               // same offset for consistent PDF visuals
+  }).addTo(vMap);
 
   // 4. Depot marker
   L.circleMarker(latlngs[0], {
@@ -1640,14 +1629,6 @@ async function captureVehicleMap(vr) {
       radius: 11, color: '#fff', weight: 2.5,
       fillColor: vr.color, fillOpacity: 1,
     }).addTo(vMap);
-
-  // Then, when calling captureVehicleMap inside generatePDF, pass the index:
-  for (let i = 0; i < d.vehicle_routes.length; i++) {
-    const vr = d.vehicle_routes[i];
-    btn.textContent = t('captureVehicle')(i + 1, d.vehicle_routes.length);
-    vehicleMaps[vr.vehicle_id] = await captureVehicleMap(vr, i, d.vehicle_routes.length);
-    await sleep(200);
-  }
   });
 
   // 6. Fit to route bounds
@@ -1740,9 +1721,11 @@ async function generatePDF() {
 
   // ── Capture per-vehicle maps ───────────────────────────────────────────────
   const vehicleMaps = {};
-  for (const vr of d.vehicle_routes) {
-    btn.textContent = t('captureVehicle')(vr.vehicle_id + 1, d.vehicle_routes.length);
-    vehicleMaps[vr.vehicle_id] = await captureVehicleMap(vr);
+  const totalVehicles = d.vehicle_routes.length;
+  for (let i = 0; i < d.vehicle_routes.length; i++) {
+    const vr = d.vehicle_routes[i];
+    btn.textContent = t('captureVehicle')(i + 1, totalVehicles);
+    vehicleMaps[vr.vehicle_id] = await captureVehicleMap(vr, i, totalVehicles);
     await sleep(200);
   }
 
@@ -1990,7 +1973,7 @@ async function openHistoryRoute(routeId) {
               <th style="padding:3px 5px;text-align:center">Window</th>
               <th style="padding:3px 5px;text-align:right">Vol m³</th>
               <th style="padding:3px 5px;text-align:right">Wt kg</th>
-            </tr>
+            <tr>
           </thead>
           <tbody>
             ${r.stops.map((s, i) => {
