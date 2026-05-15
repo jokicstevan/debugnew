@@ -3041,7 +3041,7 @@ def _do_optimize(data, user):
     for vr in vehicle_routes:
         _save_route_to_db_async({
             "route_date":        str(date.today()),
-            "saved_by":          session.get("user", "unknown"),
+            "saved_by":          user,
             "algorithm":         algorithm,
             "matrix_source":     matrix_source,
             "fuel_price_rsd_l":  fuel_price_rsd_l,
