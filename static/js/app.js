@@ -1039,13 +1039,107 @@ function updateConstraintHint() {
   }
 }
 
-// ─── HELPER: compute visual offset for a vehicle (pixels) ───────────────────
-function getOffsetForVehicle(vehicleId, totalVehicles) {
-  // Symmetric offsets: centre line = 0, step = 6 pixels
-  // Example: 3 vehicles → offsets: -6, 0, +6
-  const step = 6;
-  const center = (totalVehicles - 1) / 2;
-  return (vehicleId - center) * step;
+// ─── SHARED-SEGMENT DETECTION + GEOGRAPHIC PARALLEL-OFFSET ──────────────────
+//
+// Strategy: detect which road segments are used by more than one vehicle,
+// then draw only those segments offset sideways (in real-world metres).
+// Non-shared segments are drawn centred on the road with offset = 0.
+//
+// This completely replaces leaflet-polylineoffset, which produced
+// spike / loop artefacts at low zoom levels because its miter-join
+// math can produce intersections far from the actual corner point.
+
+/** Round a coordinate to 4 d.p. (≈ 11 m), used for segment-key hashing. */
+function _roundC(v) { return Math.round(v * 1e4) / 1e4; }
+
+/**
+ * Canonical (direction-independent) key for the segment p1→p2.
+ * p1, p2 are [lat, lng] pairs.
+ */
+function _segKey(p1, p2) {
+  const a = `${_roundC(p1[0])},${_roundC(p1[1])}`;
+  const b = `${_roundC(p2[0])},${_roundC(p2[1])}`;
+  return a <= b ? `${a}|${b}` : `${b}|${a}`;
+}
+
+/**
+ * Build a map  segKey → sorted [vehicle_id, …]  for every segment
+ * that is traversed by more than one vehicle.
+ */
+function findSharedSegments(vehicleRoutes) {
+  const segMap = {};
+  vehicleRoutes.forEach(vr => {
+    const pts = (vr.geometry || []).map(([lng, lat]) => [lat, lng]);
+    for (let i = 0; i < pts.length - 1; i++) {
+      const k = _segKey(pts[i], pts[i + 1]);
+      if (!segMap[k]) segMap[k] = new Set();
+      segMap[k].add(vr.vehicle_id);
+    }
+  });
+  const result = {};
+  for (const [k, s] of Object.entries(segMap)) {
+    if (s.size > 1) result[k] = [...s].sort((a, b) => a - b);
+  }
+  return result;
+}
+
+/**
+ * Offset a polyline perpendicularly by `meters` to the right of travel.
+ * Positive meters → right side, negative → left side, 0 → unchanged.
+ *
+ * Uses geographic math (lat/lng space with cos-lat longitude scaling)
+ * and a clamped miter join at interior vertices.  Because the offset is
+ * computed analytically in degree-space, there are NO loop/spike artefacts
+ * at any zoom level.
+ */
+function offsetPolylineGeo(pts, meters) {
+  if (!meters || pts.length < 2) return pts;
+  const n = pts.length;
+
+  // Unit direction vectors for each segment, in "flat" space:
+  //   east-component  = Δlng × cos(lat)   north-component = Δlat
+  const dirs = [];
+  for (let i = 0; i < n - 1; i++) {
+    const midLat = (pts[i][0] + pts[i + 1][0]) / 2;
+    const cosLat = Math.cos(midLat * Math.PI / 180);
+    const dx = (pts[i + 1][1] - pts[i][1]) * cosLat;   // east
+    const dy =  pts[i + 1][0] - pts[i][0];              // north
+    const len = Math.hypot(dx, dy) || 1e-10;
+    dirs.push([dx / len, dy / len]);
+  }
+
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    // Right-perpendicular of direction [dx,dy] is [dy, -dx].
+    let rx, ry;
+
+    if (i === 0) {
+      rx =  dirs[0][1]; ry = -dirs[0][0];
+    } else if (i === n - 1) {
+      rx =  dirs[n - 2][1]; ry = -dirs[n - 2][0];
+    } else {
+      // Miter join: average the right-perp vectors of the two adjacent
+      // segments, then scale so the result stays the correct distance away.
+      const r1x =  dirs[i - 1][1], r1y = -dirs[i - 1][0];
+      const r2x =  dirs[i][1],     r2y = -dirs[i][0];
+      const mx = r1x + r2x, my = r1y + r2y;
+      const mlen = Math.hypot(mx, my) || 1e-10;
+      // miter scale = 1/cos(half-angle) = 2/(1+dot).  Clamp to 3× to
+      // prevent extreme spikes at near-180° turns.
+      const dot   = r1x * r2x + r1y * r2y;
+      const scale = Math.min(2 / Math.max(1 + dot, 0.1), 3);
+      rx = (mx / mlen) * scale;
+      ry = (my / mlen) * scale;
+    }
+
+    const lat    = pts[i][0], lng = pts[i][1];
+    const cosLat = Math.cos(lat * Math.PI / 180);
+    out.push([
+      lat + ry * meters / 111320,
+      lng + rx * meters / (111320 * cosLat),
+    ]);
+  }
+  return out;
 }
 
 // ─── OPTIMIZATION ────────────────────────────────────────────────────────────
@@ -1204,32 +1298,69 @@ function drawRoutes(data) {
     st.style.color = '#e74c3c';
   }
 
-  const totalVehicles = data.vehicle_routes.length;
+  // ── Find segments shared by multiple vehicles (done once, outside the loop)
+  const sharedSegs = findSharedSegments(data.vehicle_routes);
+  const OFFSET_M   = 5; // metres of lateral separation per lane
+
   data.vehicle_routes.forEach(vr => {
     if (!vr.geometry || vr.geometry.length < 2) return;
     const latlngs = vr.geometry.map(([lng, lat]) => [lat, lng]);
-    const offsetPx = getOffsetForVehicle(vr.vehicle_id, totalVehicles);
-    
-    // First draw a white outline (thicker, same offset) to improve contrast
-    L.polyline(latlngs, {
-      color: '#ffffff',
-      weight: 6,
-      opacity: 0.5,
-      smoothFactor: 1,
-      offset: offsetPx,
-      interactive: false
-    }).addTo(map);
-    
-    // Then the coloured line on top
-    const layer = L.polyline(latlngs, {
-      color: vr.color,
-      weight: 4,
-      opacity: 0.85,
-      smoothFactor: 1,
-      offset: offsetPx
-    }).addTo(map);
-    
-    state.routeLayers[vr.vehicle_id] = layer;
+
+    // ── Per-segment offset in metres ──────────────────────────────────────
+    // Non-shared segment → 0 m (centred on the road).
+    // Shared segment     → symmetric ±N m based on this vehicle's rank among
+    //                       all vehicles that traverse this segment.
+    const segOffsets = [];
+    for (let i = 0; i < latlngs.length - 1; i++) {
+      const k    = _segKey(latlngs[i], latlngs[i + 1]);
+      const vids = sharedSegs[k];
+      if (vids && vids.length > 1) {
+        const rank   = vids.indexOf(vr.vehicle_id);
+        const center = (vids.length - 1) / 2;
+        segOffsets.push((rank - center) * OFFSET_M);
+      } else {
+        segOffsets.push(0);
+      }
+    }
+
+    // ── Group consecutive segments with the same offset into "runs" ────────
+    // Each run is drawn as a single geographically offset polyline so the
+    // line is perfectly smooth within a shared stretch.
+    const runs = [];
+    let rs = 0;
+    for (let i = 1; i < segOffsets.length; i++) {
+      if (segOffsets[i] !== segOffsets[i - 1]) {
+        runs.push({ start: rs, end: i, m: segOffsets[rs] });
+        rs = i;
+      }
+    }
+    runs.push({ start: rs, end: segOffsets.length, m: segOffsets[rs] });
+
+    // ── Draw each run as an offset polyline ───────────────────────────────
+    // Store all sub-layers in a feature group so toggle/fit-bounds still work.
+    const group = L.featureGroup();
+
+    runs.forEach(run => {
+      // slice gives points [start … end] inclusive (end+1 because last segment
+      // closes at index end, which is latlngs[end])
+      const raw = latlngs.slice(run.start, run.end + 1);
+      const pts = offsetPolylineGeo(raw, run.m);
+
+      // White outline for contrast
+      L.polyline(pts, {
+        color: '#ffffff', weight: 6, opacity: 0.5,
+        smoothFactor: 1, interactive: false,
+      }).addTo(group);
+
+      // Coloured line on top
+      L.polyline(pts, {
+        color: vr.color, weight: 4, opacity: 0.85,
+        smoothFactor: 1,
+      }).addTo(group);
+    });
+
+    group.addTo(map);
+    state.routeLayers[vr.vehicle_id] = group;
     state.vehicleVisible[vr.vehicle_id] = true;
 
     // Update each customer marker: popup with schedule + dot colour = vehicle colour
@@ -1626,27 +1757,24 @@ async function captureVehicleMap(vr, vehicleIdx, totalVehicles) {
     maxZoom: 19, crossOrigin: true,
   }).addTo(vMap);
 
-  // 3. Route polyline with side‑by‑side offset (add white outline for PDF as well)
+  // 3. Route polyline — no offset needed (this is a per-vehicle map showing only one route)
   const latlngs = vr.geometry.map(([lng, lat]) => [lat, lng]);
-  const offsetPx = getOffsetForVehicle(vehicleIdx, totalVehicles);
-  
+
   // White outline (thicker)
   L.polyline(latlngs, {
     color: '#ffffff',
     weight: 7,
     opacity: 0.6,
     smoothFactor: 1,
-    offset: offsetPx,
     interactive: false
   }).addTo(vMap);
-  
+
   // Coloured line
   L.polyline(latlngs, {
     color: vr.color,
     weight: 5,
     opacity: 0.9,
     smoothFactor: 1,
-    offset: offsetPx
   }).addTo(vMap);
 
   // 4. Depot marker
