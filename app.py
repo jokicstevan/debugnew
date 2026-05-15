@@ -727,6 +727,11 @@ def import_excel():
             else:
                 return jsonify({"ok": False, "error": "Missing columns: Packages#1 / Packages#2 / Packages#3"})
 
+        # Optional lat/lng columns — accepted as 'lat'/'lng', 'latitude'/'longitude'
+        lat_col = next((k for k in ["lat", "latitude"] if k in hmap), None)
+        lng_col = next((k for k in ["lng", "longitude"] if k in hmap), None)
+        has_coords = lat_col and lng_col
+
         import re
         parsed, errors = [], []
         for rn, row in enumerate(rows_iter, 2):
@@ -754,10 +759,32 @@ def import_excel():
                 unloading = max(1, int(float(g("unloading") or SERVICE_TIME))) if "unloading" in hmap else SERVICE_TIME
             except Exception:
                 unloading = SERVICE_TIME
-            parsed.append({"name": name, "address": addr,
-                           "pkg_counts": pkg_counts,
-                           "unloading_time": unloading,
-                           "time_window": tw})
+
+            # Parse lat/lng if columns are present and values are valid numbers
+            row_lat = row_lng = None
+            if has_coords:
+                try:
+                    raw_lat = g(lat_col)
+                    raw_lng = g(lng_col)
+                    if raw_lat and raw_lng:
+                        row_lat = float(raw_lat)
+                        row_lng = float(raw_lng)
+                        # Sanity-check: valid geographic range
+                        if not (-90 <= row_lat <= 90 and -180 <= row_lng <= 180):
+                            errors.append(f"Row {rn}: lat/lng out of range ({row_lat}, {row_lng}) — will geocode from address")
+                            row_lat = row_lng = None
+                except (ValueError, TypeError):
+                    errors.append(f"Row {rn}: invalid lat/lng values — will geocode from address")
+                    row_lat = row_lng = None
+
+            entry = {"name": name, "address": addr,
+                     "pkg_counts": pkg_counts,
+                     "unloading_time": unloading,
+                     "time_window": tw}
+            if row_lat is not None:
+                entry["lat"] = row_lat
+                entry["lng"] = row_lng
+            parsed.append(entry)
         return jsonify({"ok": True, "rows": parsed, "errors": errors})
     except ImportError:
         return jsonify({"ok": False, "error": "openpyxl not installed"})

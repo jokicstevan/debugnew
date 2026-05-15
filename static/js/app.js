@@ -778,12 +778,19 @@ async function importExcel(input) {
 }
 
 function showExcelPreview(rows) {
-  let th = '<tr><th>#</th><th>Customer</th><th>Address</th><th>Pkg#1</th><th>Pkg#2</th><th>Pkg#3</th><th>Vol (m³)</th><th>Unload (min)</th><th>Time</th></tr>';
+  const hasCoords = rows.some(r => r.lat != null);
+  let th = `<tr><th>#</th><th>Customer</th><th>Address</th>${hasCoords ? '<th>Lat/Lng</th>' : ''}<th>Pkg#1</th><th>Pkg#2</th><th>Pkg#3</th><th>Vol (m³)</th><th>Unload (min)</th><th>Time</th></tr>`;
   let td = rows.map((r,i) => {
     const pc = r.pkg_counts || [r.packages||0, 0, 0];
     const vol = calcVolume(pc).toFixed(2);
+    const coordCell = hasCoords
+      ? `<td style="font-size:10px;color:${r.lat != null ? 'var(--accent)' : 'var(--muted)'}">
+           ${r.lat != null ? `✓ ${r.lat.toFixed(4)}, ${r.lng.toFixed(4)}` : '⟳ geocode'}
+         </td>`
+      : '';
     return `<tr>
       <td>${i+1}</td><td>${esc(r.name)}</td><td>${esc(r.address)}</td>
+      ${coordCell}
       <td>${pc[0]}</td><td>${pc[1]}</td><td>${pc[2]}</td><td>${vol}</td>
       <td>${r.unloading_time ?? 10}</td>
       <td>${r.time_window.start}–${r.time_window.end}</td>
@@ -824,6 +831,15 @@ async function confirmExcelImport() {
   let importedCount = 0;
   for (let i=0; i<rows.length; i++) {
     const r = rows[i];
+    // If lat/lng already supplied in the Excel file, use them directly — no geocoding needed
+    if (r.lat != null && r.lng != null) {
+      st.textContent = t('geocodingProgress')(i, rows.length, r.name) + ' (coords ✓)';
+      const pc = r.pkg_counts || [r.packages||1, 0, 0];
+      placeCustomer(r.lat, r.lng, r.name, pc, r.time_window, r.unloading_time || 10);
+      importedCount++;
+      continue;
+    }
+    // Otherwise geocode from address as before
     st.textContent = t('geocodingProgress')(i, rows.length, r.name);
     try {
       const res = await fetch('/api/geocode', {
