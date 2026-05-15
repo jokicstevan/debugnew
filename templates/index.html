@@ -9,7 +9,6 @@
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
 <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}">
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-<script src="https://unpkg.com/leaflet-polylineoffset/leaflet.polylineoffset.js"></script>
 <style>
 .lang-switcher { display:flex; gap:4px; align-items:center; }
 .lang-btn {
@@ -229,9 +228,9 @@
                  title="Routes that interleave closer than this distance (km) are penalised. Increase for country-wide deliveries.">
         </div>
         <div class="field-row">
-          <label data-i18n="overlapWeightLabel">Overlap penalty (RSD/shared km)</label>
+          <label data-i18n="overlapWeightLabel">Overlap weight (RSD)</label>
           <input type="number" id="adv-overlap-weight" value="500" min="0" max="50000" step="50"
-                 title="RSD penalty per shared km of road between any two routes. The total penalty is proportional to the total overlapping distance — higher values push the solver to keep vehicle zones separate.">
+                 title="RSD penalty per km-under-threshold (quadratic). Higher values push the solver to separate vehicle zones more aggressively.">
         </div>
 
         <div style="border-top:1px solid var(--border2);margin:8px 0 4px;padding-top:6px;font-size:10px;color:var(--muted);letter-spacing:.05em;text-transform:uppercase" data-i18n="solverPenaltiesTitle">⚖️ Solver Penalties</div>
@@ -249,18 +248,6 @@
           <label data-i18n="alnsCoolingLabel">ALNS cooling rate</label>
           <input type="number" id="adv-alns-cooling" value="0.995" min="0.900" max="0.9999" step="0.001"
                  title="Simulated annealing cooling rate per iteration. Closer to 1 = slower cooling = more exploration.">
-        </div>
-
-        <div style="border-top:1px solid var(--border2);margin:8px 0 4px;padding-top:6px;font-size:10px;color:var(--muted);letter-spacing:.05em;text-transform:uppercase" data-i18n="histBlendTitle">🕑 Historical Traffic Blending</div>
-        <div class="field-row">
-          <label data-i18n="depTimeLabel">Planned departure time</label>
-          <input type="time" id="adv-dep-time" value=""
-                 title="Planned departure time (HH:MM). Required for historical traffic blending. Leave blank to use live traffic only.">
-        </div>
-        <div class="field-row">
-          <label data-i18n="histBlendWeightLabel">Blend weight (0 = live, 1 = historical)</label>
-          <input type="number" id="adv-hist-blend-weight" value="0.5" min="0" max="1" step="0.05"
-                 title="How much historical average traffic data is blended into live travel times. 0 = live/OSRM only; 1 = historical cache only; 0.5 = equal blend. Requires a departure time and cached traffic data.">
         </div>
 
         <div id="adv-hint" style="font-size:9px;color:var(--muted);padding:4px 6px;background:var(--bg3);border-radius:4px;margin-top:4px;font-style:italic" data-i18n="advancedParamsNote">
