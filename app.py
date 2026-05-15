@@ -2420,511 +2420,606 @@ def optimize_alns(dist_mat, time_mat, n_depots, n_cust, tw, demands,
         )
 
 
+# ─────────────────────── OPTIMIZE JOB STORE ──────────────────────────────────
+#
+# Jobs are kept in a module-level dict so any worker thread can write results
+# while the HTTP thread polls.  Keys are UUID strings; values are dicts:
+#   { "status": "running"|"done"|"error",
+#     "result": <jsonify-able dict> | None,
+#     "error":  <str> | None,
+#     "user":   <str>,          ← owner, for optional access control
+#     "started": <float> }      ← time.time() at launch
+#
+# Completed jobs are pruned when they are older than JOB_TTL_SECONDS so memory
+# doesn't grow unboundedly on a long-running deployment.
+
+import uuid as _uuid
+
+_jobs: dict = {}
+_jobs_lock  = threading.Lock()
+JOB_TTL_SECONDS = 3600   # keep completed jobs for 1 hour
+
+
+def _prune_old_jobs():
+    """Remove completed/errored jobs older than JOB_TTL_SECONDS."""
+    now = time.time()
+    with _jobs_lock:
+        stale = [jid for jid, j in _jobs.items()
+                 if j["status"] != "running" and now - j["started"] > JOB_TTL_SECONDS]
+        for jid in stale:
+            del _jobs[jid]
+
+
 # ─────────────────────── OPTIMIZE ENDPOINT ───────────────────────────────────
 
 @app.route("/api/optimize", methods=["POST"])
 @login_required
 def optimize():
-    try:
-        data = request.json
-        if not data:
-            return jsonify({"ok": False, "error": "No data received"})
+    """Accept an optimization request, launch it in a background thread, and
+    immediately return a job_id.  The client polls /api/optimize/status/<job_id>
+    until status == 'done' or 'error'.
+    """
+    data = request.json
+    if not data:
+        return jsonify({"ok": False, "error": "No data received"})
 
-        # Parse depots (list) with legacy single-depot fallback
-        depots_raw  = data.get("depots") or []
-        if not depots_raw and data.get("depot"):
-            depots_raw = [data["depot"]]
-        customers   = data.get("customers", [])
-        fleet_cfg   = data.get("fleet", [])
-        algorithm   = data.get("algorithm", "ALNS")
-        use_tw      = data.get("use_time_windows", False)
-        max_iter    = int(data.get("max_iterations", 300))
-        temperature = float(data.get("temperature", 150.0))
-        # Objective weights: which cost components to minimise.
-        # All flags default to False so that only the components explicitly
-        # sent by the frontend are active.  The fallback (fuel + wages) is
-        # only applied when the frontend sends nothing at all.
-        raw_ow      = data.get("obj_weights", {})
-        obj_weights = {
-            "fuel":     bool(raw_ow.get("fuel",     False)),
-            "wages":    bool(raw_ow.get("wages",    False)),
-            "distance": bool(raw_ow.get("distance", False)),
-            "vehicles": bool(raw_ow.get("vehicles", False)),
-            "overlap":  bool(raw_ow.get("overlap",  False)),
+    _prune_old_jobs()
+
+    job_id = str(_uuid.uuid4())
+    user   = session.get("user", "unknown")
+
+    with _jobs_lock:
+        _jobs[job_id] = {
+            "status":  "running",
+            "result":  None,
+            "error":   None,
+            "user":    user,
+            "started": time.time(),
         }
-        # Ensure at least one component is active
-        if not any(obj_weights.values()):
-            obj_weights["fuel"] = obj_weights["wages"] = True
-        # Cost parameters — user-editable, fall back to Serbia defaults
-        fuel_price_rsd_l      = float(data.get("fuel_price_rsd_l",  FUEL_PRICE_RSD_PER_LITRE))
-        driver_wage_rsd_h     = float(data.get("driver_wage_rsd_h", DRIVER_WAGE_RSD_PER_HOUR))
-        fuel_load_factor_pct  = float(data.get("fuel_load_factor_pct", FUEL_LOAD_FACTOR_PER_1000KG * 100))
-        fuel_load_factor      = fuel_load_factor_pct / 100.0   # convert % → fraction
-        # Hard constraint toggles
-        use_volume_cap = bool(data.get("use_volume_capacity", True))
-        use_weight_cap = bool(data.get("use_weight_capacity", True))
-        # ── Advanced solver parameters (user-tunable via the Advanced panel) ──
-        adv_params = data.get("advanced_params", {})
-        k_nearest            = int(adv_params.get("k_nearest",            K_NEAREST))
-        sentinel_factor      = float(adv_params.get("sentinel_factor",    SENTINEL_FACTOR))
-        overlap_threshold_km = float(adv_params.get("overlap_threshold_km", OVERLAP_THRESHOLD_KM))
-        overlap_weight_rsd   = float(adv_params.get("overlap_weight_rsd",   OVERLAP_WEIGHT_RSD))
-        dist_rsd_per_km      = float(adv_params.get("dist_rsd_per_km",      20.0))
-        tw_penalty_rsd       = float(adv_params.get("tw_penalty_rsd",       100.0))
-        alns_cooling         = float(adv_params.get("alns_cooling",         0.995))
-        hist_blend_weight    = float(adv_params.get("hist_blend_weight",    0.5))
-        hist_blend_weight    = max(0.0, min(1.0, hist_blend_weight))  # clamp to [0, 1]
 
-        if not depots_raw:
-            return jsonify({"ok": False, "error": "No depot provided"})
-        if not customers:
-            return jsonify({"ok": False, "error": "No customers provided"})
+    def _run():
+        try:
+            result = _do_optimize(data, user)
+            with _jobs_lock:
+                _jobs[job_id]["status"] = "done"
+                _jobs[job_id]["result"] = result
+        except Exception as exc:
+            import traceback
+            tb = traceback.format_exc()
+            print(f"[optimize job {job_id}] EXCEPTION: {exc}\n{tb}")
+            with _jobs_lock:
+                _jobs[job_id]["status"] = "error"
+                _jobs[job_id]["error"]  = str(exc)
 
-        depots   = depots_raw
-        n_depots = len(depots)
-        n_cust   = len(customers)
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"ok": True, "job_id": job_id})
 
-        # Serbia validation
-        outside = []
-        for i, dep in enumerate(depots):
-            if not in_serbia(dep["lat"], dep["lng"]):
-                outside.append(dep.get("name", f"Depot {i+1}"))
-        for c in customers:
-            if not in_serbia(c["lat"], c["lng"]):
-                outside.append(c.get("name", "Customer"))
-        if outside:
-            return jsonify({"ok": False,
-                "error": f"Outside Serbia: {', '.join(outside[:5])}."})
 
-        # all_locs for matrix: [depots, original customers] (unique locations)
-        # After split-delivery expansion we remap sub-order matrix indices
-        # to the corresponding original customer row — no extra matrix rows needed.
-        all_locs_orig = depots + customers
+@app.route("/api/optimize/status/<job_id>", methods=["GET"])
+@login_required
+def optimize_status(job_id):
+    """Poll endpoint.  Returns:
+      { ok, status: 'running' }                   — still computing
+      { ok, status: 'done', result: { … } }       — finished, result is the
+                                                     same payload the old
+                                                     synchronous endpoint returned
+      { ok: false, status: 'error', error: '…' }  — job failed
+      404 if job_id is unknown (expired or invalid)
+    """
+    with _jobs_lock:
+        job = _jobs.get(job_id)
 
-        # Parse planned departure time for historical traffic blending.
-        # Frontend sends e.g. "08:00"; convert to minutes-since-midnight.
-        departure_time_str = data.get("departure_time", "")
-        departure_min = None
-        if departure_time_str:
+    if job is None:
+        return jsonify({"ok": False, "error": "Job not found or expired"}), 404
+
+    if job["status"] == "running":
+        return jsonify({"ok": True, "status": "running"})
+
+    if job["status"] == "error":
+        return jsonify({"ok": False, "status": "error", "error": job["error"]})
+
+    # done
+    return jsonify({"ok": True, "status": "done", "result": job["result"]})
+
+
+def _do_optimize(data, user):
+    """The original synchronous optimization logic, now called from a thread.
+    Returns the dict that would previously have been passed to jsonify().
+    Raises on error (the caller catches and stores in the job store).
+    """
+    if not data:
+        raise ValueError("No data received")
+
+    # Parse depots (list) with legacy single-depot fallback
+    depots_raw  = data.get("depots") or []
+    if not depots_raw and data.get("depot"):
+        depots_raw = [data["depot"]]
+    customers   = data.get("customers", [])
+    fleet_cfg   = data.get("fleet", [])
+    algorithm   = data.get("algorithm", "ALNS")
+    use_tw      = data.get("use_time_windows", False)
+    max_iter    = int(data.get("max_iterations", 300))
+    temperature = float(data.get("temperature", 150.0))
+    # Objective weights: which cost components to minimise.
+    # All flags default to False so that only the components explicitly
+    # sent by the frontend are active.  The fallback (fuel + wages) is
+    # only applied when the frontend sends nothing at all.
+    raw_ow      = data.get("obj_weights", {})
+    obj_weights = {
+        "fuel":     bool(raw_ow.get("fuel",     False)),
+        "wages":    bool(raw_ow.get("wages",    False)),
+        "distance": bool(raw_ow.get("distance", False)),
+        "vehicles": bool(raw_ow.get("vehicles", False)),
+        "overlap":  bool(raw_ow.get("overlap",  False)),
+    }
+    # Ensure at least one component is active
+    if not any(obj_weights.values()):
+        obj_weights["fuel"] = obj_weights["wages"] = True
+    # Cost parameters — user-editable, fall back to Serbia defaults
+    fuel_price_rsd_l      = float(data.get("fuel_price_rsd_l",  FUEL_PRICE_RSD_PER_LITRE))
+    driver_wage_rsd_h     = float(data.get("driver_wage_rsd_h", DRIVER_WAGE_RSD_PER_HOUR))
+    fuel_load_factor_pct  = float(data.get("fuel_load_factor_pct", FUEL_LOAD_FACTOR_PER_1000KG * 100))
+    fuel_load_factor      = fuel_load_factor_pct / 100.0   # convert % → fraction
+    # Hard constraint toggles
+    use_volume_cap = bool(data.get("use_volume_capacity", True))
+    use_weight_cap = bool(data.get("use_weight_capacity", True))
+    # ── Advanced solver parameters (user-tunable via the Advanced panel) ──
+    adv_params = data.get("advanced_params", {})
+    k_nearest            = int(adv_params.get("k_nearest",            K_NEAREST))
+    sentinel_factor      = float(adv_params.get("sentinel_factor",    SENTINEL_FACTOR))
+    overlap_threshold_km = float(adv_params.get("overlap_threshold_km", OVERLAP_THRESHOLD_KM))
+    overlap_weight_rsd   = float(adv_params.get("overlap_weight_rsd",   OVERLAP_WEIGHT_RSD))
+    dist_rsd_per_km      = float(adv_params.get("dist_rsd_per_km",      20.0))
+    tw_penalty_rsd       = float(adv_params.get("tw_penalty_rsd",       100.0))
+    alns_cooling         = float(adv_params.get("alns_cooling",         0.995))
+    hist_blend_weight    = float(adv_params.get("hist_blend_weight",    0.5))
+    hist_blend_weight    = max(0.0, min(1.0, hist_blend_weight))  # clamp to [0, 1]
+
+    if not depots_raw:
+        raise ValueError("No depot provided")
+    if not customers:
+        raise ValueError("No customers provided")
+
+    depots   = depots_raw
+    n_depots = len(depots)
+    n_cust   = len(customers)
+
+    # Serbia validation
+    outside = []
+    for i, dep in enumerate(depots):
+        if not in_serbia(dep["lat"], dep["lng"]):
+            outside.append(dep.get("name", f"Depot {i+1}"))
+    for c in customers:
+        if not in_serbia(c["lat"], c["lng"]):
+            outside.append(c.get("name", "Customer"))
+    if outside:
+        raise ValueError(f"Outside Serbia: {', '.join(outside[:5])}.")
+
+    # all_locs for matrix: [depots, original customers] (unique locations)
+    # After split-delivery expansion we remap sub-order matrix indices
+    # to the corresponding original customer row — no extra matrix rows needed.
+    all_locs_orig = depots + customers
+
+    # Parse planned departure time for historical traffic blending.
+    # Frontend sends e.g. "08:00"; convert to minutes-since-midnight.
+    departure_time_str = data.get("departure_time", "")
+    departure_min = None
+    if departure_time_str:
+        try:
+            dh, dm = map(int, departure_time_str.split(":"))
+            departure_min = dh * 60 + dm
+        except Exception:
+            departure_min = None
+
+    # Phase 1: distance/time matrix — HERE (live traffic) → OSRM → haversine
+    # Pass departure_min so the time matrix is blended with historical averages.
+    dist_mat, time_mat, matrix_source = fetch_best_matrix(
+        all_locs_orig, k_nearest=k_nearest, sentinel_factor=sentinel_factor,
+        departure_min=departure_min, hist_blend_weight=hist_blend_weight)
+
+    # Fire off background pre-fetch of historical traffic for this set of
+    # locations so future optimisation runs have richer cache data.
+    if HERE_API_KEY and DATABASE_URL:
+        _, pairs_for_prefetch = build_api_pairs(all_locs_orig, k=k_nearest or K_NEAREST)
+        prefetch_traffic_history(all_locs_orig, pairs_for_prefetch)
+
+    # Temporary tw / all_locs for demand calculations below
+    all_locs = all_locs_orig
+
+    # Package type sizes (m³) passed from the frontend
+    pkg_sizes = data.get("pkg_sizes", [0.10, 0.30, 0.60])
+    while len(pkg_sizes) < 3:
+        pkg_sizes.append(0.10)
+
+    # demands[i] = total volume (m³) for customer i (0-based)
+    # Each customer carries pkg_counts[0..2] packages of each type
+    def customer_volume(c):
+        counts = c.get("pkg_counts", [0, 0, 0])
+        while len(counts) < 3:
+            counts.append(0)
+        return sum(counts[j] * pkg_sizes[j] for j in range(3))
+
+    demands = [max(0.0, customer_volume(c)) for c in customers]
+
+    # Package type weights (kg) — passed from frontend or use defaults
+    pkg_weights_kg = data.get("pkg_weights_kg", DEFAULT_PKG_WEIGHTS_KG)
+    while len(pkg_weights_kg) < 3:
+        pkg_weights_kg.append(DEFAULT_PKG_WEIGHTS_KG[len(pkg_weights_kg)])
+
+    def customer_weight(c):
+        counts = c.get("pkg_counts", [0, 0, 0])
+        while len(counts) < 3:
+            counts.append(0)
+        return sum(counts[j] * pkg_weights_kg[j] for j in range(3))
+
+    demands_kg = [max(0.0, customer_weight(c)) for c in customers]
+
+    # Per-customer unloading times: {matrix_index: minutes}
+    svc_map_orig = {}
+    for i, c in enumerate(customers):
+        ut = c.get("unloading_time", SERVICE_TIME)
+        try:
+            ut = max(1, int(float(ut)))
+        except Exception:
+            ut = SERVICE_TIME
+        svc_map_orig[n_depots + i] = ut
+
+    # ── Split-delivery expansion ──────────────────────────────────────────
+    # Each customer whose demand exceeds any single vehicle capacity is split
+    # into n_splits sub-orders with equal partial demand, all at the same
+    # physical location.  The solver treats sub-orders as independent stops.
+    #
+    # sub_to_orig[sub_i]  = original customer index (0-based)
+    # orig_to_mat[orig_i] = original matrix row for customer orig_i
+    #                       = n_depots + orig_i  (in the n+m matrix)
+    #
+    # We build an *expanded* dist/time matrix:
+    #   rows 0 .. n_depots-1           → depots  (unchanged)
+    #   rows n_depots .. n_depots+S-1  → sub-orders (copy of original row)
+    # where S = total number of sub-orders (≥ n_orig_cust).
+
+    max_vol_cap = max(
+        (float(v.get("volume_capacity", v.get("capacity", 9999))) for v in fleet_cfg),
+        default=9999.0)
+    max_wt_cap = max(
+        (float(v.get("weight_capacity", 0)) or float("inf") for v in fleet_cfg),
+        default=float("inf"))
+
+    orig_customers = customers          # keep original list for response
+    n_orig_cust    = len(customers)
+
+    sub_to_orig  = []   # sub_i → original customer index
+    exp_demands  = []   # volume per sub-order
+    exp_demands_kg = [] # weight per sub-order
+    exp_locs     = []   # loc dict per sub-order (same as original)
+
+    for orig_i, c in enumerate(customers):
+        vol = demands[orig_i]
+        wt  = demands_kg[orig_i]
+
+        # Number of sub-orders: driven by whichever constraint is tighter
+        n_splits = 1
+        if use_volume_cap and max_vol_cap < 9990 and vol > max_vol_cap + 1e-9:
+            n_splits = max(n_splits,
+                           int(vol / max_vol_cap) + (1 if vol % max_vol_cap > 1e-9 else 0))
+        if use_weight_cap and max_wt_cap < float("inf") and wt > max_wt_cap + 1e-9:
+            n_splits = max(n_splits,
+                           int(wt / max_wt_cap) + (1 if wt % max_wt_cap > 1e-9 else 0))
+
+        for _ in range(n_splits):
+            sub_to_orig.append(orig_i)
+            exp_demands.append(round(vol / n_splits, 6))
+            exp_demands_kg.append(round(wt  / n_splits, 6))
+            exp_locs.append(c)
+
+    n_sub = len(sub_to_orig)   # total sub-orders (≥ n_orig_cust)
+
+    # Build expanded matrix: copy rows/cols from original customer rows
+    # New size: (n_depots + n_sub) × (n_depots + n_sub)
+    orig_size = n_depots + n_orig_cust
+    exp_size  = n_depots + n_sub
+
+    def _expand_matrix(mat):
+        # mat is orig_size × orig_size
+        # new_mat is exp_size × exp_size
+        new_mat = [[0.0] * exp_size for _ in range(exp_size)]
+        for r in range(exp_size):
+            orig_r = r if r < n_depots else n_depots + sub_to_orig[r - n_depots]
+            for c_col in range(exp_size):
+                orig_c = c_col if c_col < n_depots else n_depots + sub_to_orig[c_col - n_depots]
+                new_mat[r][c_col] = mat[orig_r][orig_c]
+        return new_mat
+
+    dist_mat  = _expand_matrix(dist_mat)
+    time_mat  = _expand_matrix(time_mat)
+
+    # all_locs now maps to the expanded matrix rows
+    all_locs   = depots + exp_locs
+    n_cust     = n_sub
+    demands    = exp_demands
+    demands_kg = exp_demands_kg
+
+    # Rebuild tw for expanded all_locs
+    if use_tw:
+        tw = []
+        for loc in all_locs:
+            t = loc.get("time_window", {"start": "09:00", "end": "17:00"})
             try:
-                dh, dm = map(int, departure_time_str.split(":"))
-                departure_min = dh * 60 + dm
+                sh, sm = map(int, t["start"].split(":"))
+                eh, em = map(int, t["end"].split(":"))
             except Exception:
-                departure_min = None
+                sh, sm, eh, em = 9, 0, 17, 0
+            tw.append((sh*60+sm, eh*60+em))
+        for d in range(n_depots):
+            tw[d] = (6*60, 12*60)
+    else:
+        tw = [(6*60, 12*60)] * n_depots + [(540, 1020)] * n_cust
 
-        # Phase 1: distance/time matrix — HERE (live traffic) → OSRM → haversine
-        # Pass departure_min so the time matrix is blended with historical averages.
-        dist_mat, time_mat, matrix_source = fetch_best_matrix(
-            all_locs_orig, k_nearest=k_nearest, sentinel_factor=sentinel_factor,
-            departure_min=departure_min, hist_blend_weight=hist_blend_weight)
+    # If a planned departure time was set, pin the depot TW to that exact
+    # minute.  This enforces the departure time in the solver whether or not
+    # customer time windows are active: latest_feasible_departure will find
+    # only one feasible starting point — the planned one.
+    if departure_min is not None:
+        for d in range(n_depots):
+            tw[d] = (departure_min, departure_min)
+        print(f"[optimize] depot departure pinned to {mins_to_hhmm(departure_min)}")
 
-        # Fire off background pre-fetch of historical traffic for this set of
-        # locations so future optimisation runs have richer cache data.
-        if HERE_API_KEY and DATABASE_URL:
-            _, pairs_for_prefetch = build_api_pairs(all_locs_orig, k=k_nearest or K_NEAREST)
-            prefetch_traffic_history(all_locs_orig, pairs_for_prefetch)
+    # svc_map for expanded sub-orders
+    svc_map = {}
+    for sub_i, orig_i in enumerate(sub_to_orig):
+        svc_map[n_depots + sub_i] = svc_map_orig.get(n_depots + orig_i, SERVICE_TIME)
 
-        # Temporary tw / all_locs for demand calculations below
-        all_locs = all_locs_orig
+    # Precompute part number for each sub-order (1-based within its original customer)
+    sub_part_num = {}
+    orig_counter = {}
+    for sub_i, orig_i in enumerate(sub_to_orig):
+        orig_counter[orig_i] = orig_counter.get(orig_i, 0) + 1
+        sub_part_num[sub_i] = orig_counter[orig_i]
 
-        # Package type sizes (m³) passed from the frontend
-        pkg_sizes = data.get("pkg_sizes", [0.10, 0.30, 0.60])
-        while len(pkg_sizes) < 3:
-            pkg_sizes.append(0.10)
+    # Expand fleet — capacity is now volumetric (m³)
+    vehicle_colors = ["#e74c3c","#3498db","#2ecc71","#f39c12",
+                      "#9b59b6","#1abc9c","#e67e22","#e84342"]
+    fleet = []
+    for veh in fleet_cfg:
+        for k in range(max(0, int(veh.get("count", 1)))):
+            fleet.append({
+                "type":             veh.get("name", "Vehicle"),
+                "capacity":         float(veh.get("volume_capacity", veh.get("capacity", 9999))),
+                "weight_capacity":  float(veh.get("weight_capacity", 0.0)),  # 0 = unlimited
+                "color":            veh.get("color", "#3b82f6"),
+                "fuel_consumption": float(veh.get("fuel_consumption", 10.0)),
+                "min_vol_pct":      float(veh.get("min_vol_pct", 0.0)),
+                "min_wt_pct":       float(veh.get("min_wt_pct",  0.0)),
+            })
+    if not fleet:
+        fleet = [{"type":"Vehicle","capacity":9999.0,"weight_capacity":0.0,
+                  "color":"#3b82f6","fuel_consumption":10.0}]
 
-        # demands[i] = total volume (m³) for customer i (0-based)
-        # Each customer carries pkg_counts[0..2] packages of each type
-        def customer_volume(c):
-            counts = c.get("pkg_counts", [0, 0, 0])
-            while len(counts) < 3:
-                counts.append(0)
-            return sum(counts[j] * pkg_sizes[j] for j in range(3))
+    print(f"[optimize] {algorithm} depots={n_depots} custs={n_cust} "
+          f"vehicles={len(fleet)} matrix={len(dist_mat)}x{len(dist_mat[0])} "
+          f"source={matrix_source}")
 
-        demands = [max(0.0, customer_volume(c)) for c in customers]
+    # Phase 2: run optimiser → VRPState
+    # no_wait: suppress idle waiting at stops so the route is a continuous
+    # drive.  Activated automatically whenever a departure time is set.
+    no_wait = departure_min is not None
 
-        # Package type weights (kg) — passed from frontend or use defaults
-        pkg_weights_kg = data.get("pkg_weights_kg", DEFAULT_PKG_WEIGHTS_KG)
-        while len(pkg_weights_kg) < 3:
-            pkg_weights_kg.append(DEFAULT_PKG_WEIGHTS_KG[len(pkg_weights_kg)])
+    adv_kwargs = dict(
+        overlap_threshold_km=overlap_threshold_km,
+        overlap_weight_rsd=overlap_weight_rsd,
+        dist_rsd_per_km=dist_rsd_per_km,
+        tw_penalty_rsd=tw_penalty_rsd,
+        no_wait=no_wait,
+    )
+    if "Nearest Neighbor" in algorithm:
+        state = optimize_nn(dist_mat, time_mat, n_depots, n_cust, tw, demands,
+                            use_tw=use_tw, svc_map=svc_map, demands_kg=demands_kg,
+                            obj_weights=obj_weights,
+                            use_volume_cap=use_volume_cap, use_weight_cap=use_weight_cap,
+                            fuel_price_rsd_l=fuel_price_rsd_l, driver_wage_rsd_h=driver_wage_rsd_h,
+                            fuel_load_factor=fuel_load_factor, **adv_kwargs)
+    elif "Model 2" in algorithm:
+        state = optimize_2opt(dist_mat, time_mat, n_depots, n_cust, tw, demands,
+                              use_tw=use_tw, svc_map=svc_map, demands_kg=demands_kg,
+                              obj_weights=obj_weights,
+                              use_volume_cap=use_volume_cap, use_weight_cap=use_weight_cap,
+                              fuel_price_rsd_l=fuel_price_rsd_l, driver_wage_rsd_h=driver_wage_rsd_h,
+                              fuel_load_factor=fuel_load_factor, **adv_kwargs)
+    else:
+        # Model 1 (ALNS multi-vehicle) — also the default
+        state = optimize_alns(dist_mat, time_mat, n_depots, n_cust, tw,
+                               demands, fleet, max_iter, temperature,
+                               use_tw=use_tw, svc_map=svc_map, demands_kg=demands_kg,
+                               obj_weights=obj_weights,
+                               use_volume_cap=use_volume_cap, use_weight_cap=use_weight_cap,
+                               fuel_price_rsd_l=fuel_price_rsd_l, driver_wage_rsd_h=driver_wage_rsd_h,
+                               fuel_load_factor=fuel_load_factor,
+                               alns_cooling=alns_cooling, **adv_kwargs)
 
-        def customer_weight(c):
-            counts = c.get("pkg_counts", [0, 0, 0])
-            while len(counts) < 3:
-                counts.append(0)
-            return sum(counts[j] * pkg_weights_kg[j] for j in range(3))
 
-        demands_kg = [max(0.0, customer_weight(c)) for c in customers]
+    total_dist = state.total_distance()
+    # total_time is computed AFTER vehicle_routes loop from actual working hours
+    # so we defer hours/mins until after the loop
 
-        # Per-customer unloading times: {matrix_index: minutes}
-        svc_map_orig = {}
-        for i, c in enumerate(customers):
-            ut = c.get("unloading_time", SERVICE_TIME)
-            try:
-                ut = max(1, int(float(ut)))
-            except Exception:
-                ut = SERVICE_TIME
-            svc_map_orig[n_depots + i] = ut
+    # Phase 3: geometry + build response
+    vehicle_routes  = []
+    real_total_dist = 0.0
 
-        # ── Split-delivery expansion ──────────────────────────────────────────
-        # Each customer whose demand exceeds any single vehicle capacity is split
-        # into n_splits sub-orders with equal partial demand, all at the same
-        # physical location.  The solver treats sub-orders as independent stops.
-        #
-        # sub_to_orig[sub_i]  = original customer index (0-based)
-        # orig_to_mat[orig_i] = original matrix row for customer orig_i
-        #                       = n_depots + orig_i  (in the n+m matrix)
-        #
-        # We build an *expanded* dist/time matrix:
-        #   rows 0 .. n_depots-1           → depots  (unchanged)
-        #   rows n_depots .. n_depots+S-1  → sub-orders (copy of original row)
-        # where S = total number of sub-orders (≥ n_orig_cust).
+    for v_idx, route in enumerate(state.routes):
+        if not route:
+            continue
 
-        max_vol_cap = max(
-            (float(v.get("volume_capacity", v.get("capacity", 9999))) for v in fleet_cfg),
-            default=9999.0)
-        max_wt_cap = max(
-            (float(v.get("weight_capacity", 0)) or float("inf") for v in fleet_cfg),
-            default=float("inf"))
+        depot_mat = state.depot_of[v_idx]   # matrix index of depot
+        dep_loc   = all_locs[depot_mat]
+        veh_cfg   = state.fleet[v_idx]
+        color     = vehicle_colors[v_idx % len(vehicle_colors)]
 
-        orig_customers = customers          # keep original list for response
-        n_orig_cust    = len(customers)
+        pts       = [dep_loc] + [all_locs[c] for c in route] + [dep_loc]
+        waypoints = [(p["lng"], p["lat"]) for p in pts]
+        geom, seg_dist, seg_dur, route_src = fetch_best_route(waypoints)
+        real_total_dist += seg_dist or 0
 
-        sub_to_orig  = []   # sub_i → original customer index
-        exp_demands  = []   # volume per sub-order
-        exp_demands_kg = [] # weight per sub-order
-        exp_locs     = []   # loc dict per sub-order (same as original)
+        # Optimal (latest feasible) departure for this driver
+        depart_min = latest_feasible_departure(
+            route, depot_mat, dist_mat, time_mat, tw, SERVICE_TIME, svc_map,
+            no_wait=no_wait)
 
-        for orig_i, c in enumerate(customers):
-            vol = demands[orig_i]
-            wt  = demands_kg[orig_i]
+        _, sched = route_time(route, depot_mat, dist_mat, time_mat, tw,
+                               SERVICE_TIME, depart_min, svc_map, no_wait=no_wait)
+        stops = []
+        for entry in sched:
+            cmat     = entry["customer_mat"]
+            loc      = all_locs[cmat]
+            t        = loc.get("time_window", {"start":"?","end":"?"})
+            sub_idx  = cmat - n_depots          # index into expanded sub-orders
+            orig_i   = sub_to_orig[sub_idx] if sub_idx < len(sub_to_orig) else sub_idx
+            orig_c   = orig_customers[orig_i] if orig_i < len(orig_customers) else {}
+            # Count how many sub-orders this original customer was split into
+            n_splits_for_cust = sub_to_orig.count(orig_i)
+            c_counts = orig_c.get("pkg_counts", [0, 0, 0])
+            while len(c_counts) < 3:
+                c_counts.append(0)
+            # Partial counts for this sub-order
+            split_counts = [round(cnt / n_splits_for_cust, 4) for cnt in c_counts]
+            c_volume = demands[sub_idx]   # already the partial volume
+            stops.append({
+                "name":         loc.get("name", ""),
+                "lat":          loc.get("lat"),
+                "lng":          loc.get("lng"),
+                "pkg_counts":   split_counts,
+                "volume":       round(c_volume, 3),
+                "arrival":      mins_to_hhmm(entry["arrival"]),
+                "depart":       mins_to_hhmm(entry["depart"]),
+                "wait":         int(entry.get("wait", 0)),
+                "violation":    int(entry.get("violation", 0)),
+                "tw_start":     t.get("start","?"),
+                "tw_end":       t.get("end","?"),
+                "service_time": entry.get("service_time", SERVICE_TIME),
+                "split":        n_splits_for_cust > 1,
+                "split_part":   sub_part_num.get(sub_idx) if n_splits_for_cust > 1 else None,
+                "split_total":  n_splits_for_cust if n_splits_for_cust > 1 else None,
+            })
 
-            # Number of sub-orders: driven by whichever constraint is tighter
-            n_splits = 1
-            if use_volume_cap and max_vol_cap < 9990 and vol > max_vol_cap + 1e-9:
-                n_splits = max(n_splits,
-                               int(vol / max_vol_cap) + (1 if vol % max_vol_cap > 1e-9 else 0))
-            if use_weight_cap and max_wt_cap < float("inf") and wt > max_wt_cap + 1e-9:
-                n_splits = max(n_splits,
-                               int(wt / max_wt_cap) + (1 if wt % max_wt_cap > 1e-9 else 0))
-
-            for _ in range(n_splits):
-                sub_to_orig.append(orig_i)
-                exp_demands.append(round(vol / n_splits, 6))
-                exp_demands_kg.append(round(wt  / n_splits, 6))
-                exp_locs.append(c)
-
-        n_sub = len(sub_to_orig)   # total sub-orders (≥ n_orig_cust)
-
-        # Build expanded matrix: copy rows/cols from original customer rows
-        # New size: (n_depots + n_sub) × (n_depots + n_sub)
-        orig_size = n_depots + n_orig_cust
-        exp_size  = n_depots + n_sub
-
-        def _expand_matrix(mat):
-            # mat is orig_size × orig_size
-            # new_mat is exp_size × exp_size
-            new_mat = [[0.0] * exp_size for _ in range(exp_size)]
-            for r in range(exp_size):
-                orig_r = r if r < n_depots else n_depots + sub_to_orig[r - n_depots]
-                for c_col in range(exp_size):
-                    orig_c = c_col if c_col < n_depots else n_depots + sub_to_orig[c_col - n_depots]
-                    new_mat[r][c_col] = mat[orig_r][orig_c]
-            return new_mat
-
-        dist_mat  = _expand_matrix(dist_mat)
-        time_mat  = _expand_matrix(time_mat)
-
-        # all_locs now maps to the expanded matrix rows
-        all_locs   = depots + exp_locs
-        n_cust     = n_sub
-        demands    = exp_demands
-        demands_kg = exp_demands_kg
-
-        # Rebuild tw for expanded all_locs
-        if use_tw:
-            tw = []
-            for loc in all_locs:
-                t = loc.get("time_window", {"start": "09:00", "end": "17:00"})
-                try:
-                    sh, sm = map(int, t["start"].split(":"))
-                    eh, em = map(int, t["end"].split(":"))
-                except Exception:
-                    sh, sm, eh, em = 9, 0, 17, 0
-                tw.append((sh*60+sm, eh*60+em))
-            for d in range(n_depots):
-                tw[d] = (6*60, 12*60)
-        else:
-            tw = [(6*60, 12*60)] * n_depots + [(540, 1020)] * n_cust
-
-        # If a planned departure time was set, pin the depot TW to that exact
-        # minute.  This enforces the departure time in the solver whether or not
-        # customer time windows are active: latest_feasible_departure will find
-        # only one feasible starting point — the planned one.
-        if departure_min is not None:
-            for d in range(n_depots):
-                tw[d] = (departure_min, departure_min)
-            print(f"[optimize] depot departure pinned to {mins_to_hhmm(departure_min)}")
-
-        # svc_map for expanded sub-orders
-        svc_map = {}
-        for sub_i, orig_i in enumerate(sub_to_orig):
-            svc_map[n_depots + sub_i] = svc_map_orig.get(n_depots + orig_i, SERVICE_TIME)
-
-        # Precompute part number for each sub-order (1-based within its original customer)
-        sub_part_num = {}
-        orig_counter = {}
-        for sub_i, orig_i in enumerate(sub_to_orig):
-            orig_counter[orig_i] = orig_counter.get(orig_i, 0) + 1
-            sub_part_num[sub_i] = orig_counter[orig_i]
-
-        # Expand fleet — capacity is now volumetric (m³)
-        vehicle_colors = ["#e74c3c","#3498db","#2ecc71","#f39c12",
-                          "#9b59b6","#1abc9c","#e67e22","#e84342"]
-        fleet = []
-        for veh in fleet_cfg:
-            for k in range(max(0, int(veh.get("count", 1)))):
-                fleet.append({
-                    "type":             veh.get("name", "Vehicle"),
-                    "capacity":         float(veh.get("volume_capacity", veh.get("capacity", 9999))),
-                    "weight_capacity":  float(veh.get("weight_capacity", 0.0)),  # 0 = unlimited
-                    "color":            veh.get("color", "#3b82f6"),
-                    "fuel_consumption": float(veh.get("fuel_consumption", 10.0)),
-                    "min_vol_pct":      float(veh.get("min_vol_pct", 0.0)),
-                    "min_wt_pct":       float(veh.get("min_wt_pct",  0.0)),
-                })
-        if not fleet:
-            fleet = [{"type":"Vehicle","capacity":9999.0,"weight_capacity":0.0,
-                      "color":"#3b82f6","fuel_consumption":10.0}]
-
-        print(f"[optimize] {algorithm} depots={n_depots} custs={n_cust} "
-              f"vehicles={len(fleet)} matrix={len(dist_mat)}x{len(dist_mat[0])} "
-              f"source={matrix_source}")
-
-        # Phase 2: run optimiser → VRPState
-        # no_wait: suppress idle waiting at stops so the route is a continuous
-        # drive.  Activated automatically whenever a departure time is set.
-        no_wait = departure_min is not None
-
-        adv_kwargs = dict(
-            overlap_threshold_km=overlap_threshold_km,
-            overlap_weight_rsd=overlap_weight_rsd,
-            dist_rsd_per_km=dist_rsd_per_km,
-            tw_penalty_rsd=tw_penalty_rsd,
-            no_wait=no_wait,
+        route_km    = (seg_dist if seg_dist
+                       else route_dist(route, depot_mat, dist_mat))
+        # Load-dependent fuel: calculated leg-by-leg as cargo is unloaded.
+        # route_weight_kg is total initial load (used for display only).
+        route_weight_kg = sum(
+            demands_kg[c - n_depots]
+            for c in route
+            if 0 <= (c - n_depots) < len(demands_kg)
         )
-        if "Nearest Neighbor" in algorithm:
-            state = optimize_nn(dist_mat, time_mat, n_depots, n_cust, tw, demands,
-                                use_tw=use_tw, svc_map=svc_map, demands_kg=demands_kg,
-                                obj_weights=obj_weights,
-                                use_volume_cap=use_volume_cap, use_weight_cap=use_weight_cap,
-                                fuel_price_rsd_l=fuel_price_rsd_l, driver_wage_rsd_h=driver_wage_rsd_h,
-                                fuel_load_factor=fuel_load_factor, **adv_kwargs)
-        elif "Model 2" in algorithm:
-            state = optimize_2opt(dist_mat, time_mat, n_depots, n_cust, tw, demands,
-                                  use_tw=use_tw, svc_map=svc_map, demands_kg=demands_kg,
-                                  obj_weights=obj_weights,
-                                  use_volume_cap=use_volume_cap, use_weight_cap=use_weight_cap,
-                                  fuel_price_rsd_l=fuel_price_rsd_l, driver_wage_rsd_h=driver_wage_rsd_h,
-                                  fuel_load_factor=fuel_load_factor, **adv_kwargs)
+        base_fuel       = veh_cfg.get("fuel_consumption", 10.0)
+        # Effective average L/100km (for display) — weight-average over the route
+        eff_fuel        = base_fuel * (1.0 + fuel_load_factor * (route_weight_kg / 2.0) / 1000.0)
+        fuel_l          = round(route_fuel_litres(
+            route, depot_mat, dist_mat,
+            demands_kg, n_depots,
+            lambda kg: base_fuel * (1.0 + fuel_load_factor * kg / 1000.0)
+        ), 2)
+        fuel_cost       = round(fuel_l * fuel_price_rsd_l, 0)
+        work_mins   = route_working_minutes(
+            route, depot_mat, dist_mat, time_mat, tw, SERVICE_TIME, depart_min,
+            svc_map, no_wait=no_wait)
+        work_h      = round(work_mins / 60.0, 2)
+        wage_cost   = round(work_h * driver_wage_rsd_h, 0)
+
+        # Return-to-depot time
+        if sched:
+            last_dep  = sched[-1]["depart"]
+            return_min = last_dep + time_mat[route[-1]][depot_mat]
         else:
-            # Model 1 (ALNS multi-vehicle) — also the default
-            state = optimize_alns(dist_mat, time_mat, n_depots, n_cust, tw,
-                                   demands, fleet, max_iter, temperature,
-                                   use_tw=use_tw, svc_map=svc_map, demands_kg=demands_kg,
-                                   obj_weights=obj_weights,
-                                   use_volume_cap=use_volume_cap, use_weight_cap=use_weight_cap,
-                                   fuel_price_rsd_l=fuel_price_rsd_l, driver_wage_rsd_h=driver_wage_rsd_h,
-                                   fuel_load_factor=fuel_load_factor,
-                                   alns_cooling=alns_cooling, **adv_kwargs)
+            return_min = depart_min
 
-
-        total_dist = state.total_distance()
-        # total_time is computed AFTER vehicle_routes loop from actual working hours
-        # so we defer hours/mins until after the loop
-
-        # Phase 3: geometry + build response
-        vehicle_routes  = []
-        real_total_dist = 0.0
-
-        for v_idx, route in enumerate(state.routes):
-            if not route:
-                continue
-
-            depot_mat = state.depot_of[v_idx]   # matrix index of depot
-            dep_loc   = all_locs[depot_mat]
-            veh_cfg   = state.fleet[v_idx]
-            color     = vehicle_colors[v_idx % len(vehicle_colors)]
-
-            pts       = [dep_loc] + [all_locs[c] for c in route] + [dep_loc]
-            waypoints = [(p["lng"], p["lat"]) for p in pts]
-            geom, seg_dist, seg_dur, route_src = fetch_best_route(waypoints)
-            real_total_dist += seg_dist or 0
-
-            # Optimal (latest feasible) departure for this driver
-            depart_min = latest_feasible_departure(
-                route, depot_mat, dist_mat, time_mat, tw, SERVICE_TIME, svc_map,
-                no_wait=no_wait)
-
-            _, sched = route_time(route, depot_mat, dist_mat, time_mat, tw,
-                                   SERVICE_TIME, depart_min, svc_map, no_wait=no_wait)
-            stops = []
-            for entry in sched:
-                cmat     = entry["customer_mat"]
-                loc      = all_locs[cmat]
-                t        = loc.get("time_window", {"start":"?","end":"?"})
-                sub_idx  = cmat - n_depots          # index into expanded sub-orders
-                orig_i   = sub_to_orig[sub_idx] if sub_idx < len(sub_to_orig) else sub_idx
-                orig_c   = orig_customers[orig_i] if orig_i < len(orig_customers) else {}
-                # Count how many sub-orders this original customer was split into
-                n_splits_for_cust = sub_to_orig.count(orig_i)
-                c_counts = orig_c.get("pkg_counts", [0, 0, 0])
-                while len(c_counts) < 3:
-                    c_counts.append(0)
-                # Partial counts for this sub-order
-                split_counts = [round(cnt / n_splits_for_cust, 4) for cnt in c_counts]
-                c_volume = demands[sub_idx]   # already the partial volume
-                stops.append({
-                    "name":         loc.get("name", ""),
-                    "lat":          loc.get("lat"),
-                    "lng":          loc.get("lng"),
-                    "pkg_counts":   split_counts,
-                    "volume":       round(c_volume, 3),
-                    "arrival":      mins_to_hhmm(entry["arrival"]),
-                    "depart":       mins_to_hhmm(entry["depart"]),
-                    "wait":         int(entry.get("wait", 0)),
-                    "violation":    int(entry.get("violation", 0)),
-                    "tw_start":     t.get("start","?"),
-                    "tw_end":       t.get("end","?"),
-                    "service_time": entry.get("service_time", SERVICE_TIME),
-                    "split":        n_splits_for_cust > 1,
-                    "split_part":   sub_part_num.get(sub_idx) if n_splits_for_cust > 1 else None,
-                    "split_total":  n_splits_for_cust if n_splits_for_cust > 1 else None,
-                })
-
-            route_km    = (seg_dist if seg_dist
-                           else route_dist(route, depot_mat, dist_mat))
-            # Load-dependent fuel: calculated leg-by-leg as cargo is unloaded.
-            # route_weight_kg is total initial load (used for display only).
-            route_weight_kg = sum(
-                demands_kg[c - n_depots]
-                for c in route
-                if 0 <= (c - n_depots) < len(demands_kg)
-            )
-            base_fuel       = veh_cfg.get("fuel_consumption", 10.0)
-            # Effective average L/100km (for display) — weight-average over the route
-            eff_fuel        = base_fuel * (1.0 + fuel_load_factor * (route_weight_kg / 2.0) / 1000.0)
-            fuel_l          = round(route_fuel_litres(
-                route, depot_mat, dist_mat,
-                demands_kg, n_depots,
-                lambda kg: base_fuel * (1.0 + fuel_load_factor * kg / 1000.0)
-            ), 2)
-            fuel_cost       = round(fuel_l * fuel_price_rsd_l, 0)
-            work_mins   = route_working_minutes(
-                route, depot_mat, dist_mat, time_mat, tw, SERVICE_TIME, depart_min,
-                svc_map, no_wait=no_wait)
-            work_h      = round(work_mins / 60.0, 2)
-            wage_cost   = round(work_h * driver_wage_rsd_h, 0)
-
-            # Return-to-depot time
-            if sched:
-                last_dep  = sched[-1]["depart"]
-                return_min = last_dep + time_mat[route[-1]][depot_mat]
-            else:
-                return_min = depart_min
-
-            vehicle_routes.append({
-                "vehicle_id":      v_idx,
-                "type":            veh_cfg.get("type", f"Vehicle {v_idx+1}"),
-                "color":           color,
-                "depot_name":      dep_loc.get("name", f"Depot {depot_mat+1}"),
-                "depot_idx":       depot_mat,
-                "depot_lat":       dep_loc.get("lat"),
-                "depot_lng":       dep_loc.get("lng"),
-                "geometry":        geom or [],
-                "distance":        round(route_km, 2),
-                "fuel_consumption": round(veh_cfg.get("fuel_consumption", 10.0), 1),
-                "fuel_used":       fuel_l,
-                "fuel_cost_rsd":   int(fuel_cost),
-                "num_customers":   len(route),
-                "volume_used":     round(sum(demands[c - n_depots] for c in route), 3),
-                "volume_capacity": round(veh_cfg.get("capacity", 9999), 3),
-                "weight_used":     round(route_weight_kg, 1),
-                "weight_capacity": round(veh_cfg.get("weight_capacity", 0.0), 1),
-                "effective_fuel_consumption": round(eff_fuel, 2),
-                "departure_time":  mins_to_hhmm(depart_min),
-                "return_time":     mins_to_hhmm(return_min),
-                "working_hours":   work_h,
-                "wage_cost_rsd":   int(wage_cost),
-                "total_cost_rsd":  int(fuel_cost + wage_cost),
-                "stops":           stops,
-            })
-
-        # Derive total displayed time from actual driver working hours (includes
-        # service time, waiting, and latest-departure logic) — consistent with wages.
-        total_working_mins  = sum(vr["working_hours"] * 60 for vr in vehicle_routes)
-        hours, mins         = divmod(int(round(total_working_mins)), 60)
-
-        total_volume        = sum(demands)
-        fleet_volume_capacity = (sum(v.get("volume_capacity", v.get("capacity", 0)) * v.get("count", 1)
-                              for v in fleet_cfg) or 9999)
-        total_fuel_used     = sum(vr["fuel_used"] for vr in vehicle_routes)
-        total_fuel_cost_rsd = sum(vr["fuel_cost_rsd"] for vr in vehicle_routes)
-        total_wage_cost_rsd = sum(vr["wage_cost_rsd"] for vr in vehicle_routes)
-        total_cost_rsd      = total_fuel_cost_rsd + total_wage_cost_rsd
-        matrix_msg = {
-            "here":      "live traffic (HERE) — routes & map display",
-            "osrm":      "road distances (OSRM, no live traffic)",
-            "haversine": "straight-line estimates (all routers unavailable)",
-        }.get(matrix_source, matrix_source)
-
-        # ── Persist each vehicle route to the personal-PC database ────────────
-        for vr in vehicle_routes:
-            _save_route_to_db_async({
-                "route_date":        str(date.today()),
-                "saved_by":          session.get("user", "unknown"),
-                "algorithm":         algorithm,
-                "matrix_source":     matrix_source,
-                "fuel_price_rsd_l":  fuel_price_rsd_l,
-                "driver_wage_rsd_h": driver_wage_rsd_h,
-                "vehicle_route":     vr,
-            })
-
-        return jsonify({
-            "ok":                  True,
-            "matrix_source":       matrix_source,
-            "matrix_msg":          matrix_msg,
-            "n_depots":            n_depots,
-            "total_distance":      round(real_total_dist or total_dist, 2),
-            "total_fuel":          round(total_fuel_used, 2),
-            "total_fuel_cost_rsd": total_fuel_cost_rsd,
-            "total_wage_cost_rsd": total_wage_cost_rsd,
-            "total_cost_rsd":      total_cost_rsd,
-            "driver_wage_rsd_h":   driver_wage_rsd_h,
-            "fuel_price_rsd_l":    fuel_price_rsd_l,
-            "fuel_load_factor_pct": round(fuel_load_factor * 100, 2),
-            "total_time_h":        hours,
-            "total_time_m":        mins,
-            "total_volume":        round(total_volume, 3),
-            "pkg_sizes":           pkg_sizes,
-            "pkg_weights_kg":       pkg_weights_kg,
-            "vehicle_routes":      vehicle_routes,
-            "unserved_customers":  list({
-                orig_customers[sub_to_orig[sub_i]].get("name", f"Customer {sub_to_orig[sub_i]+1}")
-                for sub_i in range(len(sub_to_orig))
-                if (n_depots + sub_i) not in {c for route in state.routes for c in route}
-            }),
-            "algorithm":           algorithm,
-            "obj_weights":         obj_weights,
-            "use_volume_capacity": use_volume_cap,
-            "use_weight_capacity": use_weight_cap,
-            "service_time":        SERVICE_TIME,
+        vehicle_routes.append({
+            "vehicle_id":      v_idx,
+            "type":            veh_cfg.get("type", f"Vehicle {v_idx+1}"),
+            "color":           color,
+            "depot_name":      dep_loc.get("name", f"Depot {depot_mat+1}"),
+            "depot_idx":       depot_mat,
+            "depot_lat":       dep_loc.get("lat"),
+            "depot_lng":       dep_loc.get("lng"),
+            "geometry":        geom or [],
+            "distance":        round(route_km, 2),
+            "fuel_consumption": round(veh_cfg.get("fuel_consumption", 10.0), 1),
+            "fuel_used":       fuel_l,
+            "fuel_cost_rsd":   int(fuel_cost),
+            "num_customers":   len(route),
+            "volume_used":     round(sum(demands[c - n_depots] for c in route), 3),
+            "volume_capacity": round(veh_cfg.get("capacity", 9999), 3),
+            "weight_used":     round(route_weight_kg, 1),
+            "weight_capacity": round(veh_cfg.get("weight_capacity", 0.0), 1),
+            "effective_fuel_consumption": round(eff_fuel, 2),
+            "departure_time":  mins_to_hhmm(depart_min),
+            "return_time":     mins_to_hhmm(return_min),
+            "working_hours":   work_h,
+            "wage_cost_rsd":   int(wage_cost),
+            "total_cost_rsd":  int(fuel_cost + wage_cost),
+            "stops":           stops,
         })
 
-    except Exception as e:
-        import traceback
-        tb = traceback.format_exc()
-        print(f"[optimize] EXCEPTION: {e}\n{tb}")
-        return jsonify({"ok": False, "error": str(e)})
+    # Derive total displayed time from actual driver working hours (includes
+    # service time, waiting, and latest-departure logic) — consistent with wages.
+    total_working_mins  = sum(vr["working_hours"] * 60 for vr in vehicle_routes)
+    hours, mins         = divmod(int(round(total_working_mins)), 60)
+
+    total_volume        = sum(demands)
+    fleet_volume_capacity = (sum(v.get("volume_capacity", v.get("capacity", 0)) * v.get("count", 1)
+                          for v in fleet_cfg) or 9999)
+    total_fuel_used     = sum(vr["fuel_used"] for vr in vehicle_routes)
+    total_fuel_cost_rsd = sum(vr["fuel_cost_rsd"] for vr in vehicle_routes)
+    total_wage_cost_rsd = sum(vr["wage_cost_rsd"] for vr in vehicle_routes)
+    total_cost_rsd      = total_fuel_cost_rsd + total_wage_cost_rsd
+    matrix_msg = {
+        "here":      "live traffic (HERE) — routes & map display",
+        "osrm":      "road distances (OSRM, no live traffic)",
+        "haversine": "straight-line estimates (all routers unavailable)",
+    }.get(matrix_source, matrix_source)
+
+    # ── Persist each vehicle route to the personal-PC database ────────────
+    for vr in vehicle_routes:
+        _save_route_to_db_async({
+            "route_date":        str(date.today()),
+            "saved_by":          session.get("user", "unknown"),
+            "algorithm":         algorithm,
+            "matrix_source":     matrix_source,
+            "fuel_price_rsd_l":  fuel_price_rsd_l,
+            "driver_wage_rsd_h": driver_wage_rsd_h,
+            "vehicle_route":     vr,
+        })
+
+    return {
+        "ok":                  True,
+        "matrix_source":       matrix_source,
+        "matrix_msg":          matrix_msg,
+        "n_depots":            n_depots,
+        "total_distance":      round(real_total_dist or total_dist, 2),
+        "total_fuel":          round(total_fuel_used, 2),
+        "total_fuel_cost_rsd": total_fuel_cost_rsd,
+        "total_wage_cost_rsd": total_wage_cost_rsd,
+        "total_cost_rsd":      total_cost_rsd,
+        "driver_wage_rsd_h":   driver_wage_rsd_h,
+        "fuel_price_rsd_l":    fuel_price_rsd_l,
+        "fuel_load_factor_pct": round(fuel_load_factor * 100, 2),
+        "total_time_h":        hours,
+        "total_time_m":        mins,
+        "total_volume":        round(total_volume, 3),
+        "pkg_sizes":           pkg_sizes,
+        "pkg_weights_kg":       pkg_weights_kg,
+        "vehicle_routes":      vehicle_routes,
+        "unserved_customers":  list({
+            orig_customers[sub_to_orig[sub_i]].get("name", f"Customer {sub_to_orig[sub_i]+1}")
+            for sub_i in range(len(sub_to_orig))
+            if (n_depots + sub_i) not in {c for route in state.routes for c in route}
+        }),
+        "algorithm":           algorithm,
+        "obj_weights":         obj_weights,
+        "use_volume_capacity": use_volume_cap,
+        "use_weight_capacity": use_weight_cap,
+        "service_time":        SERVICE_TIME,
+    }
+    # NOTE: no try/except here — exceptions propagate to the job runner thread
+    #       which stores them in _jobs[job_id]["error"] and sets status="error".
 
 
 # ─────────────────────── ROUTE HISTORY ──────────────────────────────────────
