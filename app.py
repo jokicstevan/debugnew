@@ -549,10 +549,15 @@ def prefetch_traffic_history(locations, pairs):
 
             fetched = succeeded = 0
             with ThreadPoolExecutor(max_workers=_TRAFFIC_FETCH_POOL_SIZE) as pool:
-                futures = {pool.submit(_do_fetch, item): item for item in work}
-                for future in as_completed(futures):
+                # Submit all work upfront; store futures in a plain list so
+                # Python can release each Future (and its result) as soon as
+                # it's consumed — the dict form kept all results alive until
+                # the executor exited.
+                future_list = [pool.submit(_do_fetch, item) for item in work]
+                for future in as_completed(future_list):
                     fetched += 1
                     result = future.result()
+                    future_list[future_list.index(future)] = None  # drop ref early
                     if result:
                         batch.append(result)
                         succeeded += 1
@@ -595,7 +600,7 @@ def get_historical_time_mat(locations, departure_min, pairs):
         return None, 0.0
 
     n = len(locations)
-    hist_mat = [[0.0] * n for _ in range(n)]
+    hist_mat = np.zeros((n, n), dtype=np.float64)
 
     # Snap the departure time to the nearest 15-min slot
     base_slot   = (int(departure_min) // _TRAFFIC_SLOT_MINUTES) * _TRAFFIC_SLOT_MINUTES
@@ -970,8 +975,8 @@ def fetch_here_matrix(locations, pairs=None, hav_km=None, sentinel_factor=None,
         return None, None
     sf       = sentinel_factor if sentinel_factor is not None else SENTINEL_FACTOR
     n        = len(locations)
-    dist_mat = [[0.0]*n for _ in range(n)]
-    time_mat = [[0.0]*n for _ in range(n)]
+    dist_mat = np.zeros((n, n), dtype=np.float64)
+    time_mat = np.zeros((n, n), dtype=np.float64)
     if departure_min is not None:
         today = datetime.utcnow().date()
         dh, dm = divmod(int(departure_min), 60)
@@ -981,15 +986,17 @@ def fetch_here_matrix(locations, pairs=None, hav_km=None, sentinel_factor=None,
     else:
         dep_time = _here_departure_time()
 
-    # Pre-fill sentinel values for skipped pairs using haversine * factor
+    # Pre-fill sentinel values for skipped pairs using haversine * factor.
+    # Use numpy vectorised fill: build a boolean mask of skipped pairs, then
+    # write all sentinel values in two array assignments (no Python loop).
     if pairs is not None and hav_km is not None:
-        for i in range(n):
-            for j in range(n):
-                if i != j and (i, j) not in pairs:
-                    sentinel_d = float(hav_km[i][j]) * sf
-                    dist_mat[i][j] = sentinel_d
-                    # Time estimate: sentinel distance at 30 km/h average
-                    time_mat[i][j] = sentinel_d / 30.0 * 60.0
+        skip_mask = np.ones((n, n), dtype=bool)
+        np.fill_diagonal(skip_mask, False)
+        for i, j in pairs:
+            skip_mask[i, j] = False
+        sentinel_d = hav_km * sf
+        dist_mat[skip_mask] = sentinel_d[skip_mask]
+        time_mat[skip_mask] = sentinel_d[skip_mask] / 30.0 * 60.0
 
     fetch_set = pairs if pairs is not None else {(i, j) for i in range(n) for j in range(n) if i != j}
 
@@ -1222,17 +1229,20 @@ def fetch_osrm_matrix(locations, pairs=None, hav_km=None, sentinel_factor=None):
     url    = f"https://router.project-osrm.org/table/v1/driving/{coords}"
     delays = [2, 5, 10, 15]
 
-    dist_mat = [[0.0]*n for _ in range(n)]
-    time_mat = [[0.0]*n for _ in range(n)]
+    dist_mat = np.zeros((n, n), dtype=np.float64)
+    time_mat = np.zeros((n, n), dtype=np.float64)
 
-    # Pre-fill sentinel values for pairs that won't be fetched
+    # Pre-fill sentinel values for pairs that won't be fetched.
+    # Vectorised: build a boolean mask once, then write all sentinels together.
     if pairs is not None and hav_km is not None:
-        for i in range(n):
-            for j in range(n):
-                if i != j and (i, j) not in pairs:
-                    sentinel_d = float(hav_km[i][j]) * sf
-                    dist_mat[i][j] = sentinel_d
-                    time_mat[i][j] = sentinel_d / 30.0 * 60.0
+        skip_mask = np.ones((n, n), dtype=bool)
+        np.fill_diagonal(skip_mask, False)
+        for i, j in pairs:
+            skip_mask[i, j] = False
+        sentinel_d = hav_km * sf
+        dist_mat[skip_mask] = sentinel_d[skip_mask]
+        time_mat[skip_mask] = sentinel_d[skip_mask] / 30.0 * 60.0
+
 
     for attempt in range(4):
         try:
@@ -1346,17 +1356,10 @@ def build_api_pairs(locations, k=K_NEAREST):
 
 
 def build_haversine_matrix(locations):
-    n = len(locations)
-    dist = [[0.0]*n for _ in range(n)]
-    tdur = [[0.0]*n for _ in range(n)]
-    for i in range(n):
-        for j in range(i+1, n):
-            d = haversine(locations[i]["lat"], locations[i]["lng"],
-                          locations[j]["lat"], locations[j]["lng"])
-            t = d / 30 * 60
-            dist[i][j] = dist[j][i] = d
-            tdur[i][j] = tdur[j][i] = t
-    return dist, tdur
+    """Return (dist_mat, time_mat) as numpy float64 arrays (km, minutes)."""
+    hav_km   = _haversine_matrix_km(locations)          # already numpy
+    time_mat = hav_km / 30.0 * 60.0                     # km ÷ 30 km/h × 60 → minutes
+    return hav_km.copy(), time_mat
 
 
 def straight_line_geometry(waypoints):
@@ -1443,6 +1446,8 @@ def _blend_historical(live_time_mat, locations, departure_min, pairs, weight):
     """Return a blended time matrix mixing live values with historical averages.
     Pairs with no cached data are left unchanged.  departure_min=None disables
     the blend entirely (returns the original matrix).
+
+    live_time_mat is a numpy float64 array; returns a numpy float64 array.
     """
     if departure_min is None or not DATABASE_URL:
         return live_time_mat
@@ -1451,13 +1456,24 @@ def _blend_historical(live_time_mat, locations, departure_min, pairs, weight):
     if hist_mat is None or coverage == 0.0:
         return live_time_mat
 
-    n = len(live_time_mat)
-    blended = [row[:] for row in live_time_mat]   # shallow copy
-    blended_count = 0
-    for (i, j) in pairs:
-        if hist_mat[i][j] > 0:
-            blended[i][j] = (1 - weight) * live_time_mat[i][j] + weight * hist_mat[i][j]
-            blended_count += 1
+    # hist_mat comes back as list-of-lists from get_historical_time_mat;
+    # convert once so the blend arithmetic stays in numpy.
+    hist_np = np.asarray(hist_mat, dtype=np.float64)
+
+    # Build an index array from the pairs set so we can do a vectorised blend
+    # without a Python loop over every (i, j) pair.
+    if pairs:
+        rows = np.array([i for i, j in pairs], dtype=np.intp)
+        cols = np.array([j for i, j in pairs], dtype=np.intp)
+        has_hist = hist_np[rows, cols] > 0
+        r, c = rows[has_hist], cols[has_hist]
+        blended = live_time_mat.copy()
+        blended[r, c] = (1.0 - weight) * live_time_mat[r, c] + weight * hist_np[r, c]
+        blended_count = int(has_hist.sum())
+    else:
+        blended = live_time_mat
+        blended_count = 0
+
     print(f"[traffic cache] blended {blended_count}/{len(pairs)} pairs "
           f"(coverage={coverage:.1%}, weight={weight})")
     return blended
@@ -2797,17 +2813,15 @@ def _do_optimize(data, user):
         except Exception:
             departure_min = None
 
-    # Phase 1: distance/time matrix — HERE (live traffic) → OSRM → haversine
+    # Phase 1: distance/time matrix — HERE (live traffic) → OSRM → haversine.
     # Pass departure_min so the time matrix is blended with historical averages.
+    # All three builder paths now return numpy float64 arrays directly, so no
+    # conversion is needed here.  (The old np.array() call was also wasteful
+    # because _expand_matrix immediately converted everything back to
+    # list-of-lists, only for the solver to operate on Python floats.)
     dist_mat, time_mat, matrix_source = fetch_best_matrix(
         all_locs_orig, k_nearest=k_nearest, sentinel_factor=sentinel_factor,
         departure_min=departure_min, hist_blend_weight=hist_blend_weight)
-
-    # Convert to numpy arrays for fast O(1) element access inside the solver.
-    # List-of-lists indexing (dist_mat[i][j]) is slower than numpy (dist_mat[i,j])
-    # for the millions of lookups made during ALNS iterations.
-    dist_mat = np.array(dist_mat, dtype=np.float64)
-    time_mat = np.array(time_mat, dtype=np.float64)
 
     # Fire off background pre-fetch of historical traffic for this set of
     # locations so future optimisation runs have richer cache data.
@@ -2911,19 +2925,29 @@ def _do_optimize(data, user):
     orig_size = n_depots + n_orig_cust
     exp_size  = n_depots + n_sub
 
-    def _expand_matrix(mat):
-        # mat is orig_size × orig_size
-        # new_mat is exp_size × exp_size
-        new_mat = [[0.0] * exp_size for _ in range(exp_size)]
+    def _expand_matrix(mat: np.ndarray) -> np.ndarray:
+        """Expand an orig_size×orig_size numpy matrix to exp_size×exp_size.
+
+        Each expanded row/column that corresponds to a split sub-order is
+        mapped back to its original customer row/column via sub_to_orig.
+        Uses numpy fancy indexing so the result is a contiguous float64 array
+        allocated in a single C-level operation — no Python float boxing,
+        no intermediate list-of-lists.
+        """
+        idx = np.empty(exp_size, dtype=np.intp)
         for r in range(exp_size):
-            orig_r = r if r < n_depots else n_depots + sub_to_orig[r - n_depots]
-            for c_col in range(exp_size):
-                orig_c = c_col if c_col < n_depots else n_depots + sub_to_orig[c_col - n_depots]
-                new_mat[r][c_col] = mat[orig_r][orig_c]
-        return new_mat
+            idx[r] = r if r < n_depots else n_depots + sub_to_orig[r - n_depots]
+        return mat[np.ix_(idx, idx)]   # shape (exp_size, exp_size), dtype preserved
 
     dist_mat  = _expand_matrix(dist_mat)
     time_mat  = _expand_matrix(time_mat)
+
+    # Guarantee contiguous float64 layout for the solver's millions of
+    # dist_mat[i, j] / time_mat[i, j] lookups.  np.ix_ fancy-index already
+    # returns a new array, but np.ascontiguousarray makes cache locality
+    # explicit and costs nothing when the array is already C-contiguous.
+    dist_mat = np.ascontiguousarray(dist_mat, dtype=np.float64)
+    time_mat = np.ascontiguousarray(time_mat, dtype=np.float64)
 
     # all_locs now maps to the expanded matrix rows
     all_locs   = depots + exp_locs
