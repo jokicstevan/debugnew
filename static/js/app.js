@@ -1265,8 +1265,9 @@ function drawRoutes(data) {
     const latlngs = vr.geometry.map(([lng, lat]) => [lat, lng]);
     const offsetPx = getOffsetForVehicle(vr.vehicle_id, totalVehicles);
     
-    // First draw a white outline (thicker, same offset) to improve contrast
-    L.polyline(latlngs, {
+    // White outline (thicker, same offset) for contrast — stored so clearRoutes removes it
+    const outlineKey = `outline_${vr.vehicle_id}`;
+    const outlineLayer = L.polyline(latlngs, {
       color: '#ffffff',
       weight: 6,
       opacity: 0.5,
@@ -1274,8 +1275,9 @@ function drawRoutes(data) {
       offset: offsetPx,
       interactive: false
     }).addTo(map);
-    
-    // Then the coloured line on top
+    state.routeLayers[outlineKey] = outlineLayer;
+
+    // Coloured line on top
     const layer = L.polyline(latlngs, {
       color: vr.color,
       weight: 4,
@@ -1283,7 +1285,7 @@ function drawRoutes(data) {
       smoothFactor: 1,
       offset: offsetPx
     }).addTo(map);
-    
+
     state.routeLayers[vr.vehicle_id] = layer;
     state.vehicleVisible[vr.vehicle_id] = true;
 
@@ -1530,14 +1532,17 @@ function renderLegend(data) {
 }
 
 function toggleRoute(vid) {
-  const visible = state.vehicleVisible[vid];
-  const layer   = state.routeLayers[vid];
-  const row     = document.getElementById('leg-'+vid);
+  const visible     = state.vehicleVisible[vid];
+  const layer       = state.routeLayers[vid];
+  const outlineLayer = state.routeLayers[`outline_${vid}`];
+  const row         = document.getElementById('leg-'+vid);
   if (visible) {
     safeRemove(layer);
+    safeRemove(outlineLayer);
     row.classList.add('hidden-route');
     state.vehicleVisible[vid] = false;
   } else {
+    if (outlineLayer && !map.hasLayer(outlineLayer)) outlineLayer.addTo(map);
     if (layer && !map.hasLayer(layer)) layer.addTo(map);
     row.classList.remove('hidden-route');
     state.vehicleVisible[vid] = true;
@@ -1547,13 +1552,16 @@ function toggleRoute(vid) {
 function toggleAllRoutes() {
   const allVis = Object.values(state.vehicleVisible).every(v => v);
   Object.keys(state.vehicleVisible).forEach(vid => {
-    const layer = state.routeLayers[vid];
+    const layer        = state.routeLayers[vid];
+    const outlineLayer = state.routeLayers[`outline_${vid}`];
     if (allVis) {
       safeRemove(layer);
+      safeRemove(outlineLayer);
       state.vehicleVisible[vid] = false;
       const row = document.getElementById('leg-'+vid);
       if (row) row.classList.add('hidden-route');
     } else {
+      if (outlineLayer && !map.hasLayer(outlineLayer)) outlineLayer.addTo(map);
       if (layer && !map.hasLayer(layer)) layer.addTo(map);
       state.vehicleVisible[vid] = true;
       const row = document.getElementById('leg-'+vid);

@@ -1104,62 +1104,90 @@ def _decode_here_polyline(encoded):
     return coords
 
 
-def fetch_here_route(waypoints):
-    """Fetch road geometry from HERE Router v8 (live traffic).
-    Concatenates all sections so multi-stop routes display correctly on the map."""
-    if not HERE_API_KEY:
-        return None, None, None
-    origin = f"{waypoints[0][1]},{waypoints[0][0]}"
-    dest   = f"{waypoints[-1][1]},{waypoints[-1][0]}"
-    # HERE v8 expects repeated `via=lat,lng` query params, NOT `via[0]=…`.
-    # Passing a list makes `requests` emit: &via=lat1,lng1&via=lat2,lng2
-    via_list = [f"{lat},{lng}" for lng, lat in waypoints[1:-1]]
-    params = {
+# HERE v8 allows at most this many intermediate via-points per request.
+# Exceeding it causes HERE to silently drop stops, producing geometry loops.
+_HERE_MAX_VIA = 10   # conservative: 10 vias = 12-point legs (origin + 10 via + dest)
+
+def _here_route_leg(origin_wp, dest_wp, via_wps):
+    """Fetch geometry for one leg (origin→[via...]→dest) from HERE.
+    Returns (geom_lnglat, dist_km, dur_min) or (None, None, None).
+    """
+    origin   = f"{origin_wp[1]},{origin_wp[0]}"
+    dest_str = f"{dest_wp[1]},{dest_wp[0]}"
+    via_list = [f"{lat},{lng}" for lng, lat in via_wps]
+    params   = {
         "apiKey":        HERE_API_KEY,
         "transportMode": "car",
         "routingMode":   "fast",
         "departureTime": _here_departure_time(),
         "origin":        origin,
-        "destination":   dest,
+        "destination":   dest_str,
         "return":        "polyline,summary",
     }
     if via_list:
         params["via"] = via_list
     try:
-        req = requests.Request("GET", "https://router.hereapi.com/v8/routes",
-                               params=params).prepare()
-        print(f"[HERE route] URL: {req.url[:300]}")
         resp = requests.get("https://router.hereapi.com/v8/routes",
                             params=params, timeout=(5, 20))
         if resp.status_code != 200:
-            print(f"[HERE route] failed: {resp.status_code} {resp.text[:200]}")
             return None, None, None
         routes = resp.json().get("routes", [])
         if not routes:
-            print("[HERE route] no routes returned")
             return None, None, None
-        # Concatenate geometry from ALL sections (one per leg between stops).
-        # Adjacent sections share an endpoint (junction stop), so skip the
-        # duplicate first point on every section after the first.
         geom, dist_km, dur_min = [], 0.0, 0.0
         for section in routes[0]["sections"]:
-            summary   = section.get("summary", {})
-            dist_km  += summary.get("length",   0) / 1000.0
-            dur_min  += summary.get("duration", 0) / 60.0
-            raw_poly  = section.get("polyline")
+            summary  = section.get("summary", {})
+            dist_km += summary.get("length",   0) / 1000.0
+            dur_min += summary.get("duration", 0) / 60.0
+            raw_poly = section.get("polyline")
             if not raw_poly:
                 continue
-            pts  = _decode_here_polyline(raw_poly)
-            pts  = pts[1:] if geom else pts   # drop duplicate junction point
+            pts   = _decode_here_polyline(raw_poly)
+            pts   = pts[1:] if geom else pts
             geom += [(p[1], p[0]) for p in pts]
-        if not geom:
-            print("[HERE route] empty geometry after decoding")
-            return None, None, None
-        print(f"[HERE route] OK {len(geom)} pts {dist_km:.1f}km {dur_min:.1f}min")
         return geom, dist_km, dur_min
-    except Exception as e:
-        print(f"[HERE route] exception: {e}")
+    except Exception:
         return None, None, None
+
+
+def fetch_here_route(waypoints):
+    """Fetch road geometry from HERE Router v8 (live traffic).
+
+    HERE v8 limits via-points to _HERE_MAX_VIA per request.  For longer routes
+    we split into chunks of (_HERE_MAX_VIA + 1) waypoints, fetch each chunk
+    separately, then stitch the geometry together.  This avoids the silent
+    via-point truncation that causes geometry loops on routes with many stops.
+    """
+    if not HERE_API_KEY:
+        return None, None, None
+
+    # Split waypoints into overlapping chunks so consecutive chunks share
+    # exactly one endpoint (the last point of chunk N = first point of chunk N+1).
+    chunk_size = _HERE_MAX_VIA + 2   # origin + _HERE_MAX_VIA vias + dest
+    chunks = []
+    i = 0
+    while i < len(waypoints) - 1:
+        end = min(i + chunk_size, len(waypoints))
+        chunks.append(waypoints[i:end])
+        i = end - 1   # overlap by 1 so chunks connect
+
+    geom_all, dist_km_all, dur_min_all = [], 0.0, 0.0
+    for chunk in chunks:
+        g, d, t = _here_route_leg(chunk[0], chunk[-1], chunk[1:-1])
+        if g is None:
+            print(f"[HERE route] leg failed, falling back to OSRM for this route")
+            return None, None, None
+        # Skip the first point on subsequent chunks (shared with previous chunk end)
+        geom_all  += g[1:] if geom_all else g
+        dist_km_all  += d or 0.0
+        dur_min_all  += t or 0.0
+
+    if not geom_all:
+        return None, None, None
+
+    print(f"[HERE route] OK {len(geom_all)} pts {dist_km_all:.1f}km {dur_min_all:.1f}min "
+          f"({len(chunks)} chunk{'s' if len(chunks)>1 else ''})")
+    return geom_all, dist_km_all, dur_min_all
 
 
 # ── OSRM Routing (fallback, no live traffic) ──────────────────────────────────
@@ -1265,8 +1293,8 @@ def haversine(lat1, lon1, lat2, lon2):
 #   SENTINEL_FACTOR – must be > road-to-straight-line ratio; 2.5 is very safe
 #                     for Serbia's road network (typical ratio ≈ 1.2–1.6).
 
-K_NEAREST       = 10     # keep this many nearest neighbours per location
-SENTINEL_FACTOR = 2.5    # sentinel = haversine * factor  (always > real road distance)
+K_NEAREST       = 12     # keep this many nearest neighbours per location
+SENTINEL_FACTOR = 4.5    # sentinel = haversine * factor  (always > real road distance)
 
 
 def _haversine_matrix_km(locations):
