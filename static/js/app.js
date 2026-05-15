@@ -81,7 +81,7 @@ const TRANSLATIONS = {
     apply: 'Apply',
     excelPreview: 'Excel Import Preview',
     geocodingHint: 'Customers will be geocoded after import. This may take a moment.',
-    excelColumns: 'Expected columns: Customer, Address, Packages#1, Packages#2, Packages#3, Time',
+    excelColumns: 'Required: Customer, Address, Packages#1, Packages#2, Packages#3, Time — Optional: Lat, Lng (skips geocoding)',
     importAll: 'Import All',
     searching: '🔍 Searching…',
     found: '✅ Found',
@@ -168,11 +168,14 @@ const TRANSLATIONS = {
     sentinelFactorLabel: 'Sentinel factor',
     overlapPenaltyTitle: '🗺️ Route Overlap Penalty',
     overlapThresholdLabel: 'Overlap threshold (km)',
-    overlapWeightLabel: 'Overlap weight (RSD)',
+    overlapWeightLabel: 'Overlap penalty (RSD/shared km)',
     solverPenaltiesTitle: '⚖️ Solver Penalties',
     distRsdPerKmLabel: 'Distance cost (RSD/km)',
     twPenaltyRsdLabel: 'TW violation penalty (RSD/min)',
     alnsCoolingLabel: 'ALNS cooling rate',
+    histBlendTitle: '🕑 Historical Traffic Blending',
+    depTimeLabel: 'Planned departure time',
+    histBlendWeightLabel: 'Blend weight (0 = live, 1 = historical)',
     routeHistory: '🗄️ Route History',
     routeHistoryHint: 'Routes saved automatically after each optimization run.',
     refreshHistory: '🔄 Refresh',
@@ -270,7 +273,7 @@ const TRANSLATIONS = {
     apply: 'Primeni',
     excelPreview: 'Pregled Excel uvoza',
     geocodingHint: 'Mušterije će biti geokodirane nakon uvoza. Ovo može potrajati.',
-    excelColumns: 'Očekivane kolone: Customer, Address, Packages#1, Packages#2, Packages#3, Time',
+    excelColumns: 'Obavezno: Customer, Address, Packages#1, Packages#2, Packages#3, Time — Opciono: Lat, Lng (preskače geokodiranje)',
     importAll: 'Uvezi sve',
     searching: '🔍 Pretraga…',
     found: '✅ Pronađeno',
@@ -357,11 +360,14 @@ const TRANSLATIONS = {
     sentinelFactorLabel: 'Sentinel faktor',
     overlapPenaltyTitle: '🗺️ Kazna preklapanja ruta',
     overlapThresholdLabel: 'Prag preklapanja (km)',
-    overlapWeightLabel: 'Težina preklapanja (RSD)',
+    overlapWeightLabel: 'Kazna za preklapanje (RSD/deljeni km)',
     solverPenaltiesTitle: '⚖️ Kazne solvera',
     distRsdPerKmLabel: 'Trošak rastojanja (RSD/km)',
     twPenaltyRsdLabel: 'Kazna kršenja vremenskog okvira (RSD/min)',
     alnsCoolingLabel: 'ALNS stopa hlađenja',
+    histBlendTitle: '🕑 Mešanje istorijskih podataka o saobraćaju',
+    depTimeLabel: 'Planirano vreme polaska',
+    histBlendWeightLabel: 'Težina mešanja (0 = živo, 1 = istorijsko)',
     routeHistory: '🗄️ Istorija ruta',
     routeHistoryHint: 'Rute se čuvaju automatski nakon svake optimizacije.',
     refreshHistory: '🔄 Osveži',
@@ -667,7 +673,11 @@ function renderLocationsList() {
   state.customers.forEach(c => {
     html += `<div class="loc-item">
       <span class="loc-dot customer"></span>
-      <span class="loc-name">👤 C${c.customer_id}: ${esc(c.name)} [${calcVolume(c.pkg_counts).toFixed(2)}m³]</span>
+      <span class="loc-name">👤 ${
+        c.route_visit_num != null
+          ? `<span style="color:${c.route_vehicle_color};font-weight:700">V${c.route_vehicle_num}:#${c.route_visit_num}</span>`
+          : `C${c.customer_id}`
+      }: ${esc(c.name)} [${calcVolume(c.pkg_counts).toFixed(2)}m³]</span>
       <button class="loc-del" onclick="removeCustomer('${c.id}')">✕</button>
     </div>`;
   });
@@ -778,26 +788,25 @@ async function importExcel(input) {
 }
 
 function showExcelPreview(rows) {
-  const hasCoords = rows.some(r => r.lat != null);
-  let th = `<tr><th>#</th><th>Customer</th><th>Address</th>${hasCoords ? '<th>Lat/Lng</th>' : ''}<th>Pkg#1</th><th>Pkg#2</th><th>Pkg#3</th><th>Vol (m³)</th><th>Unload (min)</th><th>Time</th></tr>`;
+  const hasCoords = rows.some(r => r.lat != null && r.lng != null);
+  const coordCols = hasCoords ? '<th>Lat</th><th>Lng</th>' : '';
+  let th = `<thead><tr><th>#</th><th>Customer</th><th>Address</th><th>Pkg#1</th><th>Pkg#2</th><th>Pkg#3</th><th>Vol (m³)</th><th>Unload (min)</th><th>Time</th>${coordCols}</tr></thead>`;
   let td = rows.map((r,i) => {
     const pc = r.pkg_counts || [r.packages||0, 0, 0];
     const vol = calcVolume(pc).toFixed(2);
-    const coordCell = hasCoords
-      ? `<td style="font-size:10px;color:${r.lat != null ? 'var(--accent)' : 'var(--muted)'}">
-           ${r.lat != null ? `✓ ${r.lat.toFixed(4)}, ${r.lng.toFixed(4)}` : '⟳ geocode'}
-         </td>`
+    const coordCells = hasCoords
+      ? `<td>${r.lat != null ? r.lat.toFixed(5) : '—'}</td><td>${r.lng != null ? r.lng.toFixed(5) : '—'}</td>`
       : '';
+    const coordBadge = r.lat != null ? ' 📍' : '';
     return `<tr>
-      <td>${i+1}</td><td>${esc(r.name)}</td><td>${esc(r.address)}</td>
-      ${coordCell}
+      <td>${i+1}</td><td>${esc(r.name)}${coordBadge}</td><td>${esc(r.address)}</td>
       <td>${pc[0]}</td><td>${pc[1]}</td><td>${pc[2]}</td><td>${vol}</td>
       <td>${r.unloading_time ?? 10}</td>
-      <td>${r.time_window.start}–${r.time_window.end}</td>
+      <td>${r.time_window.start}–${r.time_window.end}</td>${coordCells}
     </tr>`;
   }).join('');
   document.getElementById('excel-table-wrap').innerHTML =
-    `<table class="excel-preview-table"><thead>${th}</thead><tbody>${td}</tbody></table>`;
+    `<table class="excel-preview-table">${th}<tbody>${td}</tbody></table>`;
   document.getElementById('excel-modal').classList.remove('hidden');
 }
 
@@ -831,15 +840,14 @@ async function confirmExcelImport() {
   let importedCount = 0;
   for (let i=0; i<rows.length; i++) {
     const r = rows[i];
-    // If lat/lng already supplied in the Excel file, use them directly — no geocoding needed
+    // If the row already has coordinates, skip the geocoding API call entirely
     if (r.lat != null && r.lng != null) {
-      st.textContent = t('geocodingProgress')(i, rows.length, r.name) + ' (coords ✓)';
+      st.textContent = `📍 (${i+1}/${rows.length}) ${r.name}`;
       const pc = r.pkg_counts || [r.packages||1, 0, 0];
       placeCustomer(r.lat, r.lng, r.name, pc, r.time_window, r.unloading_time || 10);
       importedCount++;
       continue;
     }
-    // Otherwise geocode from address as before
     st.textContent = t('geocodingProgress')(i, rows.length, r.name);
     try {
       const res = await fetch('/api/geocode', {
@@ -997,7 +1005,9 @@ function getAdvancedParams() {
     overlap_weight_rsd:   parseFloat(document.getElementById('adv-overlap-weight')?.value)  ?? 500,
     dist_rsd_per_km:      parseFloat(document.getElementById('adv-dist-rsd-per-km')?.value) ?? 20,
     tw_penalty_rsd:       parseFloat(document.getElementById('adv-tw-penalty-rsd')?.value)  ?? 100,
-    alns_cooling:         parseFloat(document.getElementById('adv-alns-cooling')?.value)    ?? 0.995,
+    alns_cooling:         parseFloat(document.getElementById('adv-alns-cooling')?.value)    || 0.995,
+    hist_blend_weight:    parseFloat(document.getElementById('adv-hist-blend-weight')?.value) || 0.5,
+    departure_time:       document.getElementById('adv-dep-time')?.value || '',
   };
 }
 
@@ -1043,6 +1053,15 @@ function updateConstraintHint() {
   }
 }
 
+// ─── HELPER: compute visual offset for a vehicle (pixels) ───────────────────
+function getOffsetForVehicle(vehicleId, totalVehicles) {
+  // Symmetric offsets: centre line = 0, step = 6 pixels
+  // Example: 3 vehicles → offsets: -6, 0, +6
+  const step = 6;
+  const center = (totalVehicles - 1) / 2;
+  return (vehicleId - center) * step;
+}
+
 // ─── OPTIMIZATION ────────────────────────────────────────────────────────────
 async function runOptimize() {
   if (state.depots.length === 0) { alert(t('addDepotFirst')); return; }
@@ -1075,25 +1094,67 @@ async function runOptimize() {
     max_iterations:   parseInt(document.getElementById('max-iter').value)||500,
     temperature:      parseFloat(document.getElementById('temperature').value)||150,
     advanced_params:  getAdvancedParams(),
+    departure_time:   document.getElementById('adv-dep-time')?.value || '',
   };
 
   try {
-    // Fake progress during server call
-    let prog = 10;
+    // ── Step 1: submit job, get job_id immediately ──────────────────────────
+    setProgress(5, t('phase1'));
+    const submitRes = await fetch('/api/optimize', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload)
+    });
+    const submitData = await submitRes.json();
+    if (!submitData.ok) {
+      alert(t('optimizationError') + (submitData.error || 'Unknown'));
+      btn.disabled = false;
+      pw.classList.add('hidden');
+      return;
+    }
+    const jobId = submitData.job_id;
+
+    // ── Step 2: poll /api/optimize/status/:job_id until done ───────────────
+    // Progress bar ticks forward slowly; messaging flips at ~40 %
+    let prog = 5;
     const ticker = setInterval(() => {
-      prog = Math.min(prog + 3, 85);
+      prog = Math.min(prog + 2, 90);
       setProgress(prog, prog < 40 ? t('phase1short') : t('phase2'));
     }, 800);
 
-    const res = await fetch('/api/optimize', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify(payload)
+    const POLL_INTERVAL_MS = 1500;
+    const MAX_WAIT_MS      = 20 * 60 * 1000;   // 20 min hard client timeout
+    const pollStart        = Date.now();
+
+    const data = await new Promise((resolve, reject) => {
+      const poll = async () => {
+        if (Date.now() - pollStart > MAX_WAIT_MS) {
+          reject(new Error('Optimization timed out after 20 minutes'));
+          return;
+        }
+        try {
+          const r = await fetch(`/api/optimize/status/${jobId}`);
+          const d = await r.json();
+          if (!r.ok || d.status === 'error') {
+            reject(new Error(d.error || 'Optimization failed on server'));
+            return;
+          }
+          if (d.status === 'done') {
+            resolve(d.result);
+            return;
+          }
+          // still running — poll again
+          setTimeout(poll, POLL_INTERVAL_MS);
+        } catch (fetchErr) {
+          reject(fetchErr);
+        }
+      };
+      setTimeout(poll, POLL_INTERVAL_MS);
     });
+
     clearInterval(ticker);
-    const data = await res.json();
 
     if (!data.ok) {
-      alert(t('optimizationError') + (data.error||'Unknown'));
+      alert(t('optimizationError') + (data.error || 'Unknown'));
       btn.disabled = false;
       pw.classList.add('hidden');
       return;
@@ -1133,10 +1194,14 @@ function setProgress(pct, msg) {
   document.getElementById('progress-label').textContent = msg;
 }
 
-// ─── DRAW ROUTES ON MAP ───────────────────────────────────────────────────────
+// ─── DRAW ROUTES ON MAP (with offset for side‑by‑side overlap) ───────────────
 function drawRoutes(data) {
   // Reset all customer markers back to default blue before colouring served ones
   state.customers.forEach(c => {
+    // Clear any route-visit numbering from a previous run
+    c.route_visit_num    = null;
+    c.route_vehicle_num  = null;
+    c.route_vehicle_color = null;
     const marker = state.markers[c.id];
     if (marker) {
       const icon = L.divIcon({
@@ -1194,12 +1259,31 @@ function drawRoutes(data) {
     st.style.color = '#e74c3c';
   }
 
+  const totalVehicles = data.vehicle_routes.length;
   data.vehicle_routes.forEach(vr => {
     if (!vr.geometry || vr.geometry.length < 2) return;
     const latlngs = vr.geometry.map(([lng, lat]) => [lat, lng]);
-    const layer = L.polyline(latlngs, {
-      color: vr.color, weight: 4, opacity: 0.85, smoothFactor: 1
+    const offsetPx = getOffsetForVehicle(vr.vehicle_id, totalVehicles);
+    
+    // First draw a white outline (thicker, same offset) to improve contrast
+    L.polyline(latlngs, {
+      color: '#ffffff',
+      weight: 6,
+      opacity: 0.5,
+      smoothFactor: 1,
+      offset: offsetPx,
+      interactive: false
     }).addTo(map);
+    
+    // Then the coloured line on top
+    const layer = L.polyline(latlngs, {
+      color: vr.color,
+      weight: 4,
+      opacity: 0.85,
+      smoothFactor: 1,
+      offset: offsetPx
+    }).addTo(map);
+    
     state.routeLayers[vr.vehicle_id] = layer;
     state.vehicleVisible[vr.vehicle_id] = true;
 
@@ -1209,7 +1293,7 @@ function drawRoutes(data) {
     state.customers.forEach(c => {
       (_nameQueue[c.name] = _nameQueue[c.name] || []).push(c);
     });
-    (vr.stops || []).forEach(stop => {
+    (vr.stops || []).forEach((stop, stopIdx) => {
       const custEntry = (_nameQueue[stop.name] || []).shift();
       if (custEntry && state.markers[custEntry.id]) {
         const flag = stop.violation > 0 ? ` ⚠️ +${stop.violation}m late`
@@ -1223,10 +1307,24 @@ function drawRoutes(data) {
           `🚪 Departs: ${stop.depart}<br>` +
           `⏱ Window: ${stop.tw_start}–${stop.tw_end}${flag}`
         );
-        try {
-          const el = state.markers[custEntry.id].getElement();
-          if (el) { const dot = el.querySelector('div'); if (dot) dot.style.background = vr.color; }
-        } catch(e) {}
+        // Update marker: show visit-order number (1 = first stop on this route)
+        // in the vehicle's colour so it's easy to see which route each stop belongs to.
+        const visitNum = stopIdx + 1;
+        custEntry.route_visit_num    = visitNum;
+        custEntry.route_vehicle_num  = vr.vehicle_id + 1;
+        custEntry.route_vehicle_color = vr.color;
+        const routeIcon = L.divIcon({
+          className: '',
+          html: `<div style="
+            width:26px;height:26px;border-radius:50%;
+            background:${vr.color};border:3px solid #fff;
+            box-shadow:0 2px 6px rgba(0,0,0,.45);
+            color:#fff;font-size:11px;font-weight:700;
+            display:flex;align-items:center;justify-content:center;
+            line-height:1;">${visitNum}</div>`,
+          iconSize:[26,26], iconAnchor:[13,13], popupAnchor:[0,-16]
+        });
+        state.markers[custEntry.id].setIcon(routeIcon);
       }
     });
   });
@@ -1244,6 +1342,26 @@ function drawRoutes(data) {
 }
 
 function clearRoutes() {
+  // Restore each customer marker to its original insertion-order number + blue
+  state.customers.forEach(c => {
+    c.route_visit_num    = null;
+    c.route_vehicle_num  = null;
+    c.route_vehicle_color = null;
+    const marker = state.markers[c.id];
+    if (marker) {
+      marker.setIcon(L.divIcon({
+        className: '',
+        html: `<div style="
+          width:26px;height:26px;border-radius:50%;
+          background:#3498db;border:3px solid #fff;
+          box-shadow:0 2px 6px rgba(0,0,0,.45);
+          color:#fff;font-size:11px;font-weight:700;
+          display:flex;align-items:center;justify-content:center;
+          line-height:1;">${c.customer_id}</div>`,
+        iconSize:[26,26], iconAnchor:[13,13], popupAnchor:[0,-16]
+      }));
+    }
+  });
   Object.values(state.routeLayers).forEach(l => safeRemove(l));
   state.routeLayers = {};
   state.vehicleVisible = {};
@@ -1539,7 +1657,7 @@ async function captureMapCanvas() {
  * draw only its route + stop markers, capture it, then tear it down.
  * This never touches the main map at all.
  */
-async function captureVehicleMap(vr) {
+async function captureVehicleMap(vr, vehicleIdx, totalVehicles) {
   if (!vr.geometry || vr.geometry.length < 2) return null;
 
   const W = 900, H = 500;
@@ -1563,9 +1681,28 @@ async function captureVehicleMap(vr) {
     maxZoom: 19, crossOrigin: true,
   }).addTo(vMap);
 
-  // 3. Route polyline
+  // 3. Route polyline with side‑by‑side offset (add white outline for PDF as well)
   const latlngs = vr.geometry.map(([lng, lat]) => [lat, lng]);
-  L.polyline(latlngs, { color: vr.color, weight: 5, opacity: 0.9, smoothFactor: 1 }).addTo(vMap);
+  const offsetPx = getOffsetForVehicle(vehicleIdx, totalVehicles);
+  
+  // White outline (thicker)
+  L.polyline(latlngs, {
+    color: '#ffffff',
+    weight: 7,
+    opacity: 0.6,
+    smoothFactor: 1,
+    offset: offsetPx,
+    interactive: false
+  }).addTo(vMap);
+  
+  // Coloured line
+  L.polyline(latlngs, {
+    color: vr.color,
+    weight: 5,
+    opacity: 0.9,
+    smoothFactor: 1,
+    offset: offsetPx
+  }).addTo(vMap);
 
   // 4. Depot marker
   L.circleMarker(latlngs[0], {
@@ -1671,9 +1808,11 @@ async function generatePDF() {
 
   // ── Capture per-vehicle maps ───────────────────────────────────────────────
   const vehicleMaps = {};
-  for (const vr of d.vehicle_routes) {
-    btn.textContent = t('captureVehicle')(vr.vehicle_id + 1, d.vehicle_routes.length);
-    vehicleMaps[vr.vehicle_id] = await captureVehicleMap(vr);
+  const totalVehicles = d.vehicle_routes.length;
+  for (let i = 0; i < d.vehicle_routes.length; i++) {
+    const vr = d.vehicle_routes[i];
+    btn.textContent = t('captureVehicle')(i + 1, totalVehicles);
+    vehicleMaps[vr.vehicle_id] = await captureVehicleMap(vr, i, totalVehicles);
     await sleep(200);
   }
 
@@ -2058,6 +2197,8 @@ function _applyWorkspaceSnapshot(ws) {
     if (a.dist_rsd_per_km !== undefined)      document.getElementById('adv-dist-rsd-per-km').value    = a.dist_rsd_per_km;
     if (a.tw_penalty_rsd !== undefined)       document.getElementById('adv-tw-penalty-rsd').value     = a.tw_penalty_rsd;
     if (a.alns_cooling !== undefined)         document.getElementById('adv-alns-cooling').value       = a.alns_cooling;
+    if (a.hist_blend_weight !== undefined)    document.getElementById('adv-hist-blend-weight').value  = a.hist_blend_weight;
+    if (a.departure_time !== undefined)       document.getElementById('adv-dep-time').value           = a.departure_time;
   }
   if (s.pkg_sizes) {
     document.getElementById('pkg-size-1').value = s.pkg_sizes[0] || 0.10;
@@ -2076,8 +2217,8 @@ function _applyWorkspaceSnapshot(ws) {
   // Re-render everything
   clearRoutes();
   redrawAllMarkers();
-  renderLocations();
-  renderFleet();
+  renderLocationsList();
+  renderFleetCards();
   updatePkgSizes();
   updatePkgWeights();
   updateCostHint();
@@ -2097,23 +2238,68 @@ function _applyWorkspaceSnapshot(ws) {
 
 function redrawAllMarkers() {
   // Clear existing markers and re-add from state
-  Object.values(state.markers || {}).forEach(m => map.removeLayer(m));
+  Object.values(state.markers || {}).forEach(m => safeRemove(m));
   state.markers = {};
-  state.depots.forEach(dep => {
-    const m = L.marker([dep.lat, dep.lng], { icon: makeIcon(DEPOT_COLOR, true) })
+
+  state.depots.forEach((dep, i) => {
+    const icon = L.divIcon({
+      className: '',
+      html: `<div style="
+        width:24px;height:24px;border-radius:50%;
+        background:${DEPOT_COLOR};border:3px solid #fff;
+        box-shadow:0 2px 6px rgba(0,0,0,.5);
+        display:flex;align-items:center;justify-content:center;
+        font-size:12px;line-height:1;color:#fff;font-weight:700;">${i + 1}</div>`,
+      iconSize:[24,24], iconAnchor:[12,12], popupAnchor:[0,-14]
+    });
+    const m = L.marker([dep.lat, dep.lng], { icon, draggable: true })
       .addTo(map)
-      .bindPopup(`<b>${dep.name}</b><br>Depot`);
+      .bindPopup(`<b>${dep.name}</b><br>${dep.lat.toFixed(5)}, ${dep.lng.toFixed(5)}`);
+    m.on('dragend', e => {
+      const p = e.target.getLatLng();
+      dep.lat = p.lat; dep.lng = p.lng;
+      m.getPopup().setContent(`<b>${dep.name}</b><br>${p.lat.toFixed(5)}, ${p.lng.toFixed(5)}`);
+    });
+    m.on('contextmenu', () => removeDepot(dep.id));
     state.markers[dep.id] = m;
   });
-  state.customers.forEach(c => {
-    const m = L.marker([c.lat, c.lng], { icon: makeIcon('#3b82f6', false) })
+
+  state.customers.forEach((c, i) => {
+    const num = i + 1;
+    const pkg = c.pkg_counts || [0, 0, 0];
+    const vol = calcVolume(pkg);
+    const unload = c.unloading_time || 10;
+    const tw = c.time_window || { start: '09:00', end: '17:00' };
+    const icon = L.divIcon({
+      className: '',
+      html: `<div style="
+        width:26px;height:26px;border-radius:50%;
+        background:#3498db;border:3px solid #fff;
+        box-shadow:0 2px 6px rgba(0,0,0,.45);
+        color:#fff;font-size:11px;font-weight:700;
+        display:flex;align-items:center;justify-content:center;
+        line-height:1;">${num}</div>`,
+      iconSize:[26,26], iconAnchor:[13,13], popupAnchor:[0,-16]
+    });
+    const m = L.marker([c.lat, c.lng], { icon, draggable: true })
       .addTo(map)
-      .bindPopup(`<b>${c.name}</b>`);
+      .bindPopup(
+        `<b>${esc(c.name)}</b><br>` +
+        `📦 P1:${pkg[0]} P2:${pkg[1]} P3:${pkg[2]}<br>` +
+        `📐 ${vol.toFixed(2)} m³ · ⚖️ ${calcWeight(pkg).toFixed(1)} kg<br>` +
+        `⏱ ${tw.start}–${tw.end}<br>` +
+        `🔧 ${t('unloadPopup')(unload)}`
+      );
+    m.on('dragend', e => {
+      const p = e.target.getLatLng();
+      c.lat = p.lat; c.lng = p.lng;
+    });
+    m.on('contextmenu', () => removeCustomer(c.id));
     state.markers[c.id] = m;
   });
+
   if (state.depots.length > 0) {
-    const d = state.depots[0];
-    map.setView([d.lat, d.lng], 12);
+    map.setView([state.depots[0].lat, state.depots[0].lng], 12);
   }
 }
 
