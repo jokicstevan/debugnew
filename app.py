@@ -994,15 +994,24 @@ def fetch_here_matrix(locations, pairs=None, hav_km=None, sentinel_factor=None,
     fetch_set = pairs if pairs is not None else {(i, j) for i in range(n) for j in range(n) if i != j}
 
     # ── Concurrent HERE API calls ─────────────────────────────────────────────
-    # Each pair is fetched in its own thread.  Individual failures are tolerated:
-    # a failed pair keeps its pre-filled sentinel value so the pool always
-    # finishes quickly.  We only abandon HERE entirely if MORE than
-    # HERE_FAIL_THRESHOLD of pairs fail (likely a key/quota problem).
-    MAX_HERE_WORKERS   = 20
-    HERE_FAIL_THRESHOLD = 0.5   # abort if >50% of pairs fail
+    # Strategy:
+    #   • Tolerate individual timeouts — failed pair keeps its haversine sentinel
+    #   • Abort the whole HERE attempt (fall back to OSRM) if EITHER:
+    #       a) >20% of pairs fail  (API key / quota problem), OR
+    #       b) the wall-clock deadline is exceeded (HERE is just too slow today)
+    #   • Hard per-request timeout of 6 s (connect 3 s + read 6 s)
+    #   • Wall-clock budget: 45 s for ≤50 pairs, 90 s for larger sets
+    MAX_HERE_WORKERS    = 20
+    HERE_FAIL_THRESHOLD = 0.20   # abort if >20% of pairs fail
+    wall_budget         = 90.0 if len(fetch_set) > 50 else 45.0
+    wall_deadline       = time.time() + wall_budget
+
+    abort_flag = threading.Event()   # set to signal all threads to stop fast
 
     def _fetch_pair(i, j):
         """Fetch one (i,j) route. Returns (i, j, dist_km, time_min) or None."""
+        if abort_flag.is_set():
+            return None
         params = {
             "apiKey":        HERE_API_KEY,
             "transportMode": "car",
@@ -1014,7 +1023,7 @@ def fetch_here_matrix(locations, pairs=None, hav_km=None, sentinel_factor=None,
         }
         try:
             resp = requests.get("https://router.hereapi.com/v8/routes",
-                                params=params, timeout=(4, 8))
+                                params=params, timeout=(3, 6))
             if resp.status_code == 200:
                 routes = resp.json().get("routes", [])
                 if routes:
@@ -1026,15 +1035,27 @@ def fetch_here_matrix(locations, pairs=None, hav_km=None, sentinel_factor=None,
         return None
 
     api_calls = failures = 0
+    timed_out = False
     with ThreadPoolExecutor(max_workers=MAX_HERE_WORKERS) as pool:
         futures = {pool.submit(_fetch_pair, i, j): (i, j) for (i, j) in fetch_set}
+        n_pairs = len(futures)
         for future in as_completed(futures):
+            # Wall-clock deadline check
+            if time.time() > wall_deadline:
+                timed_out = True
+                abort_flag.set()
+                print(f"[HERE matrix] wall-clock deadline exceeded after "
+                      f"{api_calls} successes / {failures} failures — falling back to OSRM")
+                pool.shutdown(wait=False, cancel_futures=True)
+                return None, None
+
             result = future.result()
             if result is None:
                 failures += 1
-                # Abort early if majority failing — saves time, falls back to OSRM
-                if failures > len(fetch_set) * HERE_FAIL_THRESHOLD:
-                    print(f"[HERE matrix] too many failures ({failures}), aborting")
+                if failures > n_pairs * HERE_FAIL_THRESHOLD:
+                    abort_flag.set()
+                    print(f"[HERE matrix] failure threshold exceeded "
+                          f"({failures}/{n_pairs}) — falling back to OSRM")
                     pool.shutdown(wait=False, cancel_futures=True)
                     return None, None
             else:
@@ -1919,65 +1940,72 @@ class VRPState:
 
 # ─── ALNS operators ──────────────────────────────────────────────────────────
 
-def _ins_cost(route, pos, c, state, depot):
-    """Improved insertion cost that accounts for optimal departure time shift.
-    Returns the delta in the objective value (wages + optional distance).
+def _ins_cost(route, pos, c, state, depot,
+              _old_start=None, _old_work_mins=None, _old_dist=None):
+    """Insertion cost delta for placing customer c at position pos in route.
+
+    Pre-computed baseline values (_old_start, _old_work_mins, _old_dist) can be
+    passed in by the caller to avoid recomputing them for every position on the
+    same route — the old route is identical across all positions, so these never
+    change within a vehicle loop.  When omitted they are computed here (safe but
+    slower — only use the bare form in unit-test / ad-hoc contexts).
     """
-    # Build new route with customer inserted at pos
+    ow       = state.obj_weights or {}
+    do_wages = ow.get("wages",    False)
+    do_dist  = ow.get("distance", False)
+    do_fuel  = ow.get("fuel",     False)
+
     new_route = route[:pos] + [c] + route[pos:]
-    old_route = route
 
-    # Compute total working minutes for old route (using optimal departure)
-    old_start = latest_feasible_departure(
-        old_route, depot, state.dist_mat, state.time_mat,
-        state.tw, state.svc, state.svc_map, no_wait=state.no_wait
-    )
-    old_work_mins = route_working_minutes(
-        old_route, depot, state.dist_mat, state.time_mat,
-        state.tw, state.svc, old_start, state.svc_map, no_wait=state.no_wait
-    ) if old_route else 0.0
+    # ── Baseline (old route) — use pre-computed values when available ─────────
+    if _old_start is None:
+        _old_start = latest_feasible_departure(
+            route, depot, state.dist_mat, state.time_mat,
+            state.tw, state.svc, state.svc_map, no_wait=state.no_wait)
+    if _old_work_mins is None:
+        _old_work_mins = route_working_minutes(
+            route, depot, state.dist_mat, state.time_mat,
+            state.tw, state.svc, _old_start, state.svc_map,
+            no_wait=state.no_wait) if route else 0.0
+    if _old_dist is None:
+        _old_dist = route_dist(route, depot, state.dist_mat) if route else 0.0
 
-    # Compute total working minutes for new route
-    new_start = latest_feasible_departure(
-        new_route, depot, state.dist_mat, state.time_mat,
-        state.tw, state.svc, state.svc_map, no_wait=state.no_wait
-    )
-    new_work_mins = route_working_minutes(
-        new_route, depot, state.dist_mat, state.time_mat,
-        state.tw, state.svc, new_start, state.svc_map, no_wait=state.no_wait
-    )
+    # ── New route ─────────────────────────────────────────────────────────────
+    # Distance delta: cheap O(1) — only the two edges touching pos change.
+    prev_node = route[pos - 1] if pos > 0 else depot
+    next_node = route[pos]     if pos < len(route) else depot
+    dm        = state.dist_mat
+    dist_delta = (dm[prev_node][c] + dm[c][next_node]
+                  - dm[prev_node][next_node])
 
-    # Distance delta (only matters if distance is in the objective)
-    # Compute total distance for old and new routes
-    old_dist = route_dist(old_route, depot, state.dist_mat) if old_route else 0.0
-    new_dist = route_dist(new_route, depot, state.dist_mat)
-
-    # Objective weights
-    ow = state.obj_weights or {}
-    do_wages = ow.get("wages", False)
-    do_dist = ow.get("distance", False)
-    do_fuel = ow.get("fuel", False)   # fuel not directly in insertion cost – approximated by distance
+    new_dist = _old_dist + dist_delta
 
     cost = 0.0
-    if do_wages:
-        cost += ((new_work_mins - old_work_mins) / 60.0) * state.driver_wage_rsd_h
     if do_dist:
-        cost += (new_dist - old_dist) * state.dist_rsd_per_km
+        cost += dist_delta * state.dist_rsd_per_km
     if do_fuel:
-        # Rough approximation: 10 L/100km * fuel price
         fuel_per_km = 10.0 / 100.0 * state.fuel_price_rsd_l
-        cost += (new_dist - old_dist) * fuel_per_km
+        cost += dist_delta * fuel_per_km
 
-    # If the new route is infeasible (e.g., violates time windows when use_tw=False)
-    # the working minutes calculation would have returned inf? Actually `latest_feasible_departure`
-    # returns depot open if infeasible, but we need a clear signal.
-    # We can check feasibility by calling route_time with new_start.
-    feasible, _ = route_time(
-        new_route, depot, state.dist_mat, state.time_mat,
-        state.tw, state.svc, new_start, state.svc_map, no_wait=state.no_wait
-    )
-    if not feasible and state.use_tw:
-        return float("inf")
+    if do_wages or state.use_tw:
+        new_start = latest_feasible_departure(
+            new_route, depot, state.dist_mat, state.time_mat,
+            state.tw, state.svc, state.svc_map, no_wait=state.no_wait)
+        new_work_mins = route_working_minutes(
+            new_route, depot, state.dist_mat, state.time_mat,
+            state.tw, state.svc, new_start, state.svc_map, no_wait=state.no_wait)
+        if do_wages:
+            cost += ((new_work_mins - _old_work_mins) / 60.0) * state.driver_wage_rsd_h
+        if state.use_tw:
+            feasible, _ = route_time(
+                new_route, depot, state.dist_mat, state.time_mat,
+                state.tw, state.svc, new_start, state.svc_map, no_wait=state.no_wait)
+            if not feasible:
+                return float("inf")
+    else:
+        # No wages / TW — use the O(1) distance-only approximation, no route_time needed
+        new_start = _old_start
+
     return cost
 
 
@@ -2207,10 +2235,22 @@ def _greedy_insert(state, rng):
             if state.use_weight_cap and wc > 0 and s.weight_load(v) + cust_kg > wc:
                 continue
             d = s.depot_of[v]
-            for pos in range(len(s.routes[v]) + 1):
-                cost = _ins_cost(s.routes[v], pos, c, state, d)
-                # When minimising vehicles, heavily penalise opening a new (empty) vehicle
-                if minimise_vehicles and not s.routes[v]:
+            route = s.routes[v]
+            # Pre-compute baseline once per vehicle (shared across all positions)
+            old_start = latest_feasible_departure(
+                route, d, state.dist_mat, state.time_mat,
+                state.tw, state.svc, state.svc_map, no_wait=state.no_wait)
+            old_work  = route_working_minutes(
+                route, d, state.dist_mat, state.time_mat,
+                state.tw, state.svc, old_start, state.svc_map,
+                no_wait=state.no_wait) if route else 0.0
+            old_dist  = route_dist(route, d, state.dist_mat) if route else 0.0
+            for pos in range(len(route) + 1):
+                cost = _ins_cost(route, pos, c, state, d,
+                                 _old_start=old_start,
+                                 _old_work_mins=old_work,
+                                 _old_dist=old_dist)
+                if minimise_vehicles and not route:
                     cost += 1_000_000.0
                 if cost < best_cost:
                     best_cost, best_v, best_pos = cost, v, pos
@@ -2239,11 +2279,23 @@ def _regret_insert(state, rng):
                 if state.use_weight_cap and wc > 0 and s.weight_load(v) + cust_kg > wc:
                     continue
                 d = s.depot_of[v]
-                for pos in range(len(s.routes[v]) + 1):
-                    cost = _ins_cost(s.routes[v], pos, c, state, d)
+                route = s.routes[v]
+                # Pre-compute baseline once per vehicle
+                old_start = latest_feasible_departure(
+                    route, d, state.dist_mat, state.time_mat,
+                    state.tw, state.svc, state.svc_map, no_wait=state.no_wait)
+                old_work  = route_working_minutes(
+                    route, d, state.dist_mat, state.time_mat,
+                    state.tw, state.svc, old_start, state.svc_map,
+                    no_wait=state.no_wait) if route else 0.0
+                old_dist  = route_dist(route, d, state.dist_mat) if route else 0.0
+                for pos in range(len(route) + 1):
+                    cost = _ins_cost(route, pos, c, state, d,
+                                     _old_start=old_start,
+                                     _old_work_mins=old_work,
+                                     _old_dist=old_dist)
                     if cost < float("inf"):
-                        # Penalise opening a new vehicle when minimising count
-                        if minimise_vehicles and not s.routes[v]:
+                        if minimise_vehicles and not route:
                             cost += 1_000_000.0
                         opts.append((cost, v, pos))
             if not opts:
@@ -2624,7 +2676,27 @@ def _do_optimize(data, user):
     fleet_cfg   = data.get("fleet", [])
     algorithm   = data.get("algorithm", "ALNS")
     use_tw      = data.get("use_time_windows", False)
-    max_iter    = int(data.get("max_iterations", 300))
+    # Auto-scale max_iter based on problem size when the user hasn't overridden it.
+    # More iterations = better quality, but cost is O(n²) per iteration.
+    # Heuristic: keep wall time roughly constant across problem sizes.
+    #   ≤ 20 customers  → 600 iterations  (fast, explore more)
+    #   21–40 customers → 400 iterations
+    #   41–60 customers → 250 iterations
+    #   61–80 customers → 180 iterations
+    #   > 80 customers  → 120 iterations
+    _n_custs_hint = len(data.get("customers", []))
+    if "max_iterations" in data:
+        max_iter = int(data["max_iterations"])
+    elif _n_custs_hint <= 20:
+        max_iter = 600
+    elif _n_custs_hint <= 40:
+        max_iter = 400
+    elif _n_custs_hint <= 60:
+        max_iter = 250
+    elif _n_custs_hint <= 80:
+        max_iter = 180
+    else:
+        max_iter = 120
     temperature = float(data.get("temperature", 150.0))
     # Objective weights: which cost components to minimise.
     # All flags default to False so that only the components explicitly
@@ -2702,6 +2774,12 @@ def _do_optimize(data, user):
     dist_mat, time_mat, matrix_source = fetch_best_matrix(
         all_locs_orig, k_nearest=k_nearest, sentinel_factor=sentinel_factor,
         departure_min=departure_min, hist_blend_weight=hist_blend_weight)
+
+    # Convert to numpy arrays for fast O(1) element access inside the solver.
+    # List-of-lists indexing (dist_mat[i][j]) is slower than numpy (dist_mat[i,j])
+    # for the millions of lookups made during ALNS iterations.
+    dist_mat = np.array(dist_mat, dtype=np.float64)
+    time_mat = np.array(time_mat, dtype=np.float64)
 
     # Fire off background pre-fetch of historical traffic for this set of
     # locations so future optimisation runs have richer cache data.
