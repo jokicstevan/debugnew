@@ -156,6 +156,25 @@ def _ensure_schema():
             CREATE INDEX IF NOT EXISTS idx_traffic_cache_lookup
             ON grps_traffic_cache (orig_lat, orig_lng, dest_lat, dest_lng, slot_minutes)
         """)
+
+        # ── Async optimization job queue ─────────────────────────────────────
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS grps_jobs (
+                job_id      TEXT        PRIMARY KEY,
+                status      TEXT        NOT NULL DEFAULT 'running',
+                result_json TEXT,
+                error       TEXT,
+                owner       TEXT        NOT NULL DEFAULT 'unknown',
+                created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+        cur.execute("""
+            DELETE FROM grps_jobs
+            WHERE status != 'running'
+              AND created_at < NOW() - INTERVAL '2 hours'
+        """)
+
         conn.commit()
         conn.close()
         _db_ready = True
@@ -166,6 +185,89 @@ def _ensure_schema():
 
 # Run schema setup in a background thread so a slow DB doesn't delay startup
 threading.Thread(target=_ensure_schema, daemon=True).start()
+
+
+# ── Postgres-backed job store helpers ─────────────────────────────────────────
+
+_local_jobs: dict = {}   # fallback when DATABASE_URL is not set
+
+
+def _job_create(job_id: str, owner: str):
+    if not DATABASE_URL:
+        _local_jobs[job_id] = {"status": "running", "result": None, "error": None}
+        return
+    try:
+        conn = _get_db_conn()
+        cur  = conn.cursor()
+        cur.execute(
+            "INSERT INTO grps_jobs (job_id, status, owner) VALUES (%s, 'running', %s)",
+            (job_id, owner)
+        )
+        conn.commit()
+        conn.close()
+    except Exception as exc:
+        print(f"[jobs] create failed: {exc}")
+        _local_jobs[job_id] = {"status": "running", "result": None, "error": None}
+
+
+def _job_set_done(job_id: str, result_dict: dict):
+    if not DATABASE_URL:
+        if job_id in _local_jobs:
+            _local_jobs[job_id].update({"status": "done", "result": result_dict})
+        return
+    try:
+        conn = _get_db_conn()
+        cur  = conn.cursor()
+        cur.execute(
+            "UPDATE grps_jobs SET status='done', result_json=%s, updated_at=NOW() WHERE job_id=%s",
+            (json.dumps(result_dict), job_id)
+        )
+        conn.commit()
+        conn.close()
+    except Exception as exc:
+        print(f"[jobs] set_done failed: {exc}")
+
+
+def _job_set_error(job_id: str, error: str):
+    if not DATABASE_URL:
+        if job_id in _local_jobs:
+            _local_jobs[job_id].update({"status": "error", "error": error})
+        return
+    try:
+        conn = _get_db_conn()
+        cur  = conn.cursor()
+        cur.execute(
+            "UPDATE grps_jobs SET status='error', error=%s, updated_at=NOW() WHERE job_id=%s",
+            (error, job_id)
+        )
+        conn.commit()
+        conn.close()
+    except Exception as exc:
+        print(f"[jobs] set_error failed: {exc}")
+
+
+def _job_get(job_id: str):
+    """Return {status, result, error} or None if not found."""
+    if not DATABASE_URL:
+        return _local_jobs.get(job_id)
+    try:
+        conn = _get_db_conn()
+        cur  = conn.cursor()
+        cur.execute(
+            "SELECT status, result_json, error FROM grps_jobs WHERE job_id=%s",
+            (job_id,)
+        )
+        row = cur.fetchone()
+        conn.close()
+        if not row:
+            return None
+        status, result_json, error = row
+        return {"status": status,
+                "result": json.loads(result_json) if result_json else None,
+                "error":  error}
+    except Exception as exc:
+        print(f"[jobs] get failed: {exc}")
+        return None
 
 
 def _save_route_to_db_async(payload: dict):
@@ -2420,37 +2522,10 @@ def optimize_alns(dist_mat, time_mat, n_depots, n_cust, tw, demands,
         )
 
 
-# ─────────────────────── OPTIMIZE JOB STORE ──────────────────────────────────
-#
-# Jobs are kept in a module-level dict so any worker thread can write results
-# while the HTTP thread polls.  Keys are UUID strings; values are dicts:
-#   { "status": "running"|"done"|"error",
-#     "result": <jsonify-able dict> | None,
-#     "error":  <str> | None,
-#     "user":   <str>,          ← owner, for optional access control
-#     "started": <float> }      ← time.time() at launch
-#
-# Completed jobs are pruned when they are older than JOB_TTL_SECONDS so memory
-# doesn't grow unboundedly on a long-running deployment.
+# ─────────────────────── OPTIMIZE ENDPOINT ───────────────────────────────────
 
 import uuid as _uuid
 
-_jobs: dict = {}
-_jobs_lock  = threading.Lock()
-JOB_TTL_SECONDS = 3600   # keep completed jobs for 1 hour
-
-
-def _prune_old_jobs():
-    """Remove completed/errored jobs older than JOB_TTL_SECONDS."""
-    now = time.time()
-    with _jobs_lock:
-        stale = [jid for jid, j in _jobs.items()
-                 if j["status"] != "running" and now - j["started"] > JOB_TTL_SECONDS]
-        for jid in stale:
-            del _jobs[jid]
-
-
-# ─────────────────────── OPTIMIZE ENDPOINT ───────────────────────────────────
 
 @app.route("/api/optimize", methods=["POST"])
 @login_required
@@ -2458,38 +2533,28 @@ def optimize():
     """Accept an optimization request, launch it in a background thread, and
     immediately return a job_id.  The client polls /api/optimize/status/<job_id>
     until status == 'done' or 'error'.
+
+    Job state is stored in Postgres (grps_jobs) so any gunicorn worker can
+    serve the status poll — fixes the 404 that occurred when the poll landed
+    on a different worker than the one that created the job.
     """
     data = request.json
     if not data:
         return jsonify({"ok": False, "error": "No data received"})
 
-    _prune_old_jobs()
-
     job_id = str(_uuid.uuid4())
     user   = session.get("user", "unknown")
 
-    with _jobs_lock:
-        _jobs[job_id] = {
-            "status":  "running",
-            "result":  None,
-            "error":   None,
-            "user":    user,
-            "started": time.time(),
-        }
+    _job_create(job_id, user)
 
     def _run():
         try:
             result = _do_optimize(data, user)
-            with _jobs_lock:
-                _jobs[job_id]["status"] = "done"
-                _jobs[job_id]["result"] = result
+            _job_set_done(job_id, result)
         except Exception as exc:
             import traceback
-            tb = traceback.format_exc()
-            print(f"[optimize job {job_id}] EXCEPTION: {exc}\n{tb}")
-            with _jobs_lock:
-                _jobs[job_id]["status"] = "error"
-                _jobs[job_id]["error"]  = str(exc)
+            print(f"[optimize job {job_id}] EXCEPTION: {exc}\n{traceback.format_exc()}")
+            _job_set_error(job_id, str(exc))
 
     threading.Thread(target=_run, daemon=True).start()
     return jsonify({"ok": True, "job_id": job_id})
@@ -2498,16 +2563,13 @@ def optimize():
 @app.route("/api/optimize/status/<job_id>", methods=["GET"])
 @login_required
 def optimize_status(job_id):
-    """Poll endpoint.  Returns:
-      { ok, status: 'running' }                   — still computing
-      { ok, status: 'done', result: { … } }       — finished, result is the
-                                                     same payload the old
-                                                     synchronous endpoint returned
-      { ok: false, status: 'error', error: '…' }  — job failed
-      404 if job_id is unknown (expired or invalid)
+    """Poll endpoint — reads job state from Postgres, works on any worker.
+      { ok:true,  status:'running' }               — still computing
+      { ok:true,  status:'done', result:{…} }      — finished
+      { ok:false, status:'error', error:'…' }     — job failed
+      404 if job_id unknown or expired
     """
-    with _jobs_lock:
-        job = _jobs.get(job_id)
+    job = _job_get(job_id)
 
     if job is None:
         return jsonify({"ok": False, "error": "Job not found or expired"}), 404
@@ -2518,7 +2580,6 @@ def optimize_status(job_id):
     if job["status"] == "error":
         return jsonify({"ok": False, "status": "error", "error": job["error"]})
 
-    # done
     return jsonify({"ok": True, "status": "done", "result": job["result"]})
 
 
