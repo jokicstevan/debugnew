@@ -964,19 +964,16 @@ def fetch_here_matrix(locations, pairs=None, hav_km=None, sentinel_factor=None,
 
     fetch_set = pairs if pairs is not None else {(i, j) for i in range(n) for j in range(n) if i != j}
 
-    # ── Concurrent HERE API calls ─────────────────────────────────────────────────────────────────────
-    # Replace the old sequential loop with a thread pool so N pairs are fetched
-    # in parallel rather than one-by-one.  With MAX_HERE_WORKERS=20 threads,
-    # 150 pairs at ~2 s average → ~15 s total instead of ~300 s sequential,
-    # comfortably inside the gunicorn worker timeout.
-    MAX_HERE_WORKERS = 20
-    failed = threading.Event()   # set by any thread that gets a bad response
+    # ── Concurrent HERE API calls ─────────────────────────────────────────────
+    # Each pair is fetched in its own thread.  Individual failures are tolerated:
+    # a failed pair keeps its pre-filled sentinel value so the pool always
+    # finishes quickly.  We only abandon HERE entirely if MORE than
+    # HERE_FAIL_THRESHOLD of pairs fail (likely a key/quota problem).
+    MAX_HERE_WORKERS   = 20
+    HERE_FAIL_THRESHOLD = 0.5   # abort if >50% of pairs fail
 
     def _fetch_pair(i, j):
-        """Fetch a single (i, j) route from HERE.  Returns (i, j, dist_km, time_min)
-        or returns None to signal failure."""
-        if failed.is_set():
-            return None
+        """Fetch one (i,j) route. Returns (i, j, dist_km, time_min) or None."""
         params = {
             "apiKey":        HERE_API_KEY,
             "transportMode": "car",
@@ -988,39 +985,38 @@ def fetch_here_matrix(locations, pairs=None, hav_km=None, sentinel_factor=None,
         }
         try:
             resp = requests.get("https://router.hereapi.com/v8/routes",
-                                params=params, timeout=(5, 10))
+                                params=params, timeout=(4, 8))
             if resp.status_code == 200:
                 routes = resp.json().get("routes", [])
                 if routes:
-                    summary = routes[0]["sections"][0]["summary"]
-                    return (i, j,
-                            summary["length"]   / 1000.0,   # m  → km
-                            summary["duration"] / 60.0)     # s  → min
-            print(f"[HERE matrix] ({i},{j}) failed: {resp.status_code} {resp.text[:100]}")
+                    s = routes[0]["sections"][0]["summary"]
+                    return (i, j, s["length"] / 1000.0, s["duration"] / 60.0)
+            print(f"[HERE matrix] ({i},{j}) failed: {resp.status_code}")
         except Exception as e:
             print(f"[HERE matrix] ({i},{j}) exception: {e}")
-        failed.set()
         return None
 
+    api_calls = failures = 0
     with ThreadPoolExecutor(max_workers=MAX_HERE_WORKERS) as pool:
         futures = {pool.submit(_fetch_pair, i, j): (i, j) for (i, j) in fetch_set}
-        api_calls = 0
         for future in as_completed(futures):
-            if failed.is_set():
-                pool.shutdown(wait=False, cancel_futures=True)
-                return None, None
             result = future.result()
             if result is None:
-                pool.shutdown(wait=False, cancel_futures=True)
-                return None, None
-            i, j, dist, time_val = result
-            dist_mat[i][j] = dist
-            time_mat[i][j]  = time_val
-            api_calls += 1
+                failures += 1
+                # Abort early if majority failing — saves time, falls back to OSRM
+                if failures > len(fetch_set) * HERE_FAIL_THRESHOLD:
+                    print(f"[HERE matrix] too many failures ({failures}), aborting")
+                    pool.shutdown(wait=False, cancel_futures=True)
+                    return None, None
+            else:
+                i, j, dist, time_val = result
+                dist_mat[i][j] = dist
+                time_mat[i][j] = time_val
+                api_calls += 1
 
     skipped = n * (n - 1) - api_calls
     print(f"[HERE matrix] ✅ {n}×{n} matrix built with live traffic "
-          f"({api_calls} API calls, {skipped} sentinel-filled)")
+          f"({api_calls} API calls, {failures} failed→sentinel, {skipped} skipped)")
     return dist_mat, time_mat
 
 

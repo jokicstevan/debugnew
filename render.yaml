@@ -32,6 +32,10 @@ services:
           property: connectionString
       - key: PYTHONUNBUFFERED
         value: "1"
+      - key: WEB_CONCURRENCY
+        value: "2"
+      - key: GUNICORN_CMD_ARGS
+        value: "--timeout 900 --graceful-timeout 30 --keep-alive 5"
 
 databases:
   - name: grps-db
