@@ -1092,7 +1092,7 @@ function updateRouteDetail() {
   // Below zoom 13 the PolylineOffset pixel-offset causes loops at bends
   // (a 3 px shift on a 5 px segment wraps around corners).  Collapse to 0
   // until the user zooms in to street level where offsets look correct.
-  const useOffset     = zoom >= 13;
+  const useOffset     = zoom >= 11;
   const totalVehicles = (state.lastResult.vehicle_routes || []).length;
 
   (state.lastResult.vehicle_routes || []).forEach(vr => {
