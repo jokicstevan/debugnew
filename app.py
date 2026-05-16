@@ -1984,26 +1984,75 @@ class VRPState:
 
 # ─── ALNS operators ──────────────────────────────────────────────────────────
 
-def _ins_cost(route, pos, c, state, depot):
-    """Insertion cost of customer c at position pos in route.
+def _ins_cost(route, pos, c, state, depot,
+              _old_start=None, _old_work_mins=None, _old_dist=None):
+    """Insertion cost delta for placing customer c at position pos in route.
 
-    Uses a fast distance-delta metric.  When time-window constraints are active,
-    performs a single route_time feasibility check and returns inf for infeasible
-    insertions.  This avoids the expensive latest_feasible_departure /
-    route_working_minutes calls that were causing memory and CPU issues at scale.
+    Accounts for the active objective components (wages, fuel, distance) so the
+    insertion heuristic minimises the same metric as the objective function.
+
+    Pre-computed baseline values (_old_start, _old_work_mins, _old_dist) can be
+    passed in by the caller to avoid recomputing them for every position on the
+    same route — the old route is identical across all positions, so these never
+    change within a vehicle loop.  When omitted they are computed here (safe but
+    slower — only use the bare form in ad-hoc / unit-test contexts).
     """
-    new_r = route[:pos] + [c] + route[pos:]
-    ok, _ = route_time(new_r, depot, state.dist_mat, state.time_mat, state.tw,
-                       state.svc, svc_map=state.svc_map, no_wait=state.no_wait)
-    # Only hard-reject on TW infeasibility when TW constraints are actually enforced.
-    # When use_tw=False, a long route may still violate the default TW window used
-    # internally, but that must not prevent consolidation onto a single vehicle.
-    if not ok and state.use_tw:
-        return float("inf")
-    prev = route[pos - 1] if pos > 0 else depot
-    nxt  = route[pos]     if pos < len(route) else depot
-    return (state.dist_mat[prev][c] + state.dist_mat[c][nxt]
-            - state.dist_mat[prev][nxt])
+    ow       = state.obj_weights or {}
+    do_wages = ow.get("wages",    False)
+    do_dist  = ow.get("distance", False)
+    do_fuel  = ow.get("fuel",     False)
+
+    new_route = route[:pos] + [c] + route[pos:]
+
+    # ── Baseline (old route) — use pre-computed values when available ─────────
+    if _old_start is None:
+        _old_start = latest_feasible_departure(
+            route, depot, state.dist_mat, state.time_mat,
+            state.tw, state.svc, state.svc_map, no_wait=state.no_wait)
+    if _old_work_mins is None:
+        _old_work_mins = route_working_minutes(
+            route, depot, state.dist_mat, state.time_mat,
+            state.tw, state.svc, _old_start, state.svc_map,
+            no_wait=state.no_wait) if route else 0.0
+    if _old_dist is None:
+        _old_dist = route_dist(route, depot, state.dist_mat) if route else 0.0
+
+    # ── Distance delta: O(1) — only the two edges touching pos change ─────────
+    prev_node = route[pos - 1] if pos > 0 else depot
+    next_node = route[pos]     if pos < len(route) else depot
+    dm        = state.dist_mat
+    dist_delta = (dm[prev_node][c] + dm[c][next_node]
+                  - dm[prev_node][next_node])
+
+    cost = 0.0
+    if do_dist:
+        cost += dist_delta * state.dist_rsd_per_km
+    if do_fuel:
+        fuel_per_km = 10.0 / 100.0 * state.fuel_price_rsd_l
+        cost += dist_delta * fuel_per_km
+
+    if do_wages or state.use_tw:
+        new_start = latest_feasible_departure(
+            new_route, depot, state.dist_mat, state.time_mat,
+            state.tw, state.svc, state.svc_map, no_wait=state.no_wait)
+        new_work_mins = route_working_minutes(
+            new_route, depot, state.dist_mat, state.time_mat,
+            state.tw, state.svc, new_start, state.svc_map, no_wait=state.no_wait)
+        if do_wages:
+            cost += ((new_work_mins - _old_work_mins) / 60.0) * state.driver_wage_rsd_h
+        if state.use_tw:
+            feasible, _ = route_time(
+                new_route, depot, state.dist_mat, state.time_mat,
+                state.tw, state.svc, new_start, state.svc_map, no_wait=state.no_wait)
+            if not feasible:
+                return float("inf")
+    else:
+        # No wages / TW — distance-only approximation, no route_time needed
+        if not do_dist and not do_fuel:
+            # Fallback: raw distance delta (e.g. no objectives ticked)
+            cost = dist_delta
+
+    return cost
 
 
 def _rand_remove(state, rng):
@@ -2170,8 +2219,20 @@ def _greedy_insert(state, rng):
                 continue
             d = s.depot_of[v]
             route = s.routes[v]
+            # Pre-compute baseline once per vehicle — reused across all positions
+            old_start = latest_feasible_departure(
+                route, d, state.dist_mat, state.time_mat,
+                state.tw, state.svc, state.svc_map, no_wait=state.no_wait)
+            old_work  = route_working_minutes(
+                route, d, state.dist_mat, state.time_mat,
+                state.tw, state.svc, old_start, state.svc_map,
+                no_wait=state.no_wait) if route else 0.0
+            old_dist  = route_dist(route, d, state.dist_mat) if route else 0.0
             for pos in range(len(route) + 1):
-                cost = _ins_cost(route, pos, c, state, d)
+                cost = _ins_cost(route, pos, c, state, d,
+                                 _old_start=old_start,
+                                 _old_work_mins=old_work,
+                                 _old_dist=old_dist)
                 # When minimising vehicles, heavily penalise opening a new (empty) vehicle
                 if minimise_vehicles and not route:
                     cost += 1_000_000.0
@@ -2203,8 +2264,20 @@ def _regret_insert(state, rng):
                     continue
                 d = s.depot_of[v]
                 route = s.routes[v]
+                # Pre-compute baseline once per vehicle — reused across all positions
+                old_start = latest_feasible_departure(
+                    route, d, state.dist_mat, state.time_mat,
+                    state.tw, state.svc, state.svc_map, no_wait=state.no_wait)
+                old_work  = route_working_minutes(
+                    route, d, state.dist_mat, state.time_mat,
+                    state.tw, state.svc, old_start, state.svc_map,
+                    no_wait=state.no_wait) if route else 0.0
+                old_dist  = route_dist(route, d, state.dist_mat) if route else 0.0
                 for pos in range(len(route) + 1):
-                    cost = _ins_cost(route, pos, c, state, d)
+                    cost = _ins_cost(route, pos, c, state, d,
+                                     _old_start=old_start,
+                                     _old_work_mins=old_work,
+                                     _old_dist=old_dist)
                     if cost < float("inf"):
                         # Penalise opening a new vehicle when minimising count
                         if minimise_vehicles and not route:
@@ -2951,7 +3024,7 @@ def _do_optimize(data, user):
         _, sched = route_time(route, depot_mat, dist_mat, time_mat, tw,
                                SERVICE_TIME, depart_min, svc_map, no_wait=no_wait)
         stops = []
-        for entry in sched:
+        for stop_num, entry in enumerate(sched, start=1):
             cmat     = entry["customer_mat"]
             loc      = all_locs[cmat]
             t        = loc.get("time_window", {"start":"?","end":"?"})
@@ -2967,6 +3040,7 @@ def _do_optimize(data, user):
             split_counts = [round(cnt / n_splits_for_cust, 4) for cnt in c_counts]
             c_volume = demands[sub_idx]   # already the partial volume
             stops.append({
+                "stop_number":  stop_num,
                 "name":         loc.get("name", ""),
                 "lat":          loc.get("lat"),
                 "lng":          loc.get("lng"),
