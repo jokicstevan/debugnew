@@ -1247,13 +1247,90 @@ function drawRoutes(data) {
     st.style.color = '#e74c3c';
   }
 
+  // ── Overlap detection ────────────────────────────────────────────────────
+  // For each route segment, check if any other route passes through the same
+  // road corridor (within ~25 m). Overlapping segments are drawn dashed.
+  //
+  // Algorithm:
+  //  1. Snap every segment midpoint to a grid cell (≈25 m resolution).
+  //  2. Build a map: cellKey → Set of vehicle_ids whose segment midpoint
+  //     falls in that cell.
+  //  3. When drawing a vehicle's segments, dash those whose cell is shared
+  //     with at least one other vehicle.
+  //
+  // Grid resolution: 1 cell ≈ 0.00025° ≈ 22–27 m at mid-European latitudes.
+  const GRID_RES = 0.00025;
+  function cellKey(lat, lng) {
+    return `${Math.round(lat / GRID_RES)}_${Math.round(lng / GRID_RES)}`;
+  }
+
+  // Build grid: cellKey → array of vehicle_ids
+  const cellVehicles = {};
+  (data.vehicle_routes || []).forEach(vr => {
+    if (!vr.geometry || vr.geometry.length < 2) return;
+    const pts = vr.geometry.map(([lng, lat]) => [lat, lng]);
+    for (let i = 0; i < pts.length - 1; i++) {
+      const midLat = (pts[i][0] + pts[i+1][0]) / 2;
+      const midLng = (pts[i][1] + pts[i+1][1]) / 2;
+      const k = cellKey(midLat, midLng);
+      if (!cellVehicles[k]) cellVehicles[k] = new Set();
+      cellVehicles[k].add(vr.vehicle_id);
+    }
+  });
+
+  // Determine which cells are shared by 2+ vehicles
+  const sharedCells = new Set(
+    Object.entries(cellVehicles)
+      .filter(([, vids]) => vids.size > 1)
+      .map(([k]) => k)
+  );
+
   data.vehicle_routes.forEach(vr => {
     if (!vr.geometry || vr.geometry.length < 2) return;
-    const latlngs = vr.geometry.map(([lng, lat]) => [lat, lng]);
-    const layer = L.polyline(latlngs, {
-      color: vr.color, weight: 4, opacity: 0.85, smoothFactor: 1
-    }).addTo(map);
-    state.routeLayers[vr.vehicle_id] = layer;
+    const pts = vr.geometry.map(([lng, lat]) => [lat, lng]);
+
+    // Split the route into runs of solid vs dashed segments
+    // Each run is { dashed: bool, latlngs: [...] }
+    const runs = [];
+    let currentDashed = null;
+    let currentRun = null;
+
+    for (let i = 0; i < pts.length - 1; i++) {
+      const midLat = (pts[i][0] + pts[i+1][0]) / 2;
+      const midLng = (pts[i][1] + pts[i+1][1]) / 2;
+      const dashed = sharedCells.has(cellKey(midLat, midLng));
+
+      if (dashed !== currentDashed) {
+        if (currentRun) currentRun.push(pts[i]); // close the previous run
+        currentRun = [pts[i]];
+        currentDashed = dashed;
+        runs.push({ dashed, latlngs: currentRun });
+      }
+      currentRun.push(pts[i+1]);
+    }
+
+    // Draw all runs as sub-layers inside a LayerGroup so toggle still works
+    const subLayers = [];
+    runs.forEach(run => {
+      if (run.latlngs.length < 2) return;
+      const options = {
+        color: vr.color,
+        weight: run.dashed ? 5 : 4,
+        opacity: run.dashed ? 0.95 : 0.85,
+        smoothFactor: 1,
+      };
+      if (run.dashed) {
+        // CSS dash pattern via dashArray; also draw a white underline for contrast
+        subLayers.push(
+          L.polyline(run.latlngs, { color: '#ffffff', weight: 7, opacity: 0.6, smoothFactor: 1 })
+        );
+        options.dashArray = '10 8';
+      }
+      subLayers.push(L.polyline(run.latlngs, options));
+    });
+
+    const group = L.layerGroup(subLayers).addTo(map);
+    state.routeLayers[vr.vehicle_id] = group;
     state.vehicleVisible[vr.vehicle_id] = true;
 
     // Update each customer marker: popup with schedule + dot colour = vehicle colour
@@ -1452,6 +1529,18 @@ function renderLegend(data) {
   if (!data.vehicle_routes.length) { panel.classList.add('hidden'); return; }
   panel.classList.remove('hidden');
 
+  const overlapHint = data.vehicle_routes.length > 1
+    ? `<div style="margin-top:8px;padding:5px 6px;border-radius:5px;
+                   background:rgba(128,128,128,0.08);font-size:10px;
+                   color:var(--muted);display:flex;align-items:center;gap:6px">
+         <svg width="28" height="10" style="flex-shrink:0">
+           <line x1="0" y1="5" x2="28" y2="5"
+                 stroke="#888" stroke-width="3"
+                 stroke-dasharray="6 5" stroke-linecap="round"/>
+         </svg>
+         Dashed = shared road segment
+       </div>` : '';
+
   rows.innerHTML = data.vehicle_routes.map(vr => {
     const depotSub = vr.depot_name
       ? `<span style="display:block;font-size:9px;color:var(--muted)">🏠 ${esc(vr.depot_name)}</span>` : '';
@@ -1461,7 +1550,7 @@ function renderLegend(data) {
       <span class="legend-label">${esc(vr.type)} #${vr.vehicle_id+1}${depotSub}</span>
       <span class="legend-eye">👁</span>
     </div>`;
-  }).join('');
+  }).join('') + overlapHint;
 }
 
 function toggleRoute(vid) {
