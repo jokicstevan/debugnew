@@ -496,7 +496,6 @@ window.addEventListener('DOMContentLoaded', () => {
   L.control.layers(layers, {}, { position:'topright' }).addTo(map);
 
   map.on('click', onMapClick);
-  map.on('zoomend', updateRouteDetail);
 
   renderFleetCards();
   updateFleetFooter();
@@ -1054,58 +1053,6 @@ function updateConstraintHint() {
   }
 }
 
-// ─── HELPER: compute visual offset for a vehicle (pixels) ───────────────────
-function getOffsetForVehicle(vehicleId, totalVehicles) {
-  // Symmetric offsets: centre line = 0, step = 6 pixels
-  // Example: 3 vehicles → offsets: -6, 0, +6
-  const step = 6;
-  const center = (totalVehicles - 1) / 2;
-  return (vehicleId - center) * step;
-}
-
-// Below this zoom level the detailed HERE/OSRM geometry produces visual
-// artifacts (loops, hairlines) because the polyline has more detail than
-// the screen has pixels for the route.  We switch to depot→stop→depot
-// straight lines instead, with no per-vehicle offset (overlaps are fine
-// at small scale and actually look cleaner).
-// Line weight scales with zoom so road-geometry loops stay visually thin
-// when zoomed out and look natural at street level.
-//   zoom <= 10 : 0.8px  (country/region)
-//   zoom 11    : 1.2px
-//   zoom 12    : 1.8px
-//   zoom 13    : 2.5px  (city-district — where the loops were noticeable)
-//   zoom 14    : 3.5px
-//   zoom >= 15 : 4.5px  (street level, full detail)
-function routeWeightForZoom(zoom) {
-  if (zoom <= 10) return 0.8;
-  if (zoom === 11) return 1.2;
-  if (zoom === 12) return 1.8;
-  if (zoom === 13) return 2.5;
-  if (zoom === 14) return 3.5;
-  return 4.5;
-}
-
-function updateRouteDetail() {
-  if (!state.lastResult) return;
-  const zoom          = map.getZoom();
-  const weight        = routeWeightForZoom(zoom);
-  // Below zoom 13 the PolylineOffset pixel-offset causes loops at bends
-  // (a 3 px shift on a 5 px segment wraps around corners).  Collapse to 0
-  // until the user zooms in to street level where offsets look correct.
-  const useOffset     = zoom >= 15;
-  const totalVehicles = (state.lastResult.vehicle_routes || []).length;
-
-  (state.lastResult.vehicle_routes || []).forEach(vr => {
-    const layer        = state.routeLayers[vr.vehicle_id];
-    const outlineLayer = state.routeLayers['outline_' + vr.vehicle_id];
-    if (!layer) return;
-
-    const offsetPx = useOffset ? getOffsetForVehicle(vr.vehicle_id, totalVehicles) : 0;
-    layer.setStyle({ weight: weight, opacity: 0.85, offset: offsetPx });
-    if (outlineLayer) outlineLayer.setStyle({ weight: weight + 2, opacity: 0.4, offset: offsetPx });
-  });
-}
-
 
 // ─── OPTIMIZATION ────────────────────────────────────────────────────────────
 async function runOptimize() {
@@ -1239,14 +1186,10 @@ function setProgress(pct, msg) {
   document.getElementById('progress-label').textContent = msg;
 }
 
-// ─── DRAW ROUTES ON MAP (with offset for side‑by‑side overlap) ───────────────
+// ─── DRAW ROUTES ──────────────────────────────────────────────────
 function drawRoutes(data) {
   // Reset all customer markers back to default blue before colouring served ones
   state.customers.forEach(c => {
-    // Clear any route-visit numbering from a previous run
-    c.route_visit_num    = null;
-    c.route_vehicle_num  = null;
-    c.route_vehicle_color = null;
     const marker = state.markers[c.id];
     if (marker) {
       const icon = L.divIcon({
@@ -1304,33 +1247,12 @@ function drawRoutes(data) {
     st.style.color = '#e74c3c';
   }
 
-  const totalVehicles = data.vehicle_routes.length;
   data.vehicle_routes.forEach(vr => {
     if (!vr.geometry || vr.geometry.length < 2) return;
     const latlngs = vr.geometry.map(([lng, lat]) => [lat, lng]);
-    const offsetPx = getOffsetForVehicle(vr.vehicle_id, totalVehicles);
-    
-    // White outline (thicker, same offset) for contrast — stored so clearRoutes removes it
-    const outlineKey = `outline_${vr.vehicle_id}`;
-    const outlineLayer = L.polyline(latlngs, {
-      color: '#ffffff',
-      weight: 6,
-      opacity: 0.5,
-      smoothFactor: 0,
-      offset: offsetPx,
-      interactive: false
-    }).addTo(map);
-    state.routeLayers[outlineKey] = outlineLayer;
-
-    // Coloured line on top
     const layer = L.polyline(latlngs, {
-      color: vr.color,
-      weight: 4,
-      opacity: 0.85,
-      smoothFactor: 0,
-      offset: offsetPx
+      color: vr.color, weight: 4, opacity: 0.85, smoothFactor: 1
     }).addTo(map);
-
     state.routeLayers[vr.vehicle_id] = layer;
     state.vehicleVisible[vr.vehicle_id] = true;
 
@@ -1340,7 +1262,7 @@ function drawRoutes(data) {
     state.customers.forEach(c => {
       (_nameQueue[c.name] = _nameQueue[c.name] || []).push(c);
     });
-    (vr.stops || []).forEach((stop, stopIdx) => {
+    (vr.stops || []).forEach(stop => {
       const custEntry = (_nameQueue[stop.name] || []).shift();
       if (custEntry && state.markers[custEntry.id]) {
         const flag = stop.violation > 0 ? ` ⚠️ +${stop.violation}m late`
@@ -1354,24 +1276,10 @@ function drawRoutes(data) {
           `🚪 Departs: ${stop.depart}<br>` +
           `⏱ Window: ${stop.tw_start}–${stop.tw_end}${flag}`
         );
-        // Update marker: show visit-order number (1 = first stop on this route)
-        // in the vehicle's colour so it's easy to see which route each stop belongs to.
-        const visitNum = stopIdx + 1;
-        custEntry.route_visit_num    = visitNum;
-        custEntry.route_vehicle_num  = vr.vehicle_id + 1;
-        custEntry.route_vehicle_color = vr.color;
-        const routeIcon = L.divIcon({
-          className: '',
-          html: `<div style="
-            width:26px;height:26px;border-radius:50%;
-            background:${vr.color};border:3px solid #fff;
-            box-shadow:0 2px 6px rgba(0,0,0,.45);
-            color:#fff;font-size:11px;font-weight:700;
-            display:flex;align-items:center;justify-content:center;
-            line-height:1;">${visitNum}</div>`,
-          iconSize:[26,26], iconAnchor:[13,13], popupAnchor:[0,-16]
-        });
-        state.markers[custEntry.id].setIcon(routeIcon);
+        try {
+          const el = state.markers[custEntry.id].getElement();
+          if (el) { const dot = el.querySelector('div'); if (dot) dot.style.background = vr.color; }
+        } catch(e) {}
       }
     });
   });
@@ -1386,31 +1294,9 @@ function drawRoutes(data) {
       if (bounds && bounds.isValid()) map.fitBounds(bounds, { padding:[40,40] });
     }
   } catch(e) { console.warn('fitBounds:', e); }
-  // Apply straight-line/detailed geometry based on current zoom
-  updateRouteDetail();
 }
 
 function clearRoutes() {
-  // Restore each customer marker to its original insertion-order number + blue
-  state.customers.forEach(c => {
-    c.route_visit_num    = null;
-    c.route_vehicle_num  = null;
-    c.route_vehicle_color = null;
-    const marker = state.markers[c.id];
-    if (marker) {
-      marker.setIcon(L.divIcon({
-        className: '',
-        html: `<div style="
-          width:26px;height:26px;border-radius:50%;
-          background:#3498db;border:3px solid #fff;
-          box-shadow:0 2px 6px rgba(0,0,0,.45);
-          color:#fff;font-size:11px;font-weight:700;
-          display:flex;align-items:center;justify-content:center;
-          line-height:1;">${c.customer_id}</div>`,
-        iconSize:[26,26], iconAnchor:[13,13], popupAnchor:[0,-16]
-      }));
-    }
-  });
   Object.values(state.routeLayers).forEach(l => safeRemove(l));
   state.routeLayers = {};
   state.vehicleVisible = {};
@@ -1579,17 +1465,14 @@ function renderLegend(data) {
 }
 
 function toggleRoute(vid) {
-  const visible     = state.vehicleVisible[vid];
-  const layer       = state.routeLayers[vid];
-  const outlineLayer = state.routeLayers[`outline_${vid}`];
-  const row         = document.getElementById('leg-'+vid);
+  const visible = state.vehicleVisible[vid];
+  const layer   = state.routeLayers[vid];
+  const row     = document.getElementById('leg-'+vid);
   if (visible) {
     safeRemove(layer);
-    safeRemove(outlineLayer);
     row.classList.add('hidden-route');
     state.vehicleVisible[vid] = false;
   } else {
-    if (outlineLayer && !map.hasLayer(outlineLayer)) outlineLayer.addTo(map);
     if (layer && !map.hasLayer(layer)) layer.addTo(map);
     row.classList.remove('hidden-route');
     state.vehicleVisible[vid] = true;
@@ -1599,16 +1482,13 @@ function toggleRoute(vid) {
 function toggleAllRoutes() {
   const allVis = Object.values(state.vehicleVisible).every(v => v);
   Object.keys(state.vehicleVisible).forEach(vid => {
-    const layer        = state.routeLayers[vid];
-    const outlineLayer = state.routeLayers[`outline_${vid}`];
+    const layer = state.routeLayers[vid];
     if (allVis) {
       safeRemove(layer);
-      safeRemove(outlineLayer);
       state.vehicleVisible[vid] = false;
       const row = document.getElementById('leg-'+vid);
       if (row) row.classList.add('hidden-route');
     } else {
-      if (outlineLayer && !map.hasLayer(outlineLayer)) outlineLayer.addTo(map);
       if (layer && !map.hasLayer(layer)) layer.addTo(map);
       state.vehicleVisible[vid] = true;
       const row = document.getElementById('leg-'+vid);
@@ -1712,7 +1592,7 @@ async function captureMapCanvas() {
  * draw only its route + stop markers, capture it, then tear it down.
  * This never touches the main map at all.
  */
-async function captureVehicleMap(vr, vehicleIdx, totalVehicles) {
+async function captureVehicleMap(vr) {
   if (!vr.geometry || vr.geometry.length < 2) return null;
 
   const W = 900, H = 500;
@@ -1736,28 +1616,9 @@ async function captureVehicleMap(vr, vehicleIdx, totalVehicles) {
     maxZoom: 19, crossOrigin: true,
   }).addTo(vMap);
 
-  // 3. Route polyline with side‑by‑side offset (add white outline for PDF as well)
+  // 3. Route polyline
   const latlngs = vr.geometry.map(([lng, lat]) => [lat, lng]);
-  const offsetPx = getOffsetForVehicle(vehicleIdx, totalVehicles);
-  
-  // White outline (thicker)
-  L.polyline(latlngs, {
-    color: '#ffffff',
-    weight: 7,
-    opacity: 0.6,
-    smoothFactor: 1,
-    offset: offsetPx,
-    interactive: false
-  }).addTo(vMap);
-  
-  // Coloured line
-  L.polyline(latlngs, {
-    color: vr.color,
-    weight: 5,
-    opacity: 0.9,
-    smoothFactor: 1,
-    offset: offsetPx
-  }).addTo(vMap);
+  L.polyline(latlngs, { color: vr.color, weight: 5, opacity: 0.9, smoothFactor: 1 }).addTo(vMap);
 
   // 4. Depot marker
   L.circleMarker(latlngs[0], {
@@ -1867,7 +1728,7 @@ async function generatePDF() {
   for (let i = 0; i < d.vehicle_routes.length; i++) {
     const vr = d.vehicle_routes[i];
     btn.textContent = t('captureVehicle')(i + 1, totalVehicles);
-    vehicleMaps[vr.vehicle_id] = await captureVehicleMap(vr, i, totalVehicles);
+    vehicleMaps[vr.vehicle_id] = await captureVehicleMap(vr);
     await sleep(200);
   }
 
