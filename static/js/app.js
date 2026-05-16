@@ -1247,16 +1247,15 @@ function drawRoutes(data) {
     st.style.color = '#e74c3c';
   }
 
-  // ── Overlap detection ────────────────────────────────────────────────────
-  // For each route segment, check if any other route passes through the same
-  // road corridor (within ~25 m). Overlapping segments are drawn dashed.
-  //
-  // Algorithm:
-  //  1. Snap every segment midpoint to a grid cell (≈25 m resolution).
-  //  2. Build a map: cellKey → Set of vehicle_ids whose segment midpoint
-  //     falls in that cell.
-  //  3. When drawing a vehicle's segments, dash those whose cell is shared
-  //     with at least one other vehicle.
+  // ── Overlap detection & alternating-color dashing ────────────────────────
+  // Strategy:
+  //  1. Snap each segment midpoint to a ~25 m grid cell.
+  //  2. Build cellKey → sorted array of vehicle_ids that pass through it.
+  //  3. Non-shared segments are drawn solid.
+  //  4. Shared segments get N interleaved dashed polylines (one per sharing
+  //     vehicle), each with dashOffset = i * DASH_LEN so the dashes tile
+  //     without gaps and each vehicle's color fills 1/N of the cycle.
+  //  5. Each vehicle's dashes are stored in its own LayerGroup → toggle works.
   //
   // Grid resolution: 1 cell ≈ 0.00025° ≈ 22–27 m at mid-European latitudes.
   const GRID_RES = 0.00025;
@@ -1264,7 +1263,7 @@ function drawRoutes(data) {
     return `${Math.round(lat / GRID_RES)}_${Math.round(lng / GRID_RES)}`;
   }
 
-  // Build grid: cellKey → array of vehicle_ids
+  // Build grid: cellKey → Set of vehicle_ids
   const cellVehicles = {};
   (data.vehicle_routes || []).forEach(vr => {
     if (!vr.geometry || vr.geometry.length < 2) return;
@@ -1278,58 +1277,82 @@ function drawRoutes(data) {
     }
   });
 
-  // Determine which cells are shared by 2+ vehicles
-  const sharedCells = new Set(
-    Object.entries(cellVehicles)
-      .filter(([, vids]) => vids.size > 1)
-      .map(([k]) => k)
-  );
+  // sharedCells: cellKey → sorted vehicle_id[] (only cells with 2+ vehicles)
+  const sharedCells = {};
+  Object.entries(cellVehicles).forEach(([k, vids]) => {
+    if (vids.size > 1) sharedCells[k] = [...vids].sort((a, b) => a - b);
+  });
+
+  // Color lookup
+  const vehicleColor = {};
+  (data.vehicle_routes || []).forEach(vr => { vehicleColor[vr.vehicle_id] = vr.color; });
+
+  // DASH_LEN px per vehicle dash; gap fills the rest of the N-vehicle cycle.
+  const DASH_LEN = 12;
+
+  // Accumulate sub-layers per vehicle before building LayerGroups
+  const vehicleSubLayers = {};
+  (data.vehicle_routes || []).forEach(vr => { vehicleSubLayers[vr.vehicle_id] = []; });
 
   data.vehicle_routes.forEach(vr => {
     if (!vr.geometry || vr.geometry.length < 2) return;
     const pts = vr.geometry.map(([lng, lat]) => [lat, lng]);
 
-    // Split the route into runs of solid vs dashed segments
-    // Each run is { dashed: bool, latlngs: [...] }
+    // Split route into runs by sharing-group signature
     const runs = [];
-    let currentDashed = null;
+    let currentSig = undefined;
     let currentRun = null;
 
     for (let i = 0; i < pts.length - 1; i++) {
       const midLat = (pts[i][0] + pts[i+1][0]) / 2;
       const midLng = (pts[i][1] + pts[i+1][1]) / 2;
-      const dashed = sharedCells.has(cellKey(midLat, midLng));
+      const k = cellKey(midLat, midLng);
+      const sharingVids = sharedCells[k] || null;
+      const sig = sharingVids ? sharingVids.join(',') : '';
 
-      if (dashed !== currentDashed) {
-        if (currentRun) currentRun.push(pts[i]); // close the previous run
+      if (sig !== currentSig) {
+        if (currentRun) currentRun.push(pts[i]);
         currentRun = [pts[i]];
-        currentDashed = dashed;
-        runs.push({ dashed, latlngs: currentRun });
+        currentSig = sig;
+        runs.push({ sig, sharingVids, latlngs: currentRun });
       }
-      currentRun.push(pts[i+1]);
+      currentRun.push(pts[i + 1]);
     }
 
-    // Draw all runs as sub-layers inside a LayerGroup so toggle still works
-    const subLayers = [];
     runs.forEach(run => {
       if (run.latlngs.length < 2) return;
-      const options = {
-        color: vr.color,
-        weight: run.dashed ? 5 : 4,
-        opacity: run.dashed ? 0.95 : 0.85,
-        smoothFactor: 1,
-      };
-      if (run.dashed) {
-        // CSS dash pattern via dashArray; also draw a white underline for contrast
-        subLayers.push(
-          L.polyline(run.latlngs, { color: '#ffffff', weight: 7, opacity: 0.6, smoothFactor: 1 })
-        );
-        options.dashArray = '10 8';
-      }
-      subLayers.push(L.polyline(run.latlngs, options));
-    });
 
-    const group = L.layerGroup(subLayers).addTo(map);
+      if (!run.sharingVids) {
+        // Solid, non-shared segment
+        vehicleSubLayers[vr.vehicle_id].push(
+          L.polyline(run.latlngs, { color: vr.color, weight: 4, opacity: 0.85, smoothFactor: 1 })
+        );
+      } else {
+        // Shared segment: add one interleaved dashed layer per sharing vehicle,
+        // each stored in THAT vehicle's LayerGroup so toggling works correctly.
+        const n = run.sharingVids.length;
+        const gap = (n - 1) * DASH_LEN;
+        run.sharingVids.forEach((vid, i) => {
+          if (vehicleSubLayers[vid] === undefined) return;
+          vehicleSubLayers[vid].push(
+            L.polyline(run.latlngs, {
+              color:        vehicleColor[vid],
+              weight:       5,
+              opacity:      0.95,
+              smoothFactor: 1,
+              dashArray:    `${DASH_LEN} ${gap}`,
+              dashOffset:   `${i * DASH_LEN}`,
+            })
+          );
+        });
+      }
+    });
+  });
+
+  // Build LayerGroups and add to map
+  data.vehicle_routes.forEach(vr => {
+    if (!vr.geometry || vr.geometry.length < 2) return;
+    const group = L.layerGroup(vehicleSubLayers[vr.vehicle_id]).addTo(map);
     state.routeLayers[vr.vehicle_id] = group;
     state.vehicleVisible[vr.vehicle_id] = true;
 
