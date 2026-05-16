@@ -1247,20 +1247,73 @@ function drawRoutes(data) {
     st.style.color = '#e74c3c';
   }
 
-  // ── Overlap detection & alternating-color dashing ────────────────────────
-  // Strategy:
-  //  1. Snap each segment midpoint to a ~25 m grid cell.
-  //  2. Build cellKey → sorted array of vehicle_ids that pass through it.
-  //  3. Non-shared segments are drawn solid.
-  //  4. Shared segments get N interleaved dashed polylines (one per sharing
-  //     vehicle), each with dashOffset = i * DASH_LEN so the dashes tile
-  //     without gaps and each vehicle's color fills 1/N of the cycle.
-  //  5. Each vehicle's dashes are stored in its own LayerGroup → toggle works.
+  // ── Overlap detection & zoom-invariant alternating-color splitting ─────────
+  // pixel-based dashArray shifts with zoom, so instead we split each shared
+  // run geographically: slice the coordinate array into chunks of equal
+  // geographic length (CHUNK_DEG), then assign each chunk to vehicles in
+  // round-robin order. Each chunk is drawn as a short solid polyline in that
+  // vehicle's color, stored in that vehicle's LayerGroup → toggle still works.
+  // Because the slices are defined by coordinates, the 1/N split is exact at
+  // every zoom level.
   //
   // Grid resolution: 1 cell ≈ 0.00025° ≈ 22–27 m at mid-European latitudes.
   const GRID_RES = 0.00025;
   function cellKey(lat, lng) {
     return `${Math.round(lat / GRID_RES)}_${Math.round(lng / GRID_RES)}`;
+  }
+
+  // Geographic chunk length for alternating stripes (in degrees, ≈ 30 m).
+  // Each vehicle gets one chunk per cycle, so 2 vehicles → 30 m each = 60 m cycle.
+  const CHUNK_DEG = 0.00027;
+
+  // Euclidean distance in degrees (fine for short segments)
+  function segLen(a, b) {
+    const dlat = b[0] - a[0], dlng = b[1] - a[1];
+    return Math.sqrt(dlat * dlat + dlng * dlng);
+  }
+
+  // Interpolate between two [lat,lng] points at fraction t ∈ [0,1]
+  function interp(a, b, t) {
+    return [a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])];
+  }
+
+  // Slice a polyline (array of [lat,lng]) into equal-length geographic chunks.
+  // Uses cumulative arc length so each chunk is exactly chunkLen degrees long.
+  function slicePolylineClean(pts, chunkLen) {
+    const chunks = [];
+    let cur = [pts[0]];
+    let budget = chunkLen;
+
+    for (let i = 0; i + 1 < pts.length; i++) {
+      const A = pts[i], B = pts[i + 1];
+      let d = segLen(A, B);
+      let t0 = 0; // fraction of AB already consumed
+
+      while (t0 < 1) {
+        const tNeeded = budget / d;          // fraction of AB needed to fill budget
+        if (t0 + tNeeded >= 1 - 1e-10) {
+          // Rest of AB fits within budget
+          cur.push(B);
+          budget -= d * (1 - t0);
+          t0 = 1;
+          if (budget < 1e-10) {             // chunk exactly full
+            if (cur.length >= 2) chunks.push(cur);
+            cur = [B];
+            budget = chunkLen;
+          }
+        } else {
+          // Cut AB at t0+tNeeded
+          const cutPt = interp(A, B, t0 + tNeeded);
+          cur.push(cutPt);
+          if (cur.length >= 2) chunks.push(cur);
+          cur = [cutPt];
+          t0 += tNeeded;
+          budget = chunkLen;
+        }
+      }
+    }
+    if (cur.length >= 2) chunks.push(cur);
+    return chunks;
   }
 
   // Build grid: cellKey → Set of vehicle_ids
@@ -1286,9 +1339,6 @@ function drawRoutes(data) {
   // Color lookup
   const vehicleColor = {};
   (data.vehicle_routes || []).forEach(vr => { vehicleColor[vr.vehicle_id] = vr.color; });
-
-  // DASH_LEN px per vehicle dash; gap fills the rest of the N-vehicle cycle.
-  const DASH_LEN = 12;
 
   // Accumulate sub-layers per vehicle before building LayerGroups
   const vehicleSubLayers = {};
@@ -1328,20 +1378,19 @@ function drawRoutes(data) {
           L.polyline(run.latlngs, { color: vr.color, weight: 4, opacity: 0.85, smoothFactor: 1 })
         );
       } else {
-        // Shared segment: add one interleaved dashed layer per sharing vehicle,
-        // each stored in THAT vehicle's LayerGroup so toggling works correctly.
+        // Shared segment: slice into geographic chunks and assign round-robin.
+        // Each vehicle gets every N-th chunk → exact 1/N split at all zoom levels.
         const n = run.sharingVids.length;
-        const gap = (n - 1) * DASH_LEN;
-        run.sharingVids.forEach((vid, i) => {
+        const chunks = slicePolylineClean(run.latlngs, CHUNK_DEG);
+        chunks.forEach((chunkPts, ci) => {
+          const vid = run.sharingVids[ci % n];
           if (vehicleSubLayers[vid] === undefined) return;
           vehicleSubLayers[vid].push(
-            L.polyline(run.latlngs, {
+            L.polyline(chunkPts, {
               color:        vehicleColor[vid],
               weight:       5,
               opacity:      0.95,
-              smoothFactor: 1,
-              dashArray:    `${DASH_LEN} ${gap}`,
-              dashOffset:   `${i * DASH_LEN}`,
+              smoothFactor: 0,   // no smoothing — preserve exact cut points
             })
           );
         });
