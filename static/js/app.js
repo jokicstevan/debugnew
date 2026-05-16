@@ -497,6 +497,14 @@ window.addEventListener('DOMContentLoaded', () => {
 
   map.on('click', onMapClick);
 
+  // Redraw routes on zoom so shared-segment stripe width stays visually constant
+  map.on('zoomend', () => {
+    if (state.lastResult) {
+      clearRoutes();
+      drawRoutes(state.lastResult);
+    }
+  });
+
   renderFleetCards();
   updateFleetFooter();
   restorePanelStates();
@@ -1262,9 +1270,16 @@ function drawRoutes(data) {
     return `${Math.round(lat / GRID_RES)}_${Math.round(lng / GRID_RES)}`;
   }
 
-  // Geographic chunk length for alternating stripes (in degrees, ≈ 30 m).
-  // Each vehicle gets one chunk per cycle, so 2 vehicles → 30 m each = 60 m cycle.
-  const CHUNK_DEG = 0.00027;
+  // Compute chunk size in degrees so stripes are always ~STRIPE_PX pixels wide
+  // on screen, regardless of zoom level. We convert via Leaflet's CRS scale:
+  //   metersPerPx = 156543.03 * cos(centerLat) / 2^zoom   (Web Mercator)
+  //   degPerPx    = metersPerPx / 111320
+  const STRIPE_PX = 20;  // target stripe width in screen pixels
+  const zoom = map.getZoom();
+  const centerLat = map.getCenter().lat;
+  const metersPerPx = (156543.03392 * Math.cos(centerLat * Math.PI / 180)) / Math.pow(2, zoom);
+  const degPerPx = metersPerPx / 111320;
+  const CHUNK_DEG = STRIPE_PX * degPerPx;
 
   // Euclidean distance in degrees (fine for short segments)
   function segLen(a, b) {
@@ -1605,12 +1620,11 @@ function renderLegend(data) {
     ? `<div style="margin-top:8px;padding:5px 6px;border-radius:5px;
                    background:rgba(128,128,128,0.08);font-size:10px;
                    color:var(--muted);display:flex;align-items:center;gap:6px">
-         <svg width="28" height="10" style="flex-shrink:0">
-           <line x1="0" y1="5" x2="28" y2="5"
-                 stroke="#888" stroke-width="3"
-                 stroke-dasharray="6 5" stroke-linecap="round"/>
+         <svg width="32" height="10" style="flex-shrink:0">
+           <rect x="0" y="2" width="14" height="6" fill="#3b82f6" rx="1"/>
+           <rect x="16" y="2" width="14" height="6" fill="#f97316" rx="1"/>
          </svg>
-         Dashed = shared road segment
+         Striped = shared road segment
        </div>` : '';
 
   rows.innerHTML = data.vehicle_routes.map(vr => {
