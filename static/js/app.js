@@ -1068,20 +1068,31 @@ function getOffsetForVehicle(vehicleId, totalVehicles) {
 // the screen has pixels for the route.  We switch to depot→stop→depot
 // straight lines instead, with no per-vehicle offset (overlaps are fine
 // at small scale and actually look cleaner).
-const ZOOM_STRAIGHT_LINE = 11;
-
-function straightLinePath(vr) {
-  const pts = [];
-  pts.push([vr.depot_lat, vr.depot_lng]);
-  (vr.stops || []).forEach(s => pts.push([s.lat, s.lng]));
-  pts.push([vr.depot_lat, vr.depot_lng]);
-  return pts;
+// Line weight scales with zoom so road-geometry loops stay visually thin
+// when zoomed out and look natural at street level.
+//   zoom <= 10 : 0.8px  (country/region)
+//   zoom 11    : 1.2px
+//   zoom 12    : 1.8px
+//   zoom 13    : 2.5px  (city-district — where the loops were noticeable)
+//   zoom 14    : 3.5px
+//   zoom >= 15 : 4.5px  (street level, full detail)
+function routeWeightForZoom(zoom) {
+  if (zoom <= 10) return 0.8;
+  if (zoom === 11) return 1.2;
+  if (zoom === 12) return 1.8;
+  if (zoom === 13) return 2.5;
+  if (zoom === 14) return 3.5;
+  return 4.5;
 }
 
 function updateRouteDetail() {
   if (!state.lastResult) return;
-  const zoom = map.getZoom();
-  const useStraight = zoom < ZOOM_STRAIGHT_LINE;
+  const zoom          = map.getZoom();
+  const weight        = routeWeightForZoom(zoom);
+  // Below zoom 13 the PolylineOffset pixel-offset causes loops at bends
+  // (a 3 px shift on a 5 px segment wraps around corners).  Collapse to 0
+  // until the user zooms in to street level where offsets look correct.
+  const useOffset     = zoom >= 13;
   const totalVehicles = (state.lastResult.vehicle_routes || []).length;
 
   (state.lastResult.vehicle_routes || []).forEach(vr => {
@@ -1089,25 +1100,9 @@ function updateRouteDetail() {
     const outlineLayer = state.routeLayers['outline_' + vr.vehicle_id];
     if (!layer) return;
 
-    const offsetPx = getOffsetForVehicle(vr.vehicle_id, totalVehicles);
-    let latlngs;
-    if (useStraight) {
-      latlngs = straightLinePath(vr);
-    } else {
-      if (!vr.geometry || vr.geometry.length < 2) return;
-      latlngs = vr.geometry.map(([lng, lat]) => [lat, lng]);
-    }
-
-    layer.setLatLngs(latlngs);
-    if (outlineLayer) outlineLayer.setLatLngs(latlngs);
-
-    if (useStraight) {
-      layer.setStyle({ weight: 2, opacity: 0.65, offset: 0 });
-      if (outlineLayer) outlineLayer.setStyle({ weight: 3, opacity: 0.2, offset: 0 });
-    } else {
-      layer.setStyle({ weight: 4, opacity: 0.85, offset: offsetPx });
-      if (outlineLayer) outlineLayer.setStyle({ weight: 6, opacity: 0.5, offset: offsetPx });
-    }
+    const offsetPx = useOffset ? getOffsetForVehicle(vr.vehicle_id, totalVehicles) : 0;
+    layer.setStyle({ weight: weight, opacity: 0.85, offset: offsetPx });
+    if (outlineLayer) outlineLayer.setStyle({ weight: weight + 2, opacity: 0.4, offset: offsetPx });
   });
 }
 
@@ -1321,7 +1316,7 @@ function drawRoutes(data) {
       color: '#ffffff',
       weight: 6,
       opacity: 0.5,
-      smoothFactor: 1,
+      smoothFactor: 0,
       offset: offsetPx,
       interactive: false
     }).addTo(map);
@@ -1332,7 +1327,7 @@ function drawRoutes(data) {
       color: vr.color,
       weight: 4,
       opacity: 0.85,
-      smoothFactor: 1,
+      smoothFactor: 0,
       offset: offsetPx
     }).addTo(map);
 
