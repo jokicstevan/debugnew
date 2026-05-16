@@ -1008,7 +1008,7 @@ def fetch_here_matrix(locations, pairs=None, hav_km=None, sentinel_factor=None,
     #       b) the wall-clock deadline is exceeded (HERE is just too slow today)
     #   • Hard per-request timeout of 6 s (connect 3 s + read 6 s)
     #   • Wall-clock budget: 45 s for ≤50 pairs, 90 s for larger sets
-    MAX_HERE_WORKERS    = 20
+    MAX_HERE_WORKERS    = 4
     HERE_FAIL_THRESHOLD = 0.20   # abort if >20% of pairs fail
     wall_budget         = 90.0 if len(fetch_set) > 50 else 45.0
     wall_deadline       = time.time() + wall_budget
@@ -3058,6 +3058,11 @@ def _do_optimize(data, user):
     # so we defer hours/mins until after the loop
 
     # Phase 3: geometry + build response
+    # Free the large numpy matrices now — the solver is done with them and
+    # keeping them alive during geometry fetching wastes ~(n²×8) bytes.
+    del dist_mat, time_mat
+    import gc; gc.collect()
+
     vehicle_routes  = []
     real_total_dist = 0.0
 
