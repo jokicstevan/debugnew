@@ -1440,9 +1440,21 @@ function drawRoutes(data) {
           `🚪 Departs: ${stop.depart}<br>` +
           `⏱ Window: ${stop.tw_start}–${stop.tw_end}${flag}`
         );
+        // Update icon to show visit order (stop_number) in the vehicle's colour
         try {
-          const el = state.markers[custEntry.id].getElement();
-          if (el) { const dot = el.querySelector('div'); if (dot) dot.style.background = vr.color; }
+          const stopNum = stop.stop_number ?? stop.stop_num ?? '';
+          const updatedIcon = L.divIcon({
+            className: '',
+            html: `<div style="
+              width:26px;height:26px;border-radius:50%;
+              background:${vr.color};border:3px solid #fff;
+              box-shadow:0 2px 6px rgba(0,0,0,.45);
+              color:#fff;font-size:11px;font-weight:700;
+              display:flex;align-items:center;justify-content:center;
+              line-height:1;">${stopNum}</div>`,
+            iconSize:[26,26], iconAnchor:[13,13], popupAnchor:[0,-16]
+          });
+          state.markers[custEntry.id].setIcon(updatedIcon);
         } catch(e) {}
       }
     });
