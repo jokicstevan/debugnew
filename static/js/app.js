@@ -496,6 +496,7 @@ window.addEventListener('DOMContentLoaded', () => {
   L.control.layers(layers, {}, { position:'topright' }).addTo(map);
 
   map.on('click', onMapClick);
+  map.on('zoomend', updateRouteDetail);
 
   renderFleetCards();
   updateFleetFooter();
@@ -1062,6 +1063,55 @@ function getOffsetForVehicle(vehicleId, totalVehicles) {
   return (vehicleId - center) * step;
 }
 
+// Below this zoom level the detailed HERE/OSRM geometry produces visual
+// artifacts (loops, hairlines) because the polyline has more detail than
+// the screen has pixels for the route.  We switch to depot→stop→depot
+// straight lines instead, with no per-vehicle offset (overlaps are fine
+// at small scale and actually look cleaner).
+const ZOOM_STRAIGHT_LINE = 11;
+
+function straightLinePath(vr) {
+  const pts = [];
+  pts.push([vr.depot_lat, vr.depot_lng]);
+  (vr.stops || []).forEach(s => pts.push([s.lat, s.lng]));
+  pts.push([vr.depot_lat, vr.depot_lng]);
+  return pts;
+}
+
+function updateRouteDetail() {
+  if (!state.lastResult) return;
+  const zoom = map.getZoom();
+  const useStraight = zoom < ZOOM_STRAIGHT_LINE;
+  const totalVehicles = (state.lastResult.vehicle_routes || []).length;
+
+  (state.lastResult.vehicle_routes || []).forEach(vr => {
+    const layer        = state.routeLayers[vr.vehicle_id];
+    const outlineLayer = state.routeLayers['outline_' + vr.vehicle_id];
+    if (!layer) return;
+
+    const offsetPx = getOffsetForVehicle(vr.vehicle_id, totalVehicles);
+    let latlngs;
+    if (useStraight) {
+      latlngs = straightLinePath(vr);
+    } else {
+      if (!vr.geometry || vr.geometry.length < 2) return;
+      latlngs = vr.geometry.map(([lng, lat]) => [lat, lng]);
+    }
+
+    layer.setLatLngs(latlngs);
+    if (outlineLayer) outlineLayer.setLatLngs(latlngs);
+
+    if (useStraight) {
+      layer.setStyle({ weight: 2, opacity: 0.65, offset: 0 });
+      if (outlineLayer) outlineLayer.setStyle({ weight: 3, opacity: 0.2, offset: 0 });
+    } else {
+      layer.setStyle({ weight: 4, opacity: 0.85, offset: offsetPx });
+      if (outlineLayer) outlineLayer.setStyle({ weight: 6, opacity: 0.5, offset: offsetPx });
+    }
+  });
+}
+
+
 // ─── OPTIMIZATION ────────────────────────────────────────────────────────────
 async function runOptimize() {
   if (state.depots.length === 0) { alert(t('addDepotFirst')); return; }
@@ -1341,6 +1391,8 @@ function drawRoutes(data) {
       if (bounds && bounds.isValid()) map.fitBounds(bounds, { padding:[40,40] });
     }
   } catch(e) { console.warn('fitBounds:', e); }
+  // Apply straight-line/detailed geometry based on current zoom
+  updateRouteDetail();
 }
 
 function clearRoutes() {
