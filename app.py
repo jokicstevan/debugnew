@@ -189,12 +189,14 @@ threading.Thread(target=_ensure_schema, daemon=True).start()
 
 # ── Postgres-backed job store helpers ─────────────────────────────────────────
 
-_local_jobs: dict = {}   # fallback when DATABASE_URL is not set
+_local_jobs: dict = {}   # fallback when DATABASE_URL is not set or DB write fails
+_local_jobs_lock = threading.Lock()
 
 
 def _job_create(job_id: str, owner: str):
-    if not DATABASE_URL:
-        _local_jobs[job_id] = {"status": "running", "result": None, "error": None}
+    if not DATABASE_URL or not _db_ready:
+        with _local_jobs_lock:
+            _local_jobs[job_id] = {"status": "running", "result": None, "error": None}
         return
     try:
         conn = _get_db_conn()
@@ -206,14 +208,16 @@ def _job_create(job_id: str, owner: str):
         conn.commit()
         conn.close()
     except Exception as exc:
-        print(f"[jobs] create failed: {exc}")
-        _local_jobs[job_id] = {"status": "running", "result": None, "error": None}
+        print(f"[jobs] create failed: {exc} — falling back to in-memory store")
+        with _local_jobs_lock:
+            _local_jobs[job_id] = {"status": "running", "result": None, "error": None}
 
 
 def _job_set_done(job_id: str, result_dict: dict):
-    if not DATABASE_URL:
-        if job_id in _local_jobs:
-            _local_jobs[job_id].update({"status": "done", "result": result_dict})
+    if not DATABASE_URL or not _db_ready:
+        with _local_jobs_lock:
+            if job_id in _local_jobs:
+                _local_jobs[job_id].update({"status": "done", "result": result_dict})
         return
     try:
         conn = _get_db_conn()
@@ -225,13 +229,17 @@ def _job_set_done(job_id: str, result_dict: dict):
         conn.commit()
         conn.close()
     except Exception as exc:
-        print(f"[jobs] set_done failed: {exc}")
+        print(f"[jobs] set_done failed: {exc} — writing to in-memory store")
+        with _local_jobs_lock:
+            if job_id in _local_jobs:
+                _local_jobs[job_id].update({"status": "done", "result": result_dict})
 
 
 def _job_set_error(job_id: str, error: str):
-    if not DATABASE_URL:
-        if job_id in _local_jobs:
-            _local_jobs[job_id].update({"status": "error", "error": error})
+    if not DATABASE_URL or not _db_ready:
+        with _local_jobs_lock:
+            if job_id in _local_jobs:
+                _local_jobs[job_id].update({"status": "error", "error": error})
         return
     try:
         conn = _get_db_conn()
@@ -243,13 +251,28 @@ def _job_set_error(job_id: str, error: str):
         conn.commit()
         conn.close()
     except Exception as exc:
-        print(f"[jobs] set_error failed: {exc}")
+        print(f"[jobs] set_error failed: {exc} — writing to in-memory store")
+        with _local_jobs_lock:
+            if job_id in _local_jobs:
+                _local_jobs[job_id].update({"status": "error", "error": error})
 
 
 def _job_get(job_id: str):
-    """Return {status, result, error} or None if not found."""
+    """Return {status, result, error} or None if not found.
+    Checks in-memory fallback store first (covers jobs created before DB was
+    ready, or when a DB write silently fell back to local store).
+    """
+    # Check local fallback first — this covers:
+    #   1. No DATABASE_URL configured
+    #   2. DB not ready yet when job was created (_db_ready was False)
+    #   3. DB write failed at creation time and fell back to in-memory
+    with _local_jobs_lock:
+        local = _local_jobs.get(job_id)
+    if local is not None:
+        return local
+
     if not DATABASE_URL:
-        return _local_jobs.get(job_id)
+        return None
     try:
         conn = _get_db_conn()
         cur  = conn.cursor()
@@ -2625,6 +2648,10 @@ def optimize():
     user   = session.get("user", "unknown")
 
     _job_create(job_id, user)
+
+    if DATABASE_URL and not _db_ready:
+        print(f"[optimize] ⚠️  DB schema not ready yet — job {job_id} stored in-memory only. "
+              "Poll will work only on this worker instance.")
 
     def _run():
         try:
