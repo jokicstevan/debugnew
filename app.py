@@ -45,6 +45,33 @@ if _USE_CELERY:
 else:
     celery = None  # type: ignore[assignment]
     print("[celery] ⚠️  REDIS_URL not set — Celery disabled, using threading fallback.")
+
+# ── Global error handlers — always return JSON, never HTML ───────────────────
+# The frontend does response.json() on every /api/* call.  Without these,
+# any unhandled exception produces an HTML 500 page and triggers:
+#   "Unexpected token '<', '<!doctype '... is not valid JSON"
+
+@app.errorhandler(400)
+def _err_400(e):
+    return jsonify({"ok": False, "error": f"Bad request: {e}"}), 400
+
+@app.errorhandler(401)
+def _err_401(e):
+    return jsonify({"ok": False, "error": "Unauthorised"}), 401
+
+@app.errorhandler(403)
+def _err_403(e):
+    return jsonify({"ok": False, "error": "Forbidden"}), 403
+
+@app.errorhandler(404)
+def _err_404(e):
+    return jsonify({"ok": False, "error": f"Not found: {e}"}), 404
+
+@app.errorhandler(Exception)
+def _err_500(e):
+    import traceback as _tb
+    print(f"[app] ⚠️  Unhandled exception: {e}\n{_tb.format_exc()}")
+    return jsonify({"ok": False, "error": str(e)}), 500
 UPLOAD_FOLDER = os.path.join(os.path.dirname(__file__), "uploads")
 REPORT_FOLDER = os.path.join(os.path.dirname(__file__), "reports")
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -2673,8 +2700,24 @@ def optimize():
         # ── Celery path ──────────────────────────────────────────────────────
         # Dispatch to a dedicated worker process via Redis.  The HTTP response
         # is returned before the solver starts; the client polls /api/optimize/status.
-        _celery_optimize_task.delay(data, user, job_id)
-        print(f"[optimize] 🚀 Celery task dispatched for job {job_id}")
+        try:
+            _celery_optimize_task.delay(data, user, job_id)
+            print(f"[optimize] 🚀 Celery task dispatched for job {job_id}")
+        except Exception as celery_exc:
+            # Redis unreachable or serialisation error — degrade gracefully to
+            # an in-process thread so the request never returns HTML to the JS.
+            import traceback
+            print(f"[optimize] ⚠️  Celery dispatch failed ({celery_exc}), "
+                  f"falling back to threading for job {job_id}\n"
+                  f"{traceback.format_exc()}")
+            def _run_fallback():
+                try:
+                    result = _do_optimize(data, user)
+                    _job_set_done(job_id, result)
+                except Exception as exc2:
+                    print(f"[optimize job {job_id}] EXCEPTION: {exc2}\n{traceback.format_exc()}")
+                    _job_set_error(job_id, str(exc2))
+            threading.Thread(target=_run_fallback, daemon=True).start()
     else:
         # ── Threading fallback (REDIS_URL not configured) ────────────────────
         def _run():
