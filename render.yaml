@@ -1,48 +1,89 @@
 services:
   - type: web
-    name: grps-api
+    name: grps-routing
     runtime: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --threads 4
+    pythonVersion: "3.12"
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: >
+      gunicorn app:app
+      --workers 2
+      --timeout 900
+      --graceful-timeout 30
+      --keep-alive 5
+      --max-requests 1000
+      --max-requests-jitter 100
+      --bind 0.0.0.0:$PORT
     envVars:
-      - key: PYTHON_VERSION
-        value: 3.11.0
+      - key: SECRET_KEY
+        generateValue: true
+      - key: HERE_API_KEY
+        sync: false
+      - key: APP_USER
+        value: admin
+      - key: APP_PASS
+        sync: false
+      - key: APP_USER2
+        value: dispatcher
+      - key: APP_PASS2
+        sync: false
       - key: DATABASE_URL
         fromDatabase:
           name: grps-db
           property: connectionString
       - key: REDIS_URL
         fromService:
-          type: redis
           name: grps-redis
+          type: redis
           property: connectionString
-      - key: HERE_API_KEY
-        sync: false
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: WEB_CONCURRENCY
+        value: "2"
+      - key: GUNICORN_CMD_ARGS
+        value: "--timeout 900 --graceful-timeout 30 --keep-alive 5"
 
   - type: worker
-    name: grps-worker
+    name: grps-celery-worker
     runtime: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: celery -A tasks worker --loglevel=info --concurrency=2
+    pythonVersion: "3.12"
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: >
+      celery -A app.celery worker
+      --loglevel=warning
+      --concurrency=2
+      --max-tasks-per-child=50
+      --without-gossip
+      --without-mingle
     envVars:
+      - key: HERE_API_KEY
+        sync: false
+      - key: APP_USER
+        value: admin
+      - key: APP_PASS
+        sync: false
+      - key: APP_USER2
+        value: dispatcher
+      - key: APP_PASS2
+        sync: false
       - key: DATABASE_URL
         fromDatabase:
           name: grps-db
           property: connectionString
       - key: REDIS_URL
         fromService:
-          type: redis
           name: grps-redis
+          type: redis
           property: connectionString
-      - key: HERE_API_KEY
-        sync: false
+      - key: PYTHONUNBUFFERED
+        value: "1"
 
 databases:
   - name: grps-db
+    plan: free
     databaseName: grps
     user: grps_user
 
-redis:
-  - name: grps-redis
+  - type: redis
+    name: grps-redis
     plan: free
-    ipAllowList: []
+    maxmemoryPolicy: allkeys-lru

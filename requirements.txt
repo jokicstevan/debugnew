@@ -1,10 +1,11 @@
-flask==3.0.3
-flask-cors==4.0.1
-celery==5.4.0
-redis==5.0.7
-psycopg2-binary==2.9.9
-numpy==1.26.4
-scipy==1.13.1
-requests==2.32.3
-ortools==9.10.4067
-gunicorn==23.0.0
+flask>=3.0
+requests>=2.31
+numpy>=1.24
+reportlab>=4.0
+openpyxl>=3.1
+alns>=0.3
+gunicorn>=21.2
+psycopg[binary]>=3.1
+# ── Background job queue ──────────────────────────────────────────────────────
+celery[redis]>=5.3
+redis>=5.0
