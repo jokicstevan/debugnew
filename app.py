@@ -26,6 +26,18 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
 from reportlab.lib.enums import TA_CENTER, TA_LEFT
 
+# ── Celery integration ──────────────────────────────────────────────────────
+# When CELERY_AVAILABLE is True, optimization runs in a separate worker process
+# via Redis.  The web process stays responsive and never blocks on long VRP solves.
+try:
+    from celery_app import celery_app
+    from tasks import optimize_routes
+    CELERY_AVAILABLE = True
+except ImportError as _celery_err:
+    CELERY_AVAILABLE = False
+    print(f"[celery] ⚠️  Celery not available ({_celery_err}) — using threading fallback")
+
+
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "grps-secret-2024-change-me")
 app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024  # 10 MB upload limit
@@ -2632,26 +2644,43 @@ import uuid as _uuid
 @app.route("/api/optimize", methods=["POST"])
 @login_required
 def optimize():
-    """Accept an optimization request, launch it in a background thread, and
-    immediately return a job_id.  The client polls /api/optimize/status/<job_id>
+    """Accept an optimization request, dispatch to Celery worker (or threading fallback),
+    and immediately return a job_id.  The client polls /api/optimize/status/<job_id>
     until status == 'done' or 'error'.
 
-    Job state is stored in Postgres (grps_jobs) so any gunicorn worker can
-    serve the status poll — fixes the 404 that occurred when the poll landed
-    on a different worker than the one that created the job.
+    With Celery + Redis:
+      • The web process never runs the VRP solver — it only submits tasks.
+      • Job state lives in Redis (Celery result backend) — any gunicorn worker
+        can serve the status poll, fixing the 404 from sticky sessions.
+      • The worker process can be scaled independently (more CPU / memory).
+      • Failed tasks auto-retry (up to 2 retries with 30s delay).
+
+    Fallback (Celery unavailable):
+      • Uses the original threading approach — job state in Postgres + memory.
     """
     data = request.json
     if not data:
         return jsonify({"ok": False, "error": "No data received"})
 
-    job_id = str(_uuid.uuid4())
-    user   = session.get("user", "unknown")
+    user = session.get("user", "unknown")
 
+    # ── Celery path ─────────────────────────────────────────────────────────
+    if CELERY_AVAILABLE:
+        try:
+            task = optimize_routes.delay(data, user)
+            job_id = task.id
+            print(f"[optimize] Celery task submitted: {job_id}")
+            _job_create(job_id, user)
+            return jsonify({"ok": True, "job_id": job_id})
+        except Exception as exc:
+            print(f"[optimize] Celery submit failed: {exc} — falling back to threading")
+
+    # ── Threading fallback ────────────────────────────────────────────────────
+    job_id = str(_uuid.uuid4())
     _job_create(job_id, user)
 
     if DATABASE_URL and not _db_ready:
-        print(f"[optimize] ⚠️  DB schema not ready yet — job {job_id} stored in-memory only. "
-              "Poll will work only on this worker instance.")
+        print(f"[optimize] ⚠️  DB schema not ready yet — job {job_id} stored in-memory only.")
 
     def _run():
         try:
@@ -2666,26 +2695,79 @@ def optimize():
     return jsonify({"ok": True, "job_id": job_id})
 
 
+
+# ── Celery-based job helpers ────────────────────────────────────────────────
+
+def _celery_job_status(job_id: str):
+    """Query Celery result backend for job status.
+
+    Returns a dict compatible with the old _job_get format:
+      {status: 'running'|'done'|'error', result: dict|None, error: str|None}
+    or None if the task ID is unknown.
+    """
+    if not CELERY_AVAILABLE:
+        return None
+    try:
+        result = celery_app.AsyncResult(job_id)
+        state = result.state
+
+        if state in ('PENDING', 'RECEIVED', 'STARTED', 'RETRY'):
+            return {"status": "running", "result": None, "error": None}
+        elif state == 'SUCCESS':
+            return {"status": "done", "result": result.result, "error": None}
+        elif state in ('FAILURE', 'REVOKED'):
+            err = str(result.result) if result.result else "Task failed"
+            return {"status": "error", "result": None, "error": err}
+        else:
+            return {"status": "running", "result": None, "error": None}
+    except Exception as exc:
+        print(f"[celery] status check failed for {job_id}: {exc}")
+        return None
+
+
+def _get_job_status(job_id: str):
+    """Unified job status lookup: tries Celery first, then fallback store."""
+    if CELERY_AVAILABLE:
+        celery_status = _celery_job_status(job_id)
+        if celery_status is not None:
+            return celery_status
+    return _job_get(job_id)
+
 @app.route("/api/optimize/status/<job_id>", methods=["GET"])
 @login_required
 def optimize_status(job_id):
-    """Poll endpoint — reads job state from Postgres, works on any worker.
+    """Poll endpoint — reads job state from Celery result backend (Redis).
       { ok:true,  status:'running' }               — still computing
       { ok:true,  status:'done', result:{…} }      — finished
       { ok:false, status:'error', error:'…' }     — job failed
       404 if job_id unknown or expired
-    """
-    job = _job_get(job_id)
 
+    Falls back to the in-memory / Postgres store for jobs created before
+    Celery was enabled or when Celery is temporarily unavailable.
+    """
+    # ── Try Celery first ────────────────────────────────────────────────────
+    if CELERY_AVAILABLE:
+        try:
+            celery_status = _celery_job_status(job_id)
+            if celery_status is not None:
+                if celery_status["status"] == "running":
+                    return jsonify({"ok": True, "status": "running"})
+                if celery_status["status"] == "error":
+                    return jsonify({"ok": False, "status": "error", "error": celery_status["error"]})
+                if celery_status["status"] == "done":
+                    return jsonify({"ok": True, "status": "done", "result": celery_status["result"]})
+        except Exception as exc:
+            print(f"[optimize_status] Celery lookup failed for {job_id}: {exc}")
+
+    # ── Fallback: in-memory / Postgres store ────────────────────────────────
+    job = _job_get(job_id)
     if job is None:
         return jsonify({"ok": False, "error": "Job not found or expired"}), 404
 
     if job["status"] == "running":
         return jsonify({"ok": True, "status": "running"})
-
     if job["status"] == "error":
         return jsonify({"ok": False, "status": "error", "error": job["error"]})
-
     return jsonify({"ok": True, "status": "done", "result": job["result"]})
 
 

@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: grps-routing
+    name: grps-web
     runtime: python
     pythonVersion: "3.12"
     buildCommand: pip install --upgrade pip && pip install -r requirements.txt
@@ -30,6 +30,11 @@ services:
         fromDatabase:
           name: grps-db
           property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: grps-redis
+          property: connectionString
       - key: PYTHONUNBUFFERED
         value: "1"
       - key: WEB_CONCURRENCY
@@ -37,8 +42,46 @@ services:
       - key: GUNICORN_CMD_ARGS
         value: "--timeout 900 --graceful-timeout 30 --keep-alive 5"
 
+  - type: worker
+    name: grps-worker
+    runtime: python
+    pythonVersion: "3.12"
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: celery -A celery_app worker -Q optimization,default -l info --concurrency=2
+    envVars:
+      - key: SECRET_KEY
+        generateValue: true
+      - key: HERE_API_KEY
+        sync: false
+      - key: APP_USER
+        value: admin
+      - key: APP_PASS
+        sync: false
+      - key: APP_USER2
+        value: dispatcher
+      - key: APP_PASS2
+        sync: false
+      - key: DATABASE_URL
+        fromDatabase:
+          name: grps-db
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: grps-redis
+          property: connectionString
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: C_FORCE_ROOT
+        value: "true"  # Allow Celery to run as root in container
+
 databases:
   - name: grps-db
     plan: free
     databaseName: grps
     user: grps_user
+
+redis:
+  - name: grps-redis
+    plan: free
+    maxmemoryPolicy: noeviction  # Don't evict keys — Celery needs persistence
