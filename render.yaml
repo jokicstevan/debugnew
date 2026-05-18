@@ -4,15 +4,7 @@ services:
     runtime: python
     pythonVersion: "3.12"
     buildCommand: pip install --upgrade pip && pip install -r requirements.txt
-    startCommand: >
-      gunicorn app:app
-      --workers 2
-      --timeout 900
-      --graceful-timeout 30
-      --keep-alive 5
-      --max-requests 1000
-      --max-requests-jitter 100
-      --bind 0.0.0.0:$PORT
+    startCommand: gunicorn app:app --config gunicorn.conf.py --bind 0.0.0.0:$PORT
     envVars:
       - key: SECRET_KEY
         generateValue: true
@@ -39,8 +31,6 @@ services:
         value: "1"
       - key: WEB_CONCURRENCY
         value: "2"
-      - key: GUNICORN_CMD_ARGS
-        value: "--timeout 900 --graceful-timeout 30 --keep-alive 5"
 
   - type: worker
     name: grps-celery-worker
