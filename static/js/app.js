@@ -1133,8 +1133,15 @@ async function runOptimize() {
         }
         try {
           const r = await fetch(`/api/optimize/status/${jobId}`);
+          // Guard before .json(): a non-OK response (e.g. 404 "Not Found") is
+          // plain text and will throw "Unexpected token 'N'" if parsed as JSON.
+          if (!r.ok) {
+            const text = await r.text().catch(() => r.statusText);
+            reject(new Error(`Status poll failed (${r.status}): ${text}`));
+            return;
+          }
           const d = await r.json();
-          if (!r.ok || d.status === 'error') {
+          if (d.status === 'error') {
             reject(new Error(d.error || 'Optimization failed on server'));
             return;
           }
