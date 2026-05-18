@@ -2380,8 +2380,13 @@ def _alns_optimize(fleet, dist_mat, time_mat, n_depots, n_cust, tw, demands,
                    temperature, max_iter, svc_map, use_tw,
                    overlap_threshold_km=None, overlap_weight_rsd=None,
                    dist_rsd_per_km=None, tw_penalty_rsd=None, alns_cooling=None,
-                   no_wait=False):
-    """Run a single ALNS optimisation with the given fleet (list of vehicle dicts)."""
+                   no_wait=False, deadline=None):
+    """Run a single ALNS optimisation with the given fleet (list of vehicle dicts).
+
+    deadline – optional ``time.time()``-style wall-clock deadline.  When the
+    deadline is reached the iteration loop exits early and the best solution
+    found up to that point is returned instead of raising an error.
+    """
     num_v = len(fleet)
     all_ci = list(range(n_depots, n_depots + n_cust))
 
@@ -2507,7 +2512,13 @@ def _alns_optimize(fleet, dist_mat, time_mat, n_depots, n_cust, tw, demands,
                 return i
         return len(w) - 1
 
-    for _ in range(max_iter):
+    for iteration in range(max_iter):
+        # Wall-clock deadline check — exit early and keep the best solution found.
+        if deadline is not None and iteration % 50 == 0 and time.time() >= deadline:
+            print(f"[ALNS] deadline reached after {iteration} / {max_iter} iterations "
+                  f"— returning best incumbent (obj={best_obj:.2f})")
+            break
+
         di, ri = sel(dw), sel(rw)
         dest = destroy[di](state, rng)
         cand = repair[ri](dest, rng)
@@ -2529,10 +2540,14 @@ def optimize_alns(dist_mat, time_mat, n_depots, n_cust, tw, demands,
                   fuel_price_rsd_l=None, driver_wage_rsd_h=None, fuel_load_factor=None,
                   overlap_threshold_km=None, overlap_weight_rsd=None,
                   dist_rsd_per_km=None, tw_penalty_rsd=None, alns_cooling=None,
-                  no_wait=False):
+                  no_wait=False, time_limit=None):
     """ALNS multi‑vehicle optimiser. When only vehicle minimisation is selected,
     it sorts the fleet by capacity so the largest vehicles are tried first,
-    then incrementally adds vehicles until a feasible solution is found."""
+    then incrementally adds vehicles until a feasible solution is found.
+
+    time_limit – optional wall-clock budget in seconds.  When exceeded the
+    solver returns the best solution found so far rather than failing.
+    """
     demands_kg = demands_kg or [0.0] * len(demands)
     num_v = len(fleet)
 
@@ -2545,6 +2560,7 @@ def optimize_alns(dist_mat, time_mat, n_depots, n_cust, tw, demands,
     )
 
     # Shared kwargs for all _alns_optimize calls
+    deadline = (time.time() + time_limit) if time_limit is not None else None
     adv = dict(
         overlap_threshold_km=overlap_threshold_km,
         overlap_weight_rsd=overlap_weight_rsd,
@@ -2552,6 +2568,7 @@ def optimize_alns(dist_mat, time_mat, n_depots, n_cust, tw, demands,
         tw_penalty_rsd=tw_penalty_rsd,
         alns_cooling=alns_cooling,
         no_wait=no_wait,
+        deadline=deadline,
     )
 
     if only_vehicles:
@@ -2715,6 +2732,10 @@ def _do_optimize(data, user):
     dist_rsd_per_km      = float(adv_params.get("dist_rsd_per_km",      20.0))
     tw_penalty_rsd       = float(adv_params.get("tw_penalty_rsd",       100.0))
     alns_cooling         = float(adv_params.get("alns_cooling",         0.995))
+    # Wall-clock budget for the ALNS solver (seconds).  Default is 840 s —
+    # a safe margin below the 900 s gunicorn worker timeout.  When the budget
+    # is exhausted the solver returns the best solution found so far.
+    alns_time_limit      = float(adv_params.get("alns_time_limit",      840.0))
     hist_blend_weight    = float(adv_params.get("hist_blend_weight",    0.5))
     hist_blend_weight    = max(0.0, min(1.0, hist_blend_weight))  # clamp to [0, 1]
 
@@ -2991,7 +3012,8 @@ def _do_optimize(data, user):
                                use_volume_cap=use_volume_cap, use_weight_cap=use_weight_cap,
                                fuel_price_rsd_l=fuel_price_rsd_l, driver_wage_rsd_h=driver_wage_rsd_h,
                                fuel_load_factor=fuel_load_factor,
-                               alns_cooling=alns_cooling, **adv_kwargs)
+                               alns_cooling=alns_cooling, time_limit=alns_time_limit,
+                               **adv_kwargs)
 
 
     total_dist = state.total_distance()
