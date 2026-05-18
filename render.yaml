@@ -1,31 +1,12 @@
 services:
   - type: web
-    name: grps-web
+    name: grps-api
     runtime: python
-    pythonVersion: "3.12"
-    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
-    startCommand: >
-      gunicorn app:app
-      --workers 2
-      --timeout 900
-      --graceful-timeout 30
-      --keep-alive 5
-      --max-requests 1000
-      --max-requests-jitter 100
-      --bind 0.0.0.0:$PORT
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --threads 4
     envVars:
-      - key: SECRET_KEY
-        generateValue: true
-      - key: HERE_API_KEY
-        sync: false
-      - key: APP_USER
-        value: admin
-      - key: APP_PASS
-        sync: false
-      - key: APP_USER2
-        value: dispatcher
-      - key: APP_PASS2
-        sync: false
+      - key: PYTHON_VERSION
+        value: 3.11.0
       - key: DATABASE_URL
         fromDatabase:
           name: grps-db
@@ -35,32 +16,15 @@ services:
           type: redis
           name: grps-redis
           property: connectionString
-      - key: PYTHONUNBUFFERED
-        value: "1"
-      - key: WEB_CONCURRENCY
-        value: "2"
-      - key: GUNICORN_CMD_ARGS
-        value: "--timeout 900 --graceful-timeout 30 --keep-alive 5"
+      - key: HERE_API_KEY
+        sync: false
 
   - type: worker
     name: grps-worker
     runtime: python
-    pythonVersion: "3.12"
-    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
-    startCommand: celery -A celery_app worker -Q optimization,default -l info --concurrency=2
+    buildCommand: pip install -r requirements.txt
+    startCommand: celery -A tasks worker --loglevel=info --concurrency=2
     envVars:
-      - key: SECRET_KEY
-        generateValue: true
-      - key: HERE_API_KEY
-        sync: false
-      - key: APP_USER
-        value: admin
-      - key: APP_PASS
-        sync: false
-      - key: APP_USER2
-        value: dispatcher
-      - key: APP_PASS2
-        sync: false
       - key: DATABASE_URL
         fromDatabase:
           name: grps-db
@@ -70,18 +34,15 @@ services:
           type: redis
           name: grps-redis
           property: connectionString
-      - key: PYTHONUNBUFFERED
-        value: "1"
-      - key: C_FORCE_ROOT
-        value: "true"  # Allow Celery to run as root in container
+      - key: HERE_API_KEY
+        sync: false
 
 databases:
   - name: grps-db
-    plan: free
     databaseName: grps
     user: grps_user
 
 redis:
   - name: grps-redis
     plan: free
-    maxmemoryPolicy: noeviction  # Don't evict keys — Celery needs persistence
+    ipAllowList: []

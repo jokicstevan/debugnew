@@ -1,115 +1,83 @@
-"""
-Celery tasks for GRPS Web.
-Contains the optimization task that runs in a separate worker process.
-"""
-
+# tasks.py
+"""Celery background tasks — imports optimizer, NOT app.py"""
 import os
-import sys
-import json
-import traceback
-from datetime import date
+from celery import Celery
+from celery.signals import worker_ready
+from optimizer import _do_optimize, build_distance_matrix, spatial_filter
 
-# Add the project root to path so we can import app modules
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Initialize Celery — no Flask app needed
+celery = Celery(
+    "grps",
+    broker=os.getenv("REDIS_URL", "redis://localhost:6379/0"),
+    backend=os.getenv("REDIS_URL", "redis://localhost:6379/0"),
+)
 
-from celery_app import celery_app
-
-# ── Import the optimization logic from app.py ──────────────────────────────
-# We import only what we need to avoid circular imports.
-# The heavy imports (numpy, psycopg, reportlab) happen here in the worker.
-
-import numpy as np
-
-# Import the core optimization functions and VRPState from app.py
-# These are stateless and safe to run in a Celery worker.
-from app import (
-    _do_optimize,
-    _save_route_to_db_async,
-    in_serbia,
-    build_api_pairs,
-    fetch_best_matrix,
-    fetch_best_route,
-    prefetch_traffic_history,
-    _get_db_conn,
-    _db_ready,
-    DATABASE_URL,
-    HERE_API_KEY,
-    K_NEAREST,
-    SENTINEL_FACTOR,
-    FUEL_PRICE_RSD_PER_LITRE,
-    DRIVER_WAGE_RSD_PER_HOUR,
-    FUEL_LOAD_FACTOR_PER_1000KG,
-    DEFAULT_PKG_WEIGHTS_KG,
-    SERVICE_TIME,
-    VRPState,
-    route_time,
-    route_dist,
-    route_fuel_litres,
-    route_working_minutes,
-    latest_feasible_departure,
-    mins_to_hhmm,
-    optimize_nn,
-    optimize_2opt,
-    optimize_alns,
-    haversine,
-    build_haversine_matrix,
-    straight_line_geometry,
-    fetch_osrm_route,
-    fetch_here_route,
-    fetch_here_matrix,
-    fetch_osrm_matrix,
-    _haversine_matrix_km,
-    _expand_matrix,
-    _blend_historical,
-    get_historical_time_mat,
+celery.conf.update(
+    task_serializer="json",
+    accept_content=["json"],
+    result_serializer="json",
+    timezone="UTC",
+    enable_utc=True,
+    task_track_started=True,
+    task_time_limit=300,  # 5 min hard limit
+    worker_prefetch_multiplier=1,
+    task_acks_late=True,
 )
 
 
-@celery_app.task(bind=True, max_retries=2, default_retry_delay=30)
-def optimize_routes(self, payload, user):
-    """Run route optimization in a Celery worker.
-
-    Parameters
-    ----------
-    payload : dict
-        The full optimization request data (same as what /api/optimize receives).
-    user : str
-        The username who initiated the optimization.
-
-    Returns
-    -------
-    dict
-        The optimization result (same format as _do_optimize returns).
-
-    Raises
-    ------
-    Exception
-        Re-raised after logging; Celery retry logic handles transient failures.
+@celery.task(bind=True, max_retries=3)
+def optimize_route_task(
+    self,
+    depot_id: int,
+    customer_ids: list,
+    vehicle_count: int,
+    location_coords: list,  # [(lat, lon), ...]
+    matrix_source: str = "osrm",
+    deadline_seconds: float = 30.0
+):
+    """
+    Background VRP optimization task.
+    Called by Flask via .delay() or .apply_async()
     """
     try:
-        print(f"[celery] Starting optimization task {self.request.id} for user {user}")
+        # Update progress
+        self.update_state(state="PROGRESS", meta={"step": "building_matrix"})
 
-        # Run the actual optimization
-        result = _do_optimize(payload, user)
+        # Build distance matrix
+        locations, _, _ = spatial_filter(location_coords, depot_idx=0, k_nearest=10)
+        matrix = build_distance_matrix(locations, source=matrix_source)
 
-        print(f"[celery] Optimization task {self.request.id} completed successfully")
-        return result
+        self.update_state(state="PROGRESS", meta={"step": "optimizing"})
+
+        # Run optimization
+        result = _do_optimize(
+            depot_id=depot_id,
+            customer_ids=customer_ids,
+            vehicle_count=vehicle_count,
+            distance_matrix=matrix,
+            deadline_seconds=deadline_seconds,
+        )
+
+        return {
+            "status": result.status,
+            "routes": result.routes,
+            "total_distance": result.total_distance,
+            "compute_time_ms": result.compute_time_ms,
+            "solver": result.solver,
+        }
 
     except Exception as exc:
-        print(f"[celery] Optimization task {self.request.id} failed: {exc}")
-        print(traceback.format_exc())
-        # Re-raise so Celery can retry (if retries remain)
-        raise self.retry(exc=exc)
+        # Retry on failure
+        raise self.retry(exc=exc, countdown=60)
 
 
-@celery_app.task(bind=True, ignore_result=True)
-def save_route_async(self, route_payload):
-    """Persist a route to the database asynchronously.
+@celery.task
+def health_check_task():
+    """Simple health check for Celery workers."""
+    return {"status": "ok", "worker": "grps-celery"}
 
-    This is a fire-and-forget task — the web process doesn't wait for it.
-    """
-    try:
-        _save_route_to_db_async(route_payload)
-    except Exception as exc:
-        print(f"[celery] Async route save failed: {exc}")
-        # Don't retry — this is best-effort persistence
+
+@worker_ready.connect
+def on_worker_ready(**kwargs):
+    """Log when worker is ready."""
+    print("[celery] ✅ Worker ready and connected to Redis")
