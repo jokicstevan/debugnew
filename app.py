@@ -4,7 +4,6 @@ import os
 import json
 import threading
 from datetime import datetime
-from functools import wraps
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -34,7 +33,13 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 
 def get_db():
-    """Get PostgreSQL connection."""
+    """Get PostgreSQL connection. Supports DATABASE_URL (Render) or individual vars."""
+    database_url = os.getenv("DATABASE_URL")
+    if database_url:
+        # Render provides DATABASE_URL as postgresql://user:pass@host:port/db
+        return psycopg2.connect(database_url)
+
+    # Local dev fallback
     return psycopg2.connect(
         host=os.getenv("PGHOST", "localhost"),
         database=os.getenv("PGDATABASE", "grps"),
@@ -46,29 +51,32 @@ def get_db():
 
 def init_db():
     """Initialize schema if not exists."""
-    with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS optimization_jobs (
-                    id SERIAL PRIMARY KEY,
-                    task_id VARCHAR(64) UNIQUE,
-                    status VARCHAR(20) DEFAULT 'pending',
-                    depot_id INTEGER,
-                    customer_count INTEGER,
-                    vehicle_count INTEGER,
-                    result JSONB,
-                    created_at TIMESTAMP DEFAULT NOW(),
-                    completed_at TIMESTAMP
-                );
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS optimization_jobs (
+                        id SERIAL PRIMARY KEY,
+                        task_id VARCHAR(64) UNIQUE,
+                        status VARCHAR(20) DEFAULT 'pending',
+                        depot_id INTEGER,
+                        customer_count INTEGER,
+                        vehicle_count INTEGER,
+                        result JSONB,
+                        created_at TIMESTAMP DEFAULT NOW(),
+                        completed_at TIMESTAMP
+                    );
 
-                CREATE INDEX IF NOT EXISTS idx_jobs_task_id 
-                ON optimization_jobs(task_id);
+                    CREATE INDEX IF NOT EXISTS idx_jobs_task_id 
+                    ON optimization_jobs(task_id);
 
-                CREATE INDEX IF NOT EXISTS idx_jobs_status 
-                ON optimization_jobs(status);
-            """)
-        conn.commit()
-    print("[db] ✅ PostgreSQL schema ready")
+                    CREATE INDEX IF NOT EXISTS idx_jobs_status 
+                    ON optimization_jobs(status);
+                """)
+            conn.commit()
+        print("[db] ✅ PostgreSQL schema ready")
+    except Exception as e:
+        print(f"[db] ⚠️  Schema init warning: {e}")
 
 
 # ─── Threading Fallback (when Celery unavailable) ───────────────────
@@ -136,7 +144,6 @@ class FakeAsyncResult:
 
 # Detect Celery availability
 try:
-    # Verify Celery can actually connect
     celery.connection().ensure_connection(max_retries=1)
     CELERY_AVAILABLE = True
     print("[celery] ✅ Celery connected to Redis")
@@ -154,19 +161,67 @@ def run_async_task(task_func, *args, **kwargs):
         return _fallback.delay(task_func, *args, **kwargs)
 
 
+# ─── Debug Routes ───────────────────────────────────────────────────
+
+@app.route("/", methods=["GET"])
+def root():
+    """Root endpoint — list all available routes."""
+    routes = []
+    for rule in app.url_map.iter_rules():
+        if rule.endpoint != "static":
+            routes.append({
+                "path": str(rule),
+                "methods": list(rule.methods - {"OPTIONS", "HEAD"}),
+                "endpoint": rule.endpoint,
+            })
+    return jsonify({
+        "service": "GRPS API",
+        "version": "1.0.0",
+        "routes": routes,
+    })
+
+
+@app.route("/debug/env", methods=["GET"])
+def debug_env():
+    """Debug: show environment variables (masked)."""
+    redis_url = os.getenv("REDIS_URL", "NOT_SET")
+    database_url = os.getenv("DATABASE_URL", "NOT_SET")
+
+    # Mask passwords in URLs
+    def mask_url(url):
+        if url == "NOT_SET" or "://" not in url:
+            return url
+        try:
+            from urllib.parse import urlparse, urlunparse
+            parsed = urlparse(url)
+            masked = f"{parsed.scheme}://{parsed.username}:****@{parsed.hostname}:{parsed.port}{parsed.path}"
+            return masked
+        except:
+            return "[masked]"
+
+    return jsonify({
+        "REDIS_URL": mask_url(redis_url),
+        "DATABASE_URL": mask_url(database_url),
+        "SECRET_KEY": "[set]" if os.getenv("SECRET_KEY") else "[not set]",
+        "HERE_API_KEY": "[set]" if os.getenv("HERE_API_KEY") else "[not set]",
+        "PORT": os.getenv("PORT", "5000"),
+    })
+
+
 # ─── API Routes ─────────────────────────────────────────────────────
 
 @app.route("/health", methods=["GET"])
 def health():
     """Health check endpoint."""
     db_ok = False
+    db_error = None
     try:
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT 1")
                 db_ok = True
-    except Exception:
-        pass
+    except Exception as e:
+        db_error = str(e)
 
     celery_ok = CELERY_AVAILABLE
     if celery_ok:
@@ -178,6 +233,7 @@ def health():
     return jsonify({
         "status": "healthy" if db_ok else "degraded",
         "database": "connected" if db_ok else "error",
+        "database_error": db_error,
         "celery": "connected" if celery_ok else "fallback",
         "timestamp": datetime.utcnow().isoformat(),
     })
@@ -185,13 +241,12 @@ def health():
 
 @app.route("/api/optimize", methods=["POST"])
 def optimize():
-    """
-    Trigger async optimization.
-    Returns task ID for polling.
-    """
+    """Trigger async optimization. Returns task ID for polling."""
     data = request.get_json()
 
-    # Validate
+    if not data:
+        return jsonify({"error": "No JSON body provided"}), 400
+
     required = ["depot_id", "customer_ids", "vehicle_count", "locations"]
     missing = [f for f in required if f not in data]
     if missing:
@@ -200,21 +255,24 @@ def optimize():
     depot_id = data["depot_id"]
     customer_ids = data["customer_ids"]
     vehicle_count = data["vehicle_count"]
-    locations = data["locations"]  # [[lat, lon], ...]
+    locations = data["locations"]
     matrix_source = data.get("matrix_source", "osrm")
     deadline = data.get("deadline_seconds", 30.0)
 
     # Store job in DB
-    with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO optimization_jobs 
-                (depot_id, customer_count, vehicle_count, status)
-                VALUES (%s, %s, %s, 'pending')
-                RETURNING id
-            """, (depot_id, len(customer_ids), vehicle_count))
-            job_id = cur.fetchone()[0]
-        conn.commit()
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO optimization_jobs 
+                    (depot_id, customer_count, vehicle_count, status)
+                    VALUES (%s, %s, %s, 'pending')
+                    RETURNING id
+                """, (depot_id, len(customer_ids), vehicle_count))
+                job_id = cur.fetchone()[0]
+            conn.commit()
+    except Exception as e:
+        return jsonify({"error": f"Database error: {e}"}), 500
 
     # Dispatch async task
     task = run_async_task(
@@ -228,13 +286,16 @@ def optimize():
     )
 
     # Update with task_id
-    with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                UPDATE optimization_jobs 
-                SET task_id = %s WHERE id = %s
-            """, (task.id, job_id))
-        conn.commit()
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE optimization_jobs 
+                    SET task_id = %s WHERE id = %s
+                """, (task.id, job_id))
+            conn.commit()
+    except Exception as e:
+        return jsonify({"error": f"Database error updating task: {e}"}), 500
 
     return jsonify({
         "task_id": task.id,
@@ -246,10 +307,14 @@ def optimize():
 
 @app.route("/api/optimize/sync", methods=["POST"])
 def optimize_sync():
-    """
-    Synchronous optimization (for small problems).
-    """
+    """Synchronous optimization (for small problems)."""
     data = request.get_json()
+
+    if not data:
+        return jsonify({"error": "No JSON body provided"}), 400
+
+    if "locations" not in data:
+        return jsonify({"error": "Missing field: locations"}), 400
 
     locations = data["locations"]
     depot_id = data.get("depot_id", 0)
@@ -258,30 +323,36 @@ def optimize_sync():
     matrix_source = data.get("matrix_source", "osrm")
     deadline = data.get("deadline_seconds", 30.0)
 
-    # Filter + build matrix
-    filtered_locs, indices, pairs = spatial_filter(locations, depot_idx=0, k_nearest=10)
-    print(f"[spatial filter] {len(locations)} locations → {len(pairs)} API pairs")
+    try:
+        # Filter + build matrix
+        filtered_locs, indices, pairs = spatial_filter(locations, depot_idx=0, k_nearest=10)
+        print(f"[spatial filter] {len(locations)} locations → {len(pairs)} API pairs")
 
-    matrix = build_distance_matrix(filtered_locs, source=matrix_source, deadline_seconds=10.0)
-    print(f"[matrix] ✅ {matrix.shape} source={matrix_source}")
+        matrix = build_distance_matrix(filtered_locs, source=matrix_source, deadline_seconds=10.0)
+        print(f"[matrix] ✅ {matrix.shape} source={matrix_source}")
 
-    # Optimize
-    print(f"[optimize] Model depots=1 custs={len(customer_ids)} vehicles={vehicle_count}")
-    result = _do_optimize(
-        depot_id=depot_id,
-        customer_ids=customer_ids,
-        vehicle_count=vehicle_count,
-        distance_matrix=matrix,
-        deadline_seconds=deadline,
-    )
+        # Optimize
+        print(f"[optimize] Model depots=1 custs={len(customer_ids)} vehicles={vehicle_count}")
+        result = _do_optimize(
+            depot_id=depot_id,
+            customer_ids=customer_ids,
+            vehicle_count=vehicle_count,
+            distance_matrix=matrix,
+            deadline_seconds=deadline,
+        )
 
-    return jsonify({
-        "status": result.status,
-        "routes": result.routes,
-        "total_distance": result.total_distance,
-        "compute_time_ms": round(result.compute_time_ms, 2),
-        "solver": result.solver,
-    })
+        return jsonify({
+            "status": result.status,
+            "routes": result.routes,
+            "total_distance": result.total_distance,
+            "compute_time_ms": round(result.compute_time_ms, 2),
+            "solver": result.solver,
+        })
+    except Exception as e:
+        import traceback
+        print(f"[optimize_sync] ERROR: {e}")
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/result/<task_id>", methods=["GET"])
@@ -301,16 +372,19 @@ def get_result(task_id):
             }), 202
         elif task_result.state == "SUCCESS":
             # Update DB
-            with get_db() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("""
-                        UPDATE optimization_jobs 
-                        SET status = 'completed', 
-                            result = %s,
-                            completed_at = NOW()
-                        WHERE task_id = %s
-                    """, (json.dumps(task_result.result), task_id))
-                conn.commit()
+            try:
+                with get_db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("""
+                            UPDATE optimization_jobs 
+                            SET status = 'completed', 
+                                result = %s,
+                                completed_at = NOW()
+                            WHERE task_id = %s
+                        """, (json.dumps(task_result.result), task_id))
+                    conn.commit()
+            except Exception as e:
+                print(f"[get_result] DB update warning: {e}")
 
             return jsonify({
                 "status": "completed",
@@ -342,18 +416,21 @@ def list_jobs():
     """List recent optimization jobs."""
     limit = request.args.get("limit", 50, type=int)
 
-    with get_db() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""
-                SELECT id, task_id, status, depot_id, customer_count,
-                       vehicle_count, created_at, completed_at
-                FROM optimization_jobs
-                ORDER BY created_at DESC
-                LIMIT %s
-            """, (limit,))
-            jobs = cur.fetchall()
+    try:
+        with get_db() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT id, task_id, status, depot_id, customer_count,
+                           vehicle_count, created_at, completed_at
+                    FROM optimization_jobs
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                """, (limit,))
+                jobs = cur.fetchall()
 
-    return jsonify({"jobs": jobs, "count": len(jobs)})
+        return jsonify({"jobs": jobs, "count": len(jobs)})
+    except Exception as e:
+        return jsonify({"error": f"Database error: {e}"}), 500
 
 
 # ─── Main ───────────────────────────────────────────────────────────
