@@ -1649,6 +1649,33 @@ def route_time(route_mat_indices, depot_mat_idx, dist_mat, time_mat, tw, svc,
         prev = c
     return feasible, sched
 
+
+def _route_time_scalar(route_mat_indices, depot_mat_idx, dist_mat, time_mat,
+                       tw, svc, start_time, svc_map, no_wait):
+    """Lightweight route-time walk that returns (feasible, last_depart) as scalars.
+
+    Identical logic to route_time() but allocates NO list or dict objects — only
+    plain float/bool scalars.  Called millions of times inside the ALNS insertion
+    heuristics (latest_feasible_departure, route_working_minutes, _ins_cost);
+    avoiding the sched list allocation here is the primary fix for the OOM that
+    occurs when time-window constraints are active.
+    """
+    feasible    = True
+    last_depart = start_time
+    t    = start_time
+    prev = depot_mat_idx
+    for c in route_mat_indices:
+        t += time_mat[prev][c]
+        tw_s, tw_e = tw[c]
+        if t > tw_e:
+            feasible = False
+        stop_svc    = svc_map[c] if (svc_map and c in svc_map) else svc
+        t           = (t if no_wait else max(t, tw_s)) + stop_svc
+        last_depart = t
+        prev        = c
+    return feasible, last_depart
+
+
 # This is to prevent early start
 def latest_feasible_departure(route_mat_indices, depot_mat_idx,
                                dist_mat, time_mat, tw, svc, svc_map=None,
@@ -1661,16 +1688,16 @@ def latest_feasible_departure(route_mat_indices, depot_mat_idx,
         return tw[depot_mat_idx][0]
     depot_open  = tw[depot_mat_idx][0]
     depot_close = tw[depot_mat_idx][1]
-    ok, _ = route_time(route_mat_indices, depot_mat_idx, dist_mat, time_mat,
-                        tw, svc, depot_open, svc_map, no_wait=no_wait)
+    ok, _ = _route_time_scalar(route_mat_indices, depot_mat_idx, dist_mat, time_mat,
+                               tw, svc, depot_open, svc_map, no_wait)
     if not ok:
         return depot_open
     best = depot_open
     lo, hi = depot_open, depot_close
     while hi - lo > 5:
         mid = (lo + hi) // 2
-        ok, _ = route_time(route_mat_indices, depot_mat_idx, dist_mat, time_mat,
-                            tw, svc, mid, svc_map, no_wait=no_wait)
+        ok, _ = _route_time_scalar(route_mat_indices, depot_mat_idx, dist_mat, time_mat,
+                                    tw, svc, mid, svc_map, no_wait)
         if ok:
             best = mid
             lo   = mid
@@ -1685,9 +1712,8 @@ def route_working_minutes(route_mat_indices, depot_mat_idx,
     """Total working minutes: departure -> last customer depart -> return depot."""
     if not route_mat_indices:
         return 0.0
-    _, sched = route_time(route_mat_indices, depot_mat_idx, dist_mat, time_mat,
-                           tw, svc, start_time, svc_map, no_wait=no_wait)
-    last_depart = sched[-1]["depart"] if sched else start_time
+    _, last_depart = _route_time_scalar(route_mat_indices, depot_mat_idx, dist_mat,
+                                        time_mat, tw, svc, start_time, svc_map, no_wait)
     return_time = last_depart + time_mat[route_mat_indices[-1]][depot_mat_idx]
     return max(0.0, return_time - start_time)
 
@@ -2128,9 +2154,9 @@ def _ins_cost(route, pos, c, state, depot,
         if do_wages:
             cost += ((new_work_mins - _old_work_mins) / 60.0) * state.driver_wage_rsd_h
         if state.use_tw:
-            feasible, _ = route_time(
+            feasible, _ = _route_time_scalar(
                 new_route, depot, state.dist_mat, state.time_mat,
-                state.tw, state.svc, new_start, state.svc_map, no_wait=state.no_wait)
+                state.tw, state.svc, new_start, state.svc_map, state.no_wait)
             if not feasible:
                 return float("inf")
     else:
