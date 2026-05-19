@@ -94,7 +94,7 @@ def _get_db_conn():
     """Return a new psycopg3 connection, or raise if DATABASE_URL not set."""
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL not configured")
-    return psycopg.connect(DATABASE_URL, connect_timeout=5)
+    return psycopg.connect(DATABASE_URL, connect_timeout=15)
 
 
 def _ensure_schema():
@@ -237,9 +237,11 @@ _local_jobs_lock = threading.Lock()
 
 
 def _job_create(job_id: str, owner: str):
+    # Always add to in-memory store — this ensures the job is findable
+    # even if the DB write succeeds but a later DB read times out.
+    with _local_jobs_lock:
+        _local_jobs[job_id] = {"status": "running", "result": None, "error": None}
     if not DATABASE_URL or not _db_ready:
-        with _local_jobs_lock:
-            _local_jobs[job_id] = {"status": "running", "result": None, "error": None}
         return
     try:
         conn = _get_db_conn()
@@ -251,9 +253,7 @@ def _job_create(job_id: str, owner: str):
         conn.commit()
         conn.close()
     except Exception as exc:
-        print(f"[jobs] create failed: {exc} — falling back to in-memory store")
-        with _local_jobs_lock:
-            _local_jobs[job_id] = {"status": "running", "result": None, "error": None}
+        print(f"[jobs] create failed (DB): {exc} — job already in in-memory store")
 
 
 def _job_set_done(job_id: str, result_dict: dict):
@@ -304,11 +304,14 @@ def _job_get(job_id: str):
     """Return {status, result, error} or None if not found.
     Checks in-memory fallback store first (covers jobs created before DB was
     ready, or when a DB write silently fell back to local store).
+    Always caches DB results in _local_jobs so transient connection failures
+    on subsequent polls don't cause spurious 404s.
     """
     # Check local fallback first — this covers:
     #   1. No DATABASE_URL configured
     #   2. DB not ready yet when job was created (_db_ready was False)
     #   3. DB write failed at creation time and fell back to in-memory
+    #   4. Previously fetched from DB and cached below
     with _local_jobs_lock:
         local = _local_jobs.get(job_id)
     if local is not None:
@@ -316,24 +319,31 @@ def _job_get(job_id: str):
 
     if not DATABASE_URL:
         return None
-    try:
-        conn = _get_db_conn()
-        cur  = conn.cursor()
-        cur.execute(
-            "SELECT status, result_json, error FROM grps_jobs WHERE job_id=%s",
-            (job_id,)
-        )
-        row = cur.fetchone()
-        conn.close()
-        if not row:
-            return None
-        status, result_json, error = row
-        return {"status": status,
-                "result": json.loads(result_json) if result_json else None,
-                "error":  error}
-    except Exception as exc:
-        print(f"[jobs] get failed: {exc}")
-        return None
+    for attempt in range(2):   # retry once on transient connection failure
+        try:
+            conn = _get_db_conn()
+            cur  = conn.cursor()
+            cur.execute(
+                "SELECT status, result_json, error FROM grps_jobs WHERE job_id=%s",
+                (job_id,)
+            )
+            row = cur.fetchone()
+            conn.close()
+            if not row:
+                return None
+            status, result_json, error = row
+            result = {"status": status,
+                      "result": json.loads(result_json) if result_json else None,
+                      "error":  error}
+            # Cache in memory so future polls don't need a DB round-trip
+            with _local_jobs_lock:
+                _local_jobs[job_id] = result
+            return result
+        except Exception as exc:
+            print(f"[jobs] get failed (attempt {attempt+1}): {exc}")
+            if attempt == 0:
+                time.sleep(1)   # brief pause before retry
+    return None
 
 
 def _save_route_to_db_async(payload: dict):
