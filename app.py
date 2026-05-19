@@ -222,6 +222,7 @@ def _ensure_schema():
         conn.close()
         _db_ready = True
         print("[db] ✅ PostgreSQL schema ready")
+        _flush_pending_jobs()
     except Exception as e:
         print(f"[db] ⚠️  Schema init failed: {e}")
 
@@ -236,11 +237,48 @@ _local_jobs: dict = {}   # fallback when DATABASE_URL is not set or DB write fai
 _local_jobs_lock = threading.Lock()
 
 
+
+
+def _flush_pending_jobs():
+    """Write any in-memory jobs that were created before the DB schema was
+    ready to Postgres, so other gunicorn workers can find them via _job_get.
+    Called once, immediately after _db_ready is set to True.
+    """
+    if not DATABASE_URL:
+        return
+    with _local_jobs_lock:
+        pending = [(jid, entry) for jid, entry in _local_jobs.items()
+                   if entry.get("_owner") is not None]
+    if not pending:
+        return
+    try:
+        conn = _get_db_conn()
+        cur  = conn.cursor()
+        for job_id, entry in pending:
+            owner  = entry.get("_owner", "unknown")
+            status = entry.get("status", "running")
+            result = entry.get("result")
+            error  = entry.get("error")
+            cur.execute("""
+                INSERT INTO grps_jobs (job_id, status, owner, result_json, error)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (job_id) DO NOTHING
+            """, (job_id, status, owner,
+                  json.dumps(result) if result else None,
+                  error))
+        conn.commit()
+        conn.close()
+        print(f"[jobs] flushed {len(pending)} pending job(s) to DB")
+    except Exception as exc:
+        print(f"[jobs] flush failed: {exc}")
+
 def _job_create(job_id: str, owner: str):
     # Always add to in-memory store — this ensures the job is findable
     # even if the DB write succeeds but a later DB read times out.
+    # We also store the owner so _flush_pending_jobs can write it to DB later.
     with _local_jobs_lock:
-        _local_jobs[job_id] = {"status": "running", "result": None, "error": None}
+        _local_jobs[job_id] = {"status": "running", "result": None, "error": None,
+                               "_owner": owner}
     if not DATABASE_URL or not _db_ready:
         return
     try:
