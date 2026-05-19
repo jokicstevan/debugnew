@@ -40,11 +40,6 @@ def make_celery(app) -> Celery:
         backend=redis_url,
     )
 
-    # Pull any CELERY_* keys from the Flask config into Celery.
-    celery.conf.update(
-        {k: v for k, v in app.config.items() if k.startswith("CELERY_")}
-    )
-
     # Sensible production defaults.
     celery.conf.update(
         # Use JSON everywhere — no pickle, no security surprises.
