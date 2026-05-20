@@ -100,7 +100,10 @@ def _get_db_conn():
 def _ensure_schema():
     """Create tables if they don't exist yet (idempotent, runs once on startup)."""
     global _db_ready
+    import os as _os
+    print(f"[db] worker={_os.getpid()} _ensure_schema starting  DATABASE_URL={'set' if DATABASE_URL else 'NOT SET'}")
     if not DATABASE_URL:
+        print(f"[db] no DATABASE_URL — job store will be in-memory only (multi-worker polling will fail)")
         return
     try:
         conn = _get_db_conn()
@@ -279,7 +282,11 @@ def _job_create(job_id: str, owner: str):
     with _local_jobs_lock:
         _local_jobs[job_id] = {"status": "running", "result": None, "error": None,
                                "_owner": owner}
-    if not DATABASE_URL or not _db_ready:
+    if not DATABASE_URL:
+        print(f"[jobs] create {job_id[:8]}… owner={owner} → in-memory only (no DATABASE_URL)")
+        return
+    if not _db_ready:
+        print(f"[jobs] create {job_id[:8]}… owner={owner} → in-memory only (_db_ready=False, will flush when DB ready)")
         return
     try:
         conn = _get_db_conn()
@@ -290,12 +297,14 @@ def _job_create(job_id: str, owner: str):
         )
         conn.commit()
         conn.close()
+        print(f"[jobs] create {job_id[:8]}… owner={owner} → ✅ written to DB")
     except Exception as exc:
-        print(f"[jobs] create failed (DB): {exc} — job already in in-memory store")
+        print(f"[jobs] create {job_id[:8]}… FAILED (DB): {exc} — falling back to in-memory store")
 
 
 def _job_set_done(job_id: str, result_dict: dict):
     if not DATABASE_URL or not _db_ready:
+        print(f"[jobs] set_done {job_id[:8]}… → in-memory only (db_ready={_db_ready})")
         with _local_jobs_lock:
             if job_id in _local_jobs:
                 _local_jobs[job_id].update({"status": "done", "result": result_dict})
@@ -307,10 +316,15 @@ def _job_set_done(job_id: str, result_dict: dict):
             "UPDATE grps_jobs SET status='done', result_json=%s, updated_at=NOW() WHERE job_id=%s",
             (json.dumps(result_dict), job_id)
         )
+        rows = cur.rowcount
         conn.commit()
         conn.close()
+        if rows == 0:
+            print(f"[jobs] set_done {job_id[:8]}… ⚠️  UPDATE matched 0 rows — job never in DB?")
+        else:
+            print(f"[jobs] set_done {job_id[:8]}… ✅ DB updated (done)")
     except Exception as exc:
-        print(f"[jobs] set_done failed: {exc} — writing to in-memory store")
+        print(f"[jobs] set_done {job_id[:8]}… FAILED (DB): {exc} — writing to in-memory store")
         with _local_jobs_lock:
             if job_id in _local_jobs:
                 _local_jobs[job_id].update({"status": "done", "result": result_dict})
@@ -318,6 +332,7 @@ def _job_set_done(job_id: str, result_dict: dict):
 
 def _job_set_error(job_id: str, error: str):
     if not DATABASE_URL or not _db_ready:
+        print(f"[jobs] set_error {job_id[:8]}… → in-memory only (db_ready={_db_ready})")
         with _local_jobs_lock:
             if job_id in _local_jobs:
                 _local_jobs[job_id].update({"status": "error", "error": error})
@@ -329,10 +344,15 @@ def _job_set_error(job_id: str, error: str):
             "UPDATE grps_jobs SET status='error', error=%s, updated_at=NOW() WHERE job_id=%s",
             (error, job_id)
         )
+        rows = cur.rowcount
         conn.commit()
         conn.close()
+        if rows == 0:
+            print(f"[jobs] set_error {job_id[:8]}… ⚠️  UPDATE matched 0 rows — job never in DB?")
+        else:
+            print(f"[jobs] set_error {job_id[:8]}… ✅ DB updated (error)")
     except Exception as exc:
-        print(f"[jobs] set_error failed: {exc} — writing to in-memory store")
+        print(f"[jobs] set_error {job_id[:8]}… FAILED (DB): {exc} — writing to in-memory store")
         with _local_jobs_lock:
             if job_id in _local_jobs:
                 _local_jobs[job_id].update({"status": "error", "error": error})
@@ -350,12 +370,18 @@ def _job_get(job_id: str):
     #   2. DB not ready yet when job was created (_db_ready was False)
     #   3. DB write failed at creation time and fell back to in-memory
     #   4. Previously fetched from DB and cached below
+    short = job_id[:8]
     with _local_jobs_lock:
         local = _local_jobs.get(job_id)
     if local is not None:
+        print(f"[jobs] get {short}… → found in local cache (status={local['status']})")
         return local
 
     if not DATABASE_URL:
+        print(f"[jobs] get {short}… → NOT FOUND (no DATABASE_URL, local_jobs keys: {list(_local_jobs)[:5]})")
+        return None
+    if not _db_ready:
+        print(f"[jobs] get {short}… → NOT FOUND (_db_ready=False, local_jobs keys: {list(_local_jobs)[:5]})")
         return None
     for attempt in range(2):   # retry once on transient connection failure
         try:
@@ -368,17 +394,23 @@ def _job_get(job_id: str):
             row = cur.fetchone()
             conn.close()
             if not row:
+                # Log all known job IDs to diagnose cross-worker 404s
+                with _local_jobs_lock:
+                    local_keys = list(_local_jobs.keys())
+                print(f"[jobs] get {short}… → NOT FOUND in DB (attempt {attempt+1}) "
+                      f"local_cache has {len(local_keys)} job(s): {[k[:8] for k in local_keys[:5]]}")
                 return None
             status, result_json, error = row
             result = {"status": status,
                       "result": json.loads(result_json) if result_json else None,
                       "error":  error}
+            print(f"[jobs] get {short}… → found in DB (status={status})")
             # Cache in memory so future polls don't need a DB round-trip
             with _local_jobs_lock:
                 _local_jobs[job_id] = result
             return result
         except Exception as exc:
-            print(f"[jobs] get failed (attempt {attempt+1}): {exc}")
+            print(f"[jobs] get {short}… DB attempt {attempt+1} FAILED: {exc}")
             if attempt == 0:
                 time.sleep(1)   # brief pause before retry
     return None
@@ -1156,29 +1188,41 @@ def fetch_here_matrix(locations, pairs=None, hav_km=None, sentinel_factor=None,
         return None
 
     api_calls = failures = 0
+    _log_interval = max(100, n_pairs // 10)   # progress every ~10%
+    _matrix_t0 = time.time()
     with ThreadPoolExecutor(max_workers=MAX_HERE_WORKERS) as pool:
         futures = {pool.submit(_fetch_pair, i, j): (i, j) for (i, j) in fetch_set}
         for future in as_completed(futures):
+            elapsed_now = time.time() - _matrix_t0
             if time.time() > wall_deadline:
                 abort_flag.set()
                 pool.shutdown(wait=False, cancel_futures=True)
-                print(f"[HERE matrix] wall-clock budget exceeded after "
-                      f"{api_calls} successes / {failures} failures — falling back to OSRM")
+                print(f"[HERE matrix] ❌ wall-clock budget exceeded after {elapsed_now:.1f}s "
+                      f"({api_calls} ok / {failures} failed / {n_pairs} total) — falling back to OSRM")
                 return None, None
             result = future.result()
             if result is None:
                 failures += 1
+                fail_rate = failures / max(api_calls + failures, 1)
+                if (api_calls + failures) % _log_interval == 0:
+                    print(f"[HERE matrix] progress: {api_calls+failures}/{n_pairs}  "
+                          f"ok={api_calls}  fail={failures}  fail_rate={fail_rate:.1%}  "
+                          f"elapsed={elapsed_now:.1f}s")
                 if failures > n_pairs * HERE_FAIL_THRESHOLD:
                     abort_flag.set()
                     pool.shutdown(wait=False, cancel_futures=True)
-                    print(f"[HERE matrix] failure threshold exceeded "
-                          f"({failures}/{n_pairs}) — falling back to OSRM")
+                    print(f"[HERE matrix] ❌ failure threshold exceeded "
+                          f"({failures}/{api_calls+failures} = {fail_rate:.1%}) — falling back to OSRM")
                     return None, None
             else:
                 i, j, dist, time_val = result
                 dist_mat[i][j] = dist
                 time_mat[i][j] = time_val
                 api_calls += 1
+                if api_calls % _log_interval == 0:
+                    print(f"[HERE matrix] progress: {api_calls+failures}/{n_pairs}  "
+                          f"ok={api_calls}  fail={failures}  elapsed={elapsed_now:.1f}s  "
+                          f"budget_left={wall_budget - elapsed_now:.1f}s")
 
     skipped = n * (n - 1) - api_calls
     print(f"[HERE matrix] ✅ {n}×{n} built ({api_calls} calls, "
@@ -1535,19 +1579,42 @@ def fetch_best_matrix(locations, k_nearest=None, sentinel_factor=None,
     k  = k_nearest      if k_nearest      is not None else K_NEAREST
     sf = sentinel_factor if sentinel_factor is not None else SENTINEL_FACTOR
 
+    n_locs = len(locations)
+    print(f"[matrix] building {n_locs}x{n_locs} matrix  k={k}  sf={sf}  "
+          f"departure_min={departure_min}  blend_w={blend_w}  "
+          f"HERE={'enabled' if HERE_API_KEY else 'NO KEY'}")
+
     hav_km, pairs = build_api_pairs(locations, k=k)
+    print(f"[matrix] haversine done → {len(pairs)} API pairs to fetch")
 
     if HERE_API_KEY:
+        print(f"[matrix] attempting HERE routing API…")
+        _t0 = time.time()
         d, t = fetch_here_matrix(locations, pairs=pairs, hav_km=hav_km,
                                   sentinel_factor=sf, departure_min=departure_min)
+        _elapsed = time.time() - _t0
         if d is not None:
+            print(f"[matrix] HERE ✅ in {_elapsed:.1f}s → blending historical…")
             t = _blend_historical(t, locations, departure_min, pairs, blend_w)
+            print(f"[matrix] final source=here")
             return d, t, "here"
+        print(f"[matrix] HERE ❌ after {_elapsed:.1f}s → falling back to OSRM")
+    else:
+        print(f"[matrix] HERE skipped (no API key) → trying OSRM")
+
+    print(f"[matrix] attempting OSRM…")
+    _t0 = time.time()
     d, t = fetch_osrm_matrix(locations, pairs=pairs, hav_km=hav_km, sentinel_factor=sf)
+    _elapsed = time.time() - _t0
     if d is not None:
+        print(f"[matrix] OSRM ✅ in {_elapsed:.1f}s → blending historical…")
         t = _blend_historical(t, locations, departure_min, pairs, blend_w)
+        print(f"[matrix] final source=osrm")
         return d, t, "osrm"
+    print(f"[matrix] OSRM ❌ after {_elapsed:.1f}s → falling back to haversine")
+
     d, t = build_haversine_matrix(locations)
+    print(f"[matrix] final source=haversine (straight-line distances only)")
     return d, t, "haversine"
 
 
@@ -2647,6 +2714,15 @@ def _alns_optimize(fleet, dist_mat, time_mat, n_depots, n_cust, tw, demands,
                 return i
         return len(w) - 1
 
+    _log_every  = max(50, max_iter // 20)   # ~20 progress lines regardless of max_iter
+    _last_improvement = 0
+
+    _alns_start_t = time.time()
+    alns_time_limit_local = (deadline - _alns_start_t) if deadline is not None else float('inf')
+    active_routes_init = sum(1 for r in best.routes if r)
+    unrouted_init = sum(1 for r in best.routes for _ in r) 
+    print(f"[ALNS] START  obj={best_obj:>12.2f}  routes={active_routes_init}  stops={unrouted_init}  max_iter={max_iter}  T0={temperature:.2f}  cooling={cooling:.4f}")
+
     for iteration in range(max_iter):
         # Wall-clock deadline check — exit early and keep the best solution found.
         if deadline is not None and iteration % 50 == 0 and time.time() >= deadline:
@@ -2663,9 +2739,20 @@ def _alns_optimize(fleet, dist_mat, time_mat, n_depots, n_cust, tw, demands,
             state, cur_obj = cand, cand_obj
             if cur_obj < best_obj:
                 best, best_obj = state.copy(), cur_obj
+                _last_improvement = iteration
+                active_routes = sum(1 for r in best.routes if r)
+                print(f"[ALNS] iter={iteration:>5}  NEW BEST obj={best_obj:>12.2f}  routes={active_routes}  T={temp:.2f}  destroy={destroy[di].__name__}  repair={repair[ri].__name__}")
         temp *= cooling
 
+        if iteration % _log_every == 0 and iteration > 0:
+            active_routes = sum(1 for r in best.routes if r)
+            elapsed = time.time() - (deadline - alns_time_limit_local if deadline is not None else 0)
+            print(f"[ALNS] iter={iteration:>5}/{max_iter}  best={best_obj:>12.2f}  cur={cur_obj:>12.2f}  routes={active_routes}  T={temp:.2f}  last_impr={_last_improvement}")
+
     best.reassign_depots()
+    active_routes_final = sum(1 for r in best.routes if r)
+    total_stops = sum(len(r) for r in best.routes)
+    print(f"[ALNS] END    obj={best_obj:>12.2f}  routes={active_routes_final}  stops={total_stops}  last_impr_iter={_last_improvement}  elapsed={time.time()-_alns_start_t:.1f}s")
     return best
 
 
@@ -2809,12 +2896,17 @@ def optimize_status(job_id):
     """Poll endpoint — reads job state from Postgres, works on any worker.
       { ok:true,  status:'running' }               — still computing
       { ok:true,  status:'done', result:{…} }      — finished
-      { ok:false, status:'error', error:'…' }     — job failed
+      { ok:false, status:'error', error:{} }      — job failed
       404 if job_id unknown or expired
     """
+    import os as _os
+    worker_id = _os.getpid()
+    print(f"[poll] worker={worker_id} job={job_id[:8]}… db_ready={_db_ready} "
+          f"local_cache_size={len(_local_jobs)}")
     job = _job_get(job_id)
 
     if job is None:
+        print(f"[poll] worker={worker_id} job={job_id[:8]}… → 404 NOT FOUND")
         return jsonify({"ok": False, "error": "Job not found or expired"}), 404
 
     if job["status"] == "running":
@@ -3179,9 +3271,20 @@ def _do_optimize(data, user):
         fleet = [{"type":"Vehicle","capacity":9999.0,"weight_capacity":0.0,
                   "color":"#3b82f6","fuel_consumption":10.0}]
 
-    print(f"[optimize] {algorithm} depots={n_depots} custs={n_cust} "
-          f"vehicles={len(fleet)} matrix={len(dist_mat)}x{len(dist_mat[0])} "
-          f"source={matrix_source}")
+    print(f"[optimize] {'='*60}")
+    print(f"[optimize] {algorithm} | depots={n_depots} | customers={n_orig_cust} (sub-orders={n_cust})")
+    print(f"[optimize] fleet={len(fleet)} vehicles | matrix={len(dist_mat)}x{len(dist_mat[0])} | source={matrix_source}")
+    print(f"[optimize] max_iter={max_iter} | T={temperature} | cooling={alns_cooling} | time_limit={alns_time_limit}s")
+    print(f"[optimize] obj_weights={obj_weights}")
+    print(f"[optimize] vol_cap={'ON' if use_volume_cap else 'OFF'} | wt_cap={'ON' if use_weight_cap else 'OFF'} | TW={'ON' if use_tw else 'OFF'}")
+    total_vol  = sum(demands)
+    total_wt   = sum(demands_kg)
+    print(f"[optimize] total_volume={total_vol:.3f} m³ | total_weight={total_wt:.1f} kg")
+    for vi, v in enumerate(fleet[:8]):   # show first 8 to avoid log spam
+        print(f"[optimize]   vehicle[{vi}] {v['type']}  vol={v['capacity']:.2f}m³  wt={v['weight_capacity']:.0f}kg  fuel={v['fuel_consumption']}L/100km")
+    if len(fleet) > 8:
+        print(f"[optimize]   ... and {len(fleet)-8} more vehicles")
+    print(f"[optimize] {'='*60}")
 
     # Phase 2: run optimiser → VRPState
     # no_wait: suppress idle waiting at stops so the route is a continuous
