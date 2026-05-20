@@ -2852,40 +2852,46 @@ def optimize():
         print(f"[optimize] ⚠️  DB schema not ready yet — job {job_id} stored in-memory only. "
               "Poll will work only on this worker instance.")
 
+    # ── Common threading runner ──────────────────────────────────────────────
+    def _run_in_thread():
+        import traceback as _tb
+        try:
+            result = _do_optimize(data, user)
+            _job_set_done(job_id, result)
+        except Exception as exc:
+            print(f"[optimize job {job_id}] EXCEPTION: {exc}\n{_tb.format_exc()}")
+            _job_set_error(job_id, str(exc))
+
     if _USE_CELERY and _celery_optimize_task is not None:
         # ── Celery path ──────────────────────────────────────────────────────
-        # Dispatch to a dedicated worker process via Redis.  The HTTP response
-        # is returned before the solver starts; the client polls /api/optimize/status.
+        # Before dispatching, verify at least one Celery worker is reachable.
+        # Without this check, tasks silently queue in Redis forever when the
+        # grps-celery-worker Render service is not deployed or has crashed.
+        _worker_alive = False
         try:
-            _celery_optimize_task.delay(data, user, job_id)
-            print(f"[optimize] 🚀 Celery task dispatched for job {job_id}")
-        except Exception as celery_exc:
-            # Redis unreachable or serialisation error — degrade gracefully to
-            # an in-process thread so the request never returns HTML to the JS.
-            import traceback
-            print(f"[optimize] ⚠️  Celery dispatch failed ({celery_exc}), "
-                  f"falling back to threading for job {job_id}\n"
-                  f"{traceback.format_exc()}")
-            def _run_fallback():
-                try:
-                    result = _do_optimize(data, user)
-                    _job_set_done(job_id, result)
-                except Exception as exc2:
-                    print(f"[optimize job {job_id}] EXCEPTION: {exc2}\n{traceback.format_exc()}")
-                    _job_set_error(job_id, str(exc2))
-            threading.Thread(target=_run_fallback, daemon=True).start()
+            _ping = celery.control.inspect(timeout=1.0).ping()
+            _worker_alive = bool(_ping)
+        except Exception as _pe:
+            print(f"[optimize] Celery ping failed: {_pe}")
+
+        if not _worker_alive:
+            print(f"[optimize] ⚠️  No Celery worker responded to ping — "
+                  f"falling back to threading for job {job_id}. "
+                  f"Deploy the grps-celery-worker service on Render to use Celery.")
+            threading.Thread(target=_run_in_thread, daemon=True).start()
+        else:
+            try:
+                _celery_optimize_task.delay(data, user, job_id)
+                print(f"[optimize] 🚀 Celery task dispatched for job {job_id}")
+            except Exception as celery_exc:
+                import traceback
+                print(f"[optimize] ⚠️  Celery dispatch failed ({celery_exc}), "
+                      f"falling back to threading for job {job_id}\n"
+                      f"{traceback.format_exc()}")
+                threading.Thread(target=_run_in_thread, daemon=True).start()
     else:
         # ── Threading fallback (REDIS_URL not configured) ────────────────────
-        def _run():
-            try:
-                result = _do_optimize(data, user)
-                _job_set_done(job_id, result)
-            except Exception as exc:
-                import traceback
-                print(f"[optimize job {job_id}] EXCEPTION: {exc}\n{traceback.format_exc()}")
-                _job_set_error(job_id, str(exc))
-
-        threading.Thread(target=_run, daemon=True).start()
+        threading.Thread(target=_run_in_thread, daemon=True).start()
 
     return jsonify({"ok": True, "job_id": job_id})
 
