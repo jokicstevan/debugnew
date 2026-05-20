@@ -323,6 +323,11 @@ def _job_set_done(job_id: str, result_dict: dict):
             print(f"[jobs] set_done {job_id[:8]}… ⚠️  UPDATE matched 0 rows — job never in DB?")
         else:
             print(f"[jobs] set_done {job_id[:8]}… ✅ DB updated (done)")
+        # Always update local cache so same-worker polls see 'done' immediately
+        # without waiting for a DB round-trip on the next _job_get call.
+        with _local_jobs_lock:
+            if job_id in _local_jobs:
+                _local_jobs[job_id].update({"status": "done", "result": result_dict})
     except Exception as exc:
         print(f"[jobs] set_done {job_id[:8]}… FAILED (DB): {exc} — writing to in-memory store")
         with _local_jobs_lock:
@@ -351,6 +356,10 @@ def _job_set_error(job_id: str, error: str):
             print(f"[jobs] set_error {job_id[:8]}… ⚠️  UPDATE matched 0 rows — job never in DB?")
         else:
             print(f"[jobs] set_error {job_id[:8]}… ✅ DB updated (error)")
+        # Always update local cache so same-worker polls see 'error' immediately.
+        with _local_jobs_lock:
+            if job_id in _local_jobs:
+                _local_jobs[job_id].update({"status": "error", "error": error})
     except Exception as exc:
         print(f"[jobs] set_error {job_id[:8]}… FAILED (DB): {exc} — writing to in-memory store")
         with _local_jobs_lock:
