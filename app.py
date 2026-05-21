@@ -1162,9 +1162,11 @@ def fetch_here_matrix(locations, pairs=None, hav_km=None, sentinel_factor=None,
     # ── Concurrent HERE /v8/routes calls ──────────────────────────────────────
     # 20 workers comfortably handles 2 000–3 000 pairs within 240 s at ~1.1 s/call.
     # Wall-clock budget scales with pair count: 120 s for small jobs, 240 s for large.
-    MAX_HERE_WORKERS    = 20
-    HERE_FAIL_THRESHOLD = 0.20
-    wall_budget         = 240.0 if n_pairs > 500 else 120.0
+    MAX_HERE_WORKERS    = 30
+    HERE_FAIL_THRESHOLD = 0.15
+    # Budget scales with pair count: pairs/throughput + 60s headroom, capped at 480s.
+    # Observed throughput on Render free tier: ~3.5 pairs/s with 30 workers.
+    wall_budget         = min(480.0, max(90.0, n_pairs / 3.5 + 60.0))
     wall_deadline       = time.time() + wall_budget
     abort_flag          = threading.Event()
 
@@ -2992,24 +2994,34 @@ def _do_optimize(data, user):
     algorithm   = data.get("algorithm", "ALNS")
     use_tw      = data.get("use_time_windows", False)
     # Auto-scale max_iter based on problem size when the user hasn't overridden it.
-    # More iterations = better quality, but cost is O(n²) per iteration.
     # Heuristic: keep wall time roughly constant across problem sizes.
     #   ≤ 20 customers  → 600 iterations  (fast, explore more)
     #   21–40 customers → 400 iterations
-    #   41–60 customers → 250 iterations
-    #   61–80 customers → 180 iterations
-    #   > 80 customers  → 120 iterations
+    #   41–60 customers → 300 iterations
+    #   61–100 customers→ 250 iterations
+    #   101–150 customers→200 iterations
+    #   151–200 customers→150 iterations
+    #   > 200 customers → 120 iterations
+    # A server-side floor of 50 prevents a tiny frontend value (e.g. 5) from
+    # producing a near-random solution regardless of what the client sends.
+    _MIN_ITER = 50
     _n_custs_hint = len(data.get("customers", []))
     if "max_iterations" in data:
-        max_iter = int(data["max_iterations"])
+        max_iter = max(int(data["max_iterations"]), _MIN_ITER)
+        if int(data["max_iterations"]) < _MIN_ITER:
+            print(f"[optimize] ⚠️  max_iterations={data['max_iterations']} overridden to floor {_MIN_ITER}")
     elif _n_custs_hint <= 20:
         max_iter = 600
     elif _n_custs_hint <= 40:
         max_iter = 400
     elif _n_custs_hint <= 60:
+        max_iter = 300
+    elif _n_custs_hint <= 100:
         max_iter = 250
-    elif _n_custs_hint <= 80:
-        max_iter = 180
+    elif _n_custs_hint <= 150:
+        max_iter = 200
+    elif _n_custs_hint <= 200:
+        max_iter = 150
     else:
         max_iter = 120
     temperature = float(data.get("temperature", 150.0))
