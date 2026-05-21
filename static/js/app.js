@@ -81,7 +81,7 @@ const TRANSLATIONS = {
     apply: 'Apply',
     excelPreview: 'Excel Import Preview',
     geocodingHint: 'Customers will be geocoded after import. This may take a moment.',
-    excelColumns: 'Expected columns: Customer, Address, Packages#1, Packages#2, Packages#3, Time',
+    excelColumns: 'Required: Customer, Address, Packages#1, Packages#2, Packages#3, Time — Optional: Lat, Lng (skips geocoding)',
     importAll: 'Import All',
     searching: '🔍 Searching…',
     found: '✅ Found',
@@ -168,11 +168,14 @@ const TRANSLATIONS = {
     sentinelFactorLabel: 'Sentinel factor',
     overlapPenaltyTitle: '🗺️ Route Overlap Penalty',
     overlapThresholdLabel: 'Overlap threshold (km)',
-    overlapWeightLabel: 'Overlap weight (RSD)',
+    overlapWeightLabel: 'Overlap penalty (RSD/shared km)',
     solverPenaltiesTitle: '⚖️ Solver Penalties',
     distRsdPerKmLabel: 'Distance cost (RSD/km)',
     twPenaltyRsdLabel: 'TW violation penalty (RSD/min)',
     alnsCoolingLabel: 'ALNS cooling rate',
+    histBlendTitle: '🕑 Historical Traffic Blending',
+    depTimeLabel: 'Planned departure time',
+    histBlendWeightLabel: 'Blend weight (0 = live, 1 = historical)',
     routeHistory: '🗄️ Route History',
     routeHistoryHint: 'Routes saved automatically after each optimization run.',
     refreshHistory: '🔄 Refresh',
@@ -270,7 +273,7 @@ const TRANSLATIONS = {
     apply: 'Primeni',
     excelPreview: 'Pregled Excel uvoza',
     geocodingHint: 'Mušterije će biti geokodirane nakon uvoza. Ovo može potrajati.',
-    excelColumns: 'Očekivane kolone: Customer, Address, Packages#1, Packages#2, Packages#3, Time',
+    excelColumns: 'Obavezno: Customer, Address, Packages#1, Packages#2, Packages#3, Time — Opciono: Lat, Lng (preskače geokodiranje)',
     importAll: 'Uvezi sve',
     searching: '🔍 Pretraga…',
     found: '✅ Pronađeno',
@@ -357,11 +360,14 @@ const TRANSLATIONS = {
     sentinelFactorLabel: 'Sentinel faktor',
     overlapPenaltyTitle: '🗺️ Kazna preklapanja ruta',
     overlapThresholdLabel: 'Prag preklapanja (km)',
-    overlapWeightLabel: 'Težina preklapanja (RSD)',
+    overlapWeightLabel: 'Kazna za preklapanje (RSD/deljeni km)',
     solverPenaltiesTitle: '⚖️ Kazne solvera',
     distRsdPerKmLabel: 'Trošak rastojanja (RSD/km)',
     twPenaltyRsdLabel: 'Kazna kršenja vremenskog okvira (RSD/min)',
     alnsCoolingLabel: 'ALNS stopa hlađenja',
+    histBlendTitle: '🕑 Mešanje istorijskih podataka o saobraćaju',
+    depTimeLabel: 'Planirano vreme polaska',
+    histBlendWeightLabel: 'Težina mešanja (0 = živo, 1 = istorijsko)',
     routeHistory: '🗄️ Istorija ruta',
     routeHistoryHint: 'Rute se čuvaju automatski nakon svake optimizacije.',
     refreshHistory: '🔄 Osveži',
@@ -490,6 +496,14 @@ window.addEventListener('DOMContentLoaded', () => {
   L.control.layers(layers, {}, { position:'topright' }).addTo(map);
 
   map.on('click', onMapClick);
+
+  // Redraw routes on zoom so shared-segment stripe width stays visually constant
+  map.on('zoomend', () => {
+    if (state.lastResult) {
+      clearRoutes();
+      drawRoutes(state.lastResult);
+    }
+  });
 
   renderFleetCards();
   updateFleetFooter();
@@ -667,7 +681,11 @@ function renderLocationsList() {
   state.customers.forEach(c => {
     html += `<div class="loc-item">
       <span class="loc-dot customer"></span>
-      <span class="loc-name">👤 C${c.customer_id}: ${esc(c.name)} [${calcVolume(c.pkg_counts).toFixed(2)}m³]</span>
+      <span class="loc-name">👤 ${
+        c.route_visit_num != null
+          ? `<span style="color:${c.route_vehicle_color};font-weight:700">V${c.route_vehicle_num}:#${c.route_visit_num}</span>`
+          : `C${c.customer_id}`
+      }: ${esc(c.name)} [${calcVolume(c.pkg_counts).toFixed(2)}m³]</span>
       <button class="loc-del" onclick="removeCustomer('${c.id}')">✕</button>
     </div>`;
   });
@@ -778,19 +796,25 @@ async function importExcel(input) {
 }
 
 function showExcelPreview(rows) {
-  let th = '<tr><th>#</th><th>Customer</th><th>Address</th><th>Pkg#1</th><th>Pkg#2</th><th>Pkg#3</th><th>Vol (m³)</th><th>Unload (min)</th><th>Time</th></tr>';
+  const hasCoords = rows.some(r => r.lat != null && r.lng != null);
+  const coordCols = hasCoords ? '<th>Lat</th><th>Lng</th>' : '';
+  let th = `<thead><tr><th>#</th><th>Customer</th><th>Address</th><th>Pkg#1</th><th>Pkg#2</th><th>Pkg#3</th><th>Vol (m³)</th><th>Unload (min)</th><th>Time</th>${coordCols}</tr></thead>`;
   let td = rows.map((r,i) => {
     const pc = r.pkg_counts || [r.packages||0, 0, 0];
     const vol = calcVolume(pc).toFixed(2);
+    const coordCells = hasCoords
+      ? `<td>${r.lat != null ? r.lat.toFixed(5) : '—'}</td><td>${r.lng != null ? r.lng.toFixed(5) : '—'}</td>`
+      : '';
+    const coordBadge = r.lat != null ? ' 📍' : '';
     return `<tr>
-      <td>${i+1}</td><td>${esc(r.name)}</td><td>${esc(r.address)}</td>
+      <td>${i+1}</td><td>${esc(r.name)}${coordBadge}</td><td>${esc(r.address)}</td>
       <td>${pc[0]}</td><td>${pc[1]}</td><td>${pc[2]}</td><td>${vol}</td>
       <td>${r.unloading_time ?? 10}</td>
-      <td>${r.time_window.start}–${r.time_window.end}</td>
+      <td>${r.time_window.start}–${r.time_window.end}</td>${coordCells}
     </tr>`;
   }).join('');
   document.getElementById('excel-table-wrap').innerHTML =
-    `<table class="excel-preview-table"><thead>${th}</thead><tbody>${td}</tbody></table>`;
+    `<table class="excel-preview-table">${th}<tbody>${td}</tbody></table>`;
   document.getElementById('excel-modal').classList.remove('hidden');
 }
 
@@ -824,6 +848,14 @@ async function confirmExcelImport() {
   let importedCount = 0;
   for (let i=0; i<rows.length; i++) {
     const r = rows[i];
+    // If the row already has coordinates, skip the geocoding API call entirely
+    if (r.lat != null && r.lng != null) {
+      st.textContent = `📍 (${i+1}/${rows.length}) ${r.name}`;
+      const pc = r.pkg_counts || [r.packages||1, 0, 0];
+      placeCustomer(r.lat, r.lng, r.name, pc, r.time_window, r.unloading_time || 10);
+      importedCount++;
+      continue;
+    }
     st.textContent = t('geocodingProgress')(i, rows.length, r.name);
     try {
       const res = await fetch('/api/geocode', {
@@ -981,7 +1013,9 @@ function getAdvancedParams() {
     overlap_weight_rsd:   parseFloat(document.getElementById('adv-overlap-weight')?.value)  ?? 500,
     dist_rsd_per_km:      parseFloat(document.getElementById('adv-dist-rsd-per-km')?.value) ?? 20,
     tw_penalty_rsd:       parseFloat(document.getElementById('adv-tw-penalty-rsd')?.value)  ?? 100,
-    alns_cooling:         parseFloat(document.getElementById('adv-alns-cooling')?.value)    ?? 0.995,
+    alns_cooling:         parseFloat(document.getElementById('adv-alns-cooling')?.value)    || 0.995,
+    hist_blend_weight:    parseFloat(document.getElementById('adv-hist-blend-weight')?.value) || 0.5,
+    departure_time:       document.getElementById('adv-dep-time')?.value || '',
   };
 }
 
@@ -1027,6 +1061,7 @@ function updateConstraintHint() {
   }
 }
 
+
 // ─── OPTIMIZATION ────────────────────────────────────────────────────────────
 async function runOptimize() {
   if (state.depots.length === 0) { alert(t('addDepotFirst')); return; }
@@ -1059,25 +1094,93 @@ async function runOptimize() {
     max_iterations:   parseInt(document.getElementById('max-iter').value)||500,
     temperature:      parseFloat(document.getElementById('temperature').value)||150,
     advanced_params:  getAdvancedParams(),
+    departure_time:   document.getElementById('adv-dep-time')?.value || '',
   };
 
   try {
-    // Fake progress during server call
-    let prog = 10;
+    // ── Step 1: submit job, get job_id immediately ──────────────────────────
+    setProgress(5, t('phase1'));
+    const submitRes = await fetch('/api/optimize', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload)
+    });
+    const submitData = await submitRes.json();
+    if (!submitData.ok) {
+      alert(t('optimizationError') + (submitData.error || 'Unknown'));
+      btn.disabled = false;
+      pw.classList.add('hidden');
+      return;
+    }
+    const jobId = submitData.job_id;
+
+    // ── Step 2: poll /api/optimize/status/:job_id until done ───────────────
+    // Progress bar ticks forward slowly; messaging flips at ~40 %
+    let prog = 5;
     const ticker = setInterval(() => {
-      prog = Math.min(prog + 3, 85);
+      prog = Math.min(prog + 2, 90);
       setProgress(prog, prog < 40 ? t('phase1short') : t('phase2'));
     }, 800);
 
-    const res = await fetch('/api/optimize', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify(payload)
+    const POLL_INTERVAL_MS  = 1500;
+    const MAX_WAIT_MS       = 20 * 60 * 1000;  // 20 min hard client timeout
+    const MAX_RETRY_ERRORS  = 10;              // tolerate this many transient errors
+    // HTTP statuses treated as transient: worker restarting (502/503/504) or
+    // job not yet visible on this worker after a bounce (404).
+    const RETRYABLE_STATUSES = new Set([404, 502, 503, 504]);
+    const pollStart          = Date.now();
+    let   transientErrors    = 0;
+
+    const data = await new Promise((resolve, reject) => {
+      const poll = async () => {
+        if (Date.now() - pollStart > MAX_WAIT_MS) {
+          reject(new Error('Optimization timed out after 20 minutes'));
+          return;
+        }
+        try {
+          const r = await fetch(`/api/optimize/status/${jobId}`);
+          if (!r.ok) {
+            if (RETRYABLE_STATUSES.has(r.status) && transientErrors < MAX_RETRY_ERRORS) {
+              // Back off and retry — worker may be restarting.
+              transientErrors++;
+              const backoff = Math.min(POLL_INTERVAL_MS * transientErrors, 10000);
+              setTimeout(poll, backoff);
+              return;
+            }
+            // Permanent error or retry budget exhausted — surface it.
+            const text = await r.text().catch(() => r.statusText);
+            reject(new Error(`Status poll failed (${r.status}): ${text}`));
+            return;
+          }
+          transientErrors = 0;  // reset on a good response
+          const d = await r.json();
+          if (d.status === 'error') {
+            reject(new Error(d.error || 'Optimization failed on server'));
+            return;
+          }
+          if (d.status === 'done') {
+            resolve(d.result);
+            return;
+          }
+          // still running — poll again
+          setTimeout(poll, POLL_INTERVAL_MS);
+        } catch (fetchErr) {
+          // Network-level failure (offline, DNS) — retry up to the same limit.
+          if (transientErrors < MAX_RETRY_ERRORS) {
+            transientErrors++;
+            const backoff = Math.min(POLL_INTERVAL_MS * transientErrors, 10000);
+            setTimeout(poll, backoff);
+          } else {
+            reject(fetchErr);
+          }
+        }
+      };
+      setTimeout(poll, POLL_INTERVAL_MS);
     });
+
     clearInterval(ticker);
-    const data = await res.json();
 
     if (!data.ok) {
-      alert(t('optimizationError') + (data.error||'Unknown'));
+      alert(t('optimizationError') + (data.error || 'Unknown'));
       btn.disabled = false;
       pw.classList.add('hidden');
       return;
@@ -1117,7 +1220,7 @@ function setProgress(pct, msg) {
   document.getElementById('progress-label').textContent = msg;
 }
 
-// ─── DRAW ROUTES ON MAP ───────────────────────────────────────────────────────
+// ─── DRAW ROUTES ──────────────────────────────────────────────────
 function drawRoutes(data) {
   // Reset all customer markers back to default blue before colouring served ones
   state.customers.forEach(c => {
@@ -1178,13 +1281,169 @@ function drawRoutes(data) {
     st.style.color = '#e74c3c';
   }
 
+  // ── Overlap detection & zoom-invariant alternating-color splitting ─────────
+  // pixel-based dashArray shifts with zoom, so instead we split each shared
+  // run geographically: slice the coordinate array into chunks of equal
+  // geographic length (CHUNK_DEG), then assign each chunk to vehicles in
+  // round-robin order. Each chunk is drawn as a short solid polyline in that
+  // vehicle's color, stored in that vehicle's LayerGroup → toggle still works.
+  // Because the slices are defined by coordinates, the 1/N split is exact at
+  // every zoom level.
+  //
+  // Grid resolution: 1 cell ≈ 0.00025° ≈ 22–27 m at mid-European latitudes.
+  const GRID_RES = 0.00025;
+  function cellKey(lat, lng) {
+    return `${Math.round(lat / GRID_RES)}_${Math.round(lng / GRID_RES)}`;
+  }
+
+  // Compute chunk size in degrees so stripes are always ~STRIPE_PX pixels wide
+  // on screen, regardless of zoom level. We convert via Leaflet's CRS scale:
+  //   metersPerPx = 156543.03 * cos(centerLat) / 2^zoom   (Web Mercator)
+  //   degPerPx    = metersPerPx / 111320
+  const STRIPE_PX = 20;  // target stripe width in screen pixels
+  const zoom = map.getZoom();
+  const centerLat = map.getCenter().lat;
+  const metersPerPx = (156543.03392 * Math.cos(centerLat * Math.PI / 180)) / Math.pow(2, zoom);
+  const degPerPx = metersPerPx / 111320;
+  const CHUNK_DEG = STRIPE_PX * degPerPx;
+
+  // Euclidean distance in degrees (fine for short segments)
+  function segLen(a, b) {
+    const dlat = b[0] - a[0], dlng = b[1] - a[1];
+    return Math.sqrt(dlat * dlat + dlng * dlng);
+  }
+
+  // Interpolate between two [lat,lng] points at fraction t ∈ [0,1]
+  function interp(a, b, t) {
+    return [a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])];
+  }
+
+  // Slice a polyline (array of [lat,lng]) into equal-length geographic chunks.
+  // Uses cumulative arc length so each chunk is exactly chunkLen degrees long.
+  function slicePolylineClean(pts, chunkLen) {
+    const chunks = [];
+    let cur = [pts[0]];
+    let budget = chunkLen;
+
+    for (let i = 0; i + 1 < pts.length; i++) {
+      const A = pts[i], B = pts[i + 1];
+      let d = segLen(A, B);
+      let t0 = 0; // fraction of AB already consumed
+
+      while (t0 < 1) {
+        const tNeeded = budget / d;          // fraction of AB needed to fill budget
+        if (t0 + tNeeded >= 1 - 1e-10) {
+          // Rest of AB fits within budget
+          cur.push(B);
+          budget -= d * (1 - t0);
+          t0 = 1;
+          if (budget < 1e-10) {             // chunk exactly full
+            if (cur.length >= 2) chunks.push(cur);
+            cur = [B];
+            budget = chunkLen;
+          }
+        } else {
+          // Cut AB at t0+tNeeded
+          const cutPt = interp(A, B, t0 + tNeeded);
+          cur.push(cutPt);
+          if (cur.length >= 2) chunks.push(cur);
+          cur = [cutPt];
+          t0 += tNeeded;
+          budget = chunkLen;
+        }
+      }
+    }
+    if (cur.length >= 2) chunks.push(cur);
+    return chunks;
+  }
+
+  // Build grid: cellKey → Set of vehicle_ids
+  const cellVehicles = {};
+  (data.vehicle_routes || []).forEach(vr => {
+    if (!vr.geometry || vr.geometry.length < 2) return;
+    const pts = vr.geometry.map(([lng, lat]) => [lat, lng]);
+    for (let i = 0; i < pts.length - 1; i++) {
+      const midLat = (pts[i][0] + pts[i+1][0]) / 2;
+      const midLng = (pts[i][1] + pts[i+1][1]) / 2;
+      const k = cellKey(midLat, midLng);
+      if (!cellVehicles[k]) cellVehicles[k] = new Set();
+      cellVehicles[k].add(vr.vehicle_id);
+    }
+  });
+
+  // sharedCells: cellKey → sorted vehicle_id[] (only cells with 2+ vehicles)
+  const sharedCells = {};
+  Object.entries(cellVehicles).forEach(([k, vids]) => {
+    if (vids.size > 1) sharedCells[k] = [...vids].sort((a, b) => a - b);
+  });
+
+  // Color lookup
+  const vehicleColor = {};
+  (data.vehicle_routes || []).forEach(vr => { vehicleColor[vr.vehicle_id] = vr.color; });
+
+  // Accumulate sub-layers per vehicle before building LayerGroups
+  const vehicleSubLayers = {};
+  (data.vehicle_routes || []).forEach(vr => { vehicleSubLayers[vr.vehicle_id] = []; });
+
   data.vehicle_routes.forEach(vr => {
     if (!vr.geometry || vr.geometry.length < 2) return;
-    const latlngs = vr.geometry.map(([lng, lat]) => [lat, lng]);
-    const layer = L.polyline(latlngs, {
-      color: vr.color, weight: 4, opacity: 0.85, smoothFactor: 1
-    }).addTo(map);
-    state.routeLayers[vr.vehicle_id] = layer;
+    const pts = vr.geometry.map(([lng, lat]) => [lat, lng]);
+
+    // Split route into runs by sharing-group signature
+    const runs = [];
+    let currentSig = undefined;
+    let currentRun = null;
+
+    for (let i = 0; i < pts.length - 1; i++) {
+      const midLat = (pts[i][0] + pts[i+1][0]) / 2;
+      const midLng = (pts[i][1] + pts[i+1][1]) / 2;
+      const k = cellKey(midLat, midLng);
+      const sharingVids = sharedCells[k] || null;
+      const sig = sharingVids ? sharingVids.join(',') : '';
+
+      if (sig !== currentSig) {
+        if (currentRun) currentRun.push(pts[i]);
+        currentRun = [pts[i]];
+        currentSig = sig;
+        runs.push({ sig, sharingVids, latlngs: currentRun });
+      }
+      currentRun.push(pts[i + 1]);
+    }
+
+    runs.forEach(run => {
+      if (run.latlngs.length < 2) return;
+
+      if (!run.sharingVids) {
+        // Solid, non-shared segment
+        vehicleSubLayers[vr.vehicle_id].push(
+          L.polyline(run.latlngs, { color: vr.color, weight: 4, opacity: 0.85, smoothFactor: 1 })
+        );
+      } else {
+        // Shared segment: slice into geographic chunks and assign round-robin.
+        // Each vehicle gets every N-th chunk → exact 1/N split at all zoom levels.
+        const n = run.sharingVids.length;
+        const chunks = slicePolylineClean(run.latlngs, CHUNK_DEG);
+        chunks.forEach((chunkPts, ci) => {
+          const vid = run.sharingVids[ci % n];
+          if (vehicleSubLayers[vid] === undefined) return;
+          vehicleSubLayers[vid].push(
+            L.polyline(chunkPts, {
+              color:        vehicleColor[vid],
+              weight:       5,
+              opacity:      0.95,
+              smoothFactor: 0,   // no smoothing — preserve exact cut points
+            })
+          );
+        });
+      }
+    });
+  });
+
+  // Build LayerGroups and add to map
+  data.vehicle_routes.forEach(vr => {
+    if (!vr.geometry || vr.geometry.length < 2) return;
+    const group = L.layerGroup(vehicleSubLayers[vr.vehicle_id]).addTo(map);
+    state.routeLayers[vr.vehicle_id] = group;
     state.vehicleVisible[vr.vehicle_id] = true;
 
     // Update each customer marker: popup with schedule + dot colour = vehicle colour
@@ -1207,9 +1466,21 @@ function drawRoutes(data) {
           `🚪 Departs: ${stop.depart}<br>` +
           `⏱ Window: ${stop.tw_start}–${stop.tw_end}${flag}`
         );
+        // Update icon to show visit order (stop_number) in the vehicle's colour
         try {
-          const el = state.markers[custEntry.id].getElement();
-          if (el) { const dot = el.querySelector('div'); if (dot) dot.style.background = vr.color; }
+          const stopNum = stop.stop_number ?? stop.stop_num ?? '';
+          const updatedIcon = L.divIcon({
+            className: '',
+            html: `<div style="
+              width:26px;height:26px;border-radius:50%;
+              background:${vr.color};border:3px solid #fff;
+              box-shadow:0 2px 6px rgba(0,0,0,.45);
+              color:#fff;font-size:11px;font-weight:700;
+              display:flex;align-items:center;justify-content:center;
+              line-height:1;">${stopNum}</div>`,
+            iconSize:[26,26], iconAnchor:[13,13], popupAnchor:[0,-16]
+          });
+          state.markers[custEntry.id].setIcon(updatedIcon);
         } catch(e) {}
       }
     });
@@ -1383,6 +1654,17 @@ function renderLegend(data) {
   if (!data.vehicle_routes.length) { panel.classList.add('hidden'); return; }
   panel.classList.remove('hidden');
 
+  const overlapHint = data.vehicle_routes.length > 1
+    ? `<div style="margin-top:8px;padding:5px 6px;border-radius:5px;
+                   background:rgba(128,128,128,0.08);font-size:10px;
+                   color:var(--muted);display:flex;align-items:center;gap:6px">
+         <svg width="32" height="10" style="flex-shrink:0">
+           <rect x="0" y="2" width="14" height="6" fill="#3b82f6" rx="1"/>
+           <rect x="16" y="2" width="14" height="6" fill="#f97316" rx="1"/>
+         </svg>
+         Striped = shared road segment
+       </div>` : '';
+
   rows.innerHTML = data.vehicle_routes.map(vr => {
     const depotSub = vr.depot_name
       ? `<span style="display:block;font-size:9px;color:var(--muted)">🏠 ${esc(vr.depot_name)}</span>` : '';
@@ -1392,7 +1674,7 @@ function renderLegend(data) {
       <span class="legend-label">${esc(vr.type)} #${vr.vehicle_id+1}${depotSub}</span>
       <span class="legend-eye">👁</span>
     </div>`;
-  }).join('');
+  }).join('') + overlapHint;
 }
 
 function toggleRoute(vid) {
@@ -1655,8 +1937,10 @@ async function generatePDF() {
 
   // ── Capture per-vehicle maps ───────────────────────────────────────────────
   const vehicleMaps = {};
-  for (const vr of d.vehicle_routes) {
-    btn.textContent = t('captureVehicle')(vr.vehicle_id + 1, d.vehicle_routes.length);
+  const totalVehicles = d.vehicle_routes.length;
+  for (let i = 0; i < d.vehicle_routes.length; i++) {
+    const vr = d.vehicle_routes[i];
+    btn.textContent = t('captureVehicle')(i + 1, totalVehicles);
     vehicleMaps[vr.vehicle_id] = await captureVehicleMap(vr);
     await sleep(200);
   }
@@ -2042,6 +2326,8 @@ function _applyWorkspaceSnapshot(ws) {
     if (a.dist_rsd_per_km !== undefined)      document.getElementById('adv-dist-rsd-per-km').value    = a.dist_rsd_per_km;
     if (a.tw_penalty_rsd !== undefined)       document.getElementById('adv-tw-penalty-rsd').value     = a.tw_penalty_rsd;
     if (a.alns_cooling !== undefined)         document.getElementById('adv-alns-cooling').value       = a.alns_cooling;
+    if (a.hist_blend_weight !== undefined)    document.getElementById('adv-hist-blend-weight').value  = a.hist_blend_weight;
+    if (a.departure_time !== undefined)       document.getElementById('adv-dep-time').value           = a.departure_time;
   }
   if (s.pkg_sizes) {
     document.getElementById('pkg-size-1').value = s.pkg_sizes[0] || 0.10;
