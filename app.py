@@ -2935,60 +2935,6 @@ def optimize_status(job_id):
     return jsonify({"ok": True, "status": "done", "result": job["result"]})
 
 
-
-# ── Local-runner endpoints ────────────────────────────────────────────────────
-# These allow the heavy optimization to run on a local desktop and only
-# use Render for job-state storage and result delivery to the browser.
-
-@app.route("/api/optimize/reserve", methods=["POST"])
-@login_required
-def optimize_reserve():
-    """
-    Reserve a job slot without starting any computation.
-    The caller (local runner script) will do the work and submit via
-    /api/optimize/submit/<job_id> when done.
-
-    Returns: { ok: true, job_id: "<uuid>" }
-    """
-    import uuid as _uuid
-    job_id = str(_uuid.uuid4())
-    user   = session.get("user", "local")
-    _job_create(job_id, user)
-    print(f"[local-runner] reserved job {job_id} for user={user}")
-    return jsonify({"ok": True, "job_id": job_id})
-
-
-@app.route("/api/optimize/submit/<job_id>", methods=["POST"])
-@login_required
-def optimize_submit(job_id):
-    """
-    Accept a pre-computed result from the local runner and mark the job done.
-    The browser's existing poll loop will pick it up on the next tick.
-
-    Body: the same result JSON that _do_optimize() returns.
-    Returns: { ok: true }
-    """
-    payload = request.get_json(silent=True)
-    if not payload:
-        return jsonify({"ok": False, "error": "Empty or non-JSON body"}), 400
-
-    existing = _job_get(job_id)
-    if existing is None:
-        return jsonify({"ok": False, "error": "Job not found — call /reserve first"}), 404
-    if existing["status"] != "running":
-        return jsonify({"ok": False, "error": f"Job already in state '{existing['status']}'"}), 409
-
-    if payload.get("error"):
-        _job_set_error(job_id, payload["error"])
-        print(f"[local-runner] job {job_id[:8]}… submitted as ERROR: {payload['error']}")
-    else:
-        _job_set_done(job_id, payload)
-        print(f"[local-runner] job {job_id[:8]}… submitted as DONE "
-              f"(routes={len(payload.get('routes', []))})")
-
-    return jsonify({"ok": True})
-
-
 # ── Celery task ───────────────────────────────────────────────────────────────
 
 def _make_optimization_task(celery_instance):
