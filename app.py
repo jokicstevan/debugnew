@@ -288,11 +288,6 @@ _TRAFFIC_HISTORY_DAYS    = 14  # how many days back to fetch in total
 _TRAFFIC_FETCH_DAYS_PER_RUN = 3  # fetch at most this many days per optimize call (spreads load)
 _TRAFFIC_SLOT_MINUTES    = 15  # resolution in minutes
 
-# Only one prefetch may run at a time.  If an optimize fires while a prefetch
-# is already in progress (e.g. workspace reload + new customers), the new
-# request is skipped rather than stacking a second thread on top.
-_prefetch_lock = threading.Lock()
-
 
 def _round_coord(v):
     """Round coordinate to 5 decimal places for cache key consistency."""
@@ -321,7 +316,7 @@ def _fetch_here_for_slot(origin, destination, departure_iso):
     }
     try:
         resp = requests.get("https://router.hereapi.com/v8/routes",
-                            params=params, timeout=(5, 12))
+                            params=params, timeout=12)
         if resp.status_code == 200:
             routes = resp.json().get("routes", [])
             if routes:
@@ -374,98 +369,93 @@ def prefetch_traffic_history(locations, pairs):
         return  # nothing to do without both DB and HERE
 
     def _run():
-        if not _prefetch_lock.acquire(blocking=False):
-            print("[traffic cache] prefetch skipped — another prefetch already running")
-            return
+        # Determine which (pair, slot, date) triples are already in the cache
+        # so we can skip them.  We query once per pair to avoid a huge IN clause.
+        already = set()
         try:
-            # Determine which (pair, slot, date) triples are already in the cache
-            # so we can skip them.  We query once per pair to avoid a huge IN clause.
+            conn = _get_db_conn()
+            cur  = conn.cursor()
+            for (i, j) in pairs:
+                olat = _round_coord(locations[i]["lat"])
+                olng = _round_coord(locations[i]["lng"])
+                dlat = _round_coord(locations[j]["lat"])
+                dlng = _round_coord(locations[j]["lng"])
+                cur.execute("""
+                    SELECT slot_minutes, DATE(fetched_at)
+                    FROM grps_traffic_cache
+                    WHERE orig_lat=%s AND orig_lng=%s
+                      AND dest_lat=%s AND dest_lng=%s
+                      AND fetched_at >= NOW() - INTERVAL %s
+                """, (olat, olng, dlat, dlng,
+                      f"{_TRAFFIC_HISTORY_DAYS} days"))
+                for row in cur.fetchall():
+                    already.add((i, j, int(row[0]), str(row[1])))
+            conn.close()
+        except Exception as exc:
+            print(f"[traffic cache] pre-check failed: {exc}")
             already = set()
-            try:
-                conn = _get_db_conn()
-                cur  = conn.cursor()
-                for (i, j) in pairs:
-                    olat = _round_coord(locations[i]["lat"])
-                    olng = _round_coord(locations[i]["lng"])
-                    dlat = _round_coord(locations[j]["lat"])
-                    dlng = _round_coord(locations[j]["lng"])
-                    cur.execute(f"""
-                        SELECT slot_minutes, DATE(fetched_at)
-                        FROM grps_traffic_cache
-                        WHERE orig_lat=%s AND orig_lng=%s
-                          AND dest_lat=%s AND dest_lng=%s
-                          AND fetched_at >= NOW() - INTERVAL '{_TRAFFIC_HISTORY_DAYS} days'
-                    """, (olat, olng, dlat, dlng))
-                    for row in cur.fetchall():
-                        already.add((i, j, int(row[0]), str(row[1])))
-                conn.close()
-            except Exception as exc:
-                print(f"[traffic cache] pre-check failed: {exc}")
-                already = set()
 
-            # Build the list of (pair, day_offset, slot) work items to fetch.
-            # Cap to _TRAFFIC_FETCH_DAYS_PER_RUN days per run so a single optimize
-            # call never floods the HERE API. The cache fills up over successive runs.
-            today_utc = datetime.utcnow().date()
-            work = []
-            for day_offset in range(_TRAFFIC_HISTORY_DAYS):
-                if day_offset >= _TRAFFIC_FETCH_DAYS_PER_RUN:
-                    break
-                day = today_utc - timedelta(days=day_offset + 1)
-                for (i, j) in pairs:
-                    for slot in range(0, 24 * 60, _TRAFFIC_SLOT_MINUTES):
-                        if (i, j, slot, str(day)) not in already:
-                            work.append((i, j, day, slot))
+        # Build the list of (pair, day_offset, slot) work items to fetch.
+        # Cap to _TRAFFIC_FETCH_DAYS_PER_RUN days per run so a single optimize
+        # call never floods the HERE API. The cache fills up over successive runs.
+        today_utc = datetime.utcnow().date()
+        work = []
+        for day_offset in range(_TRAFFIC_HISTORY_DAYS):
+            if day_offset >= _TRAFFIC_FETCH_DAYS_PER_RUN:
+                break
+            day = today_utc - timedelta(days=day_offset + 1)
+            for (i, j) in pairs:
+                for slot in range(0, 24 * 60, _TRAFFIC_SLOT_MINUTES):
+                    if (i, j, slot, str(day)) not in already:
+                        work.append((i, j, day, slot))
 
-            if not work:
-                print("[traffic cache] ✅ All pairs already cached — nothing to fetch")
-                return
+        if not work:
+            print("[traffic cache] ✅ All pairs already cached — nothing to fetch")
+            return
 
-            print(f"[traffic cache] Starting prefetch: {len(work)} calls "
-                  f"({len(pairs)} pairs × up to {_TRAFFIC_HISTORY_DAYS} days × "
-                  f"{24*60//_TRAFFIC_SLOT_MINUTES} slots)")
+        print(f"[traffic cache] Starting prefetch: {len(work)} calls "
+              f"({len(pairs)} pairs × up to {_TRAFFIC_HISTORY_DAYS} days × "
+              f"{24*60//_TRAFFIC_SLOT_MINUTES} slots)")
 
-            # Fetch in parallel; batch DB writes every 50 rows
-            batch = []
+        # Fetch in parallel; batch DB writes every 50 rows
+        batch = []
 
-            def _do_fetch(item):
-                fi, fj, fday, fslot = item
-                origin      = locations[fi]
-                destination = locations[fj]
-                dep_dt  = datetime(fday.year, fday.month, fday.day,
-                                   fslot // 60, fslot % 60, 0)
-                dep_iso = dep_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-                time.sleep(0.15)   # ~6 calls/sec per thread; 2 threads → ~12 calls/sec total
-                tt, dk  = _fetch_here_for_slot(origin, destination, dep_iso)
-                if tt is not None:
-                    return (
-                        _round_coord(origin["lat"]),  _round_coord(origin["lng"]),
-                        _round_coord(destination["lat"]), _round_coord(destination["lng"]),
-                        fslot, tt, dk, dep_dt,
-                    )
-                return None
+        def _do_fetch(item):
+            fi, fj, fday, fslot = item
+            origin      = locations[fi]
+            destination = locations[fj]
+            dep_dt  = datetime(fday.year, fday.month, fday.day,
+                               fslot // 60, fslot % 60, 0)
+            dep_iso = dep_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+            time.sleep(0.15)   # ~6 calls/sec per thread; 2 threads → ~12 calls/sec total
+            tt, dk  = _fetch_here_for_slot(origin, destination, dep_iso)
+            if tt is not None:
+                return (
+                    _round_coord(origin["lat"]),  _round_coord(origin["lng"]),
+                    _round_coord(destination["lat"]), _round_coord(destination["lng"]),
+                    fslot, tt, dk, dep_dt,
+                )
+            return None
 
-            fetched = succeeded = 0
-            with ThreadPoolExecutor(max_workers=_TRAFFIC_FETCH_POOL_SIZE) as pool:
-                futures = {pool.submit(_do_fetch, item): item for item in work}
-                for future in as_completed(futures):
-                    fetched += 1
-                    result = future.result()
-                    if result:
-                        batch.append(result)
-                        succeeded += 1
-                    if len(batch) >= 50:
-                        _upsert_traffic_rows(batch)
-                        batch.clear()
-                    if fetched % 200 == 0:
-                        print(f"[traffic cache] …{fetched}/{len(work)} fetched, "
-                              f"{succeeded} succeeded")
-            if batch:
-                _upsert_traffic_rows(batch)
+        fetched = succeeded = 0
+        with ThreadPoolExecutor(max_workers=_TRAFFIC_FETCH_POOL_SIZE) as pool:
+            futures = {pool.submit(_do_fetch, item): item for item in work}
+            for future in as_completed(futures):
+                fetched += 1
+                result = future.result()
+                if result:
+                    batch.append(result)
+                    succeeded += 1
+                if len(batch) >= 50:
+                    _upsert_traffic_rows(batch)
+                    batch.clear()
+                if fetched % 200 == 0:
+                    print(f"[traffic cache] …{fetched}/{len(work)} fetched, "
+                          f"{succeeded} succeeded")
+        if batch:
+            _upsert_traffic_rows(batch)
 
-            print(f"[traffic cache] ✅ Prefetch complete: {succeeded}/{len(work)} stored")
-        finally:
-            _prefetch_lock.release()
+        print(f"[traffic cache] ✅ Prefetch complete: {succeeded}/{len(work)} stored")
 
     threading.Thread(target=_run, daemon=True).start()
 
@@ -817,8 +807,7 @@ def _here_departure_time():
 
 # ── HERE Routing (live traffic) ───────────────────────────────────────────────
 
-def fetch_here_matrix(locations, pairs=None, hav_km=None, sentinel_factor=None,
-                      departure_min=None):
+def fetch_here_matrix(locations, pairs=None, hav_km=None, sentinel_factor=None):
     """Build N×N matrix using HERE Router v8 /routes with live traffic.
     Avoids the async Matrix API (which requires OAuth2 for polling).
     Uses one API call per origin row — fast enough for ≤25 locations.
@@ -841,14 +830,7 @@ def fetch_here_matrix(locations, pairs=None, hav_km=None, sentinel_factor=None,
     n        = len(locations)
     dist_mat = [[0.0]*n for _ in range(n)]
     time_mat = [[0.0]*n for _ in range(n)]
-    if departure_min is not None:
-        today = datetime.utcnow().date()
-        dh, dm = divmod(int(departure_min), 60)
-        dep_time = datetime(today.year, today.month, today.day,
-                            dh % 24, dm % 60).strftime("%Y-%m-%dT%H:%M:%SZ")
-        print(f"[HERE matrix] using planned departure time {dep_time}")
-    else:
-        dep_time = _here_departure_time()
+    dep_time = _here_departure_time()
 
     # Pre-fill sentinel values for skipped pairs using haversine * factor
     if pairs is not None and hav_km is not None:
@@ -861,60 +843,37 @@ def fetch_here_matrix(locations, pairs=None, hav_km=None, sentinel_factor=None,
                     time_mat[i][j] = sentinel_d / 30.0 * 60.0
 
     fetch_set = pairs if pairs is not None else {(i, j) for i in range(n) for j in range(n) if i != j}
+    api_calls = 0
 
-    # ── Concurrent HERE API calls ─────────────────────────────────────────────────────────────────────
-    # Replace the old sequential loop with a thread pool so N pairs are fetched
-    # in parallel rather than one-by-one.  With MAX_HERE_WORKERS=20 threads,
-    # 150 pairs at ~2 s average → ~15 s total instead of ~300 s sequential,
-    # comfortably inside the gunicorn worker timeout.
-    MAX_HERE_WORKERS = 20
-    failed = threading.Event()   # set by any thread that gets a bad response
-
-    def _fetch_pair(i, j):
-        """Fetch a single (i, j) route from HERE.  Returns (i, j, dist_km, time_min)
-        or returns None to signal failure."""
-        if failed.is_set():
-            return None
-        params = {
-            "apiKey":        HERE_API_KEY,
-            "transportMode": "car",
-            "routingMode":   "fast",
-            "departureTime": dep_time,
-            "origin":        f"{locations[i]['lat']},{locations[i]['lng']}",
-            "destination":   f"{locations[j]['lat']},{locations[j]['lng']}",
-            "return":        "summary",
-        }
-        try:
-            resp = requests.get("https://router.hereapi.com/v8/routes",
-                                params=params, timeout=(5, 10))
-            if resp.status_code == 200:
-                routes = resp.json().get("routes", [])
-                if routes:
-                    summary = routes[0]["sections"][0]["summary"]
-                    return (i, j,
-                            summary["length"]   / 1000.0,   # m  → km
-                            summary["duration"] / 60.0)     # s  → min
-            print(f"[HERE matrix] ({i},{j}) failed: {resp.status_code} {resp.text[:100]}")
-        except Exception as e:
-            print(f"[HERE matrix] ({i},{j}) exception: {e}")
-        failed.set()
-        return None
-
-    with ThreadPoolExecutor(max_workers=MAX_HERE_WORKERS) as pool:
-        futures = {pool.submit(_fetch_pair, i, j): (i, j) for (i, j) in fetch_set}
-        api_calls = 0
-        for future in as_completed(futures):
-            if failed.is_set():
-                pool.shutdown(wait=False, cancel_futures=True)
+    for i in range(n):
+        for j in range(n):
+            if i == j or (i, j) not in fetch_set:
+                continue
+            params = {
+                "apiKey":        HERE_API_KEY,
+                "transportMode": "car",
+                "routingMode":   "fast",
+                "departureTime": dep_time,
+                "origin":        f"{locations[i]['lat']},{locations[i]['lng']}",
+                "destination":   f"{locations[j]['lat']},{locations[j]['lng']}",
+                "return":        "summary",
+            }
+            try:
+                resp = requests.get("https://router.hereapi.com/v8/routes",
+                                    params=params, timeout=10)
+                if resp.status_code == 200:
+                    routes = resp.json().get("routes", [])
+                    if routes:
+                        summary = routes[0]["sections"][0]["summary"]
+                        dist_mat[i][j] = summary["length"]   / 1000.0  # m → km
+                        time_mat[i][j] = summary["duration"] / 60.0    # s → min
+                        api_calls += 1
+                        continue
+                print(f"[HERE matrix] ({i},{j}) failed: {resp.status_code} {resp.text[:100]}")
+                return None, None   # fail fast — fall back to OSRM
+            except Exception as e:
+                print(f"[HERE matrix] ({i},{j}) exception: {e}")
                 return None, None
-            result = future.result()
-            if result is None:
-                pool.shutdown(wait=False, cancel_futures=True)
-                return None, None
-            i, j, dist, time_val = result
-            dist_mat[i][j] = dist
-            time_mat[i][j]  = time_val
-            api_calls += 1
 
     skipped = n * (n - 1) - api_calls
     print(f"[HERE matrix] ✅ {n}×{n} matrix built with live traffic "
@@ -982,7 +941,7 @@ def fetch_here_route(waypoints):
                                params=params).prepare()
         print(f"[HERE route] URL: {req.url[:300]}")
         resp = requests.get("https://router.hereapi.com/v8/routes",
-                            params=params, timeout=(5, 20))
+                            params=params, timeout=20)
         if resp.status_code != 200:
             print(f"[HERE route] failed: {resp.status_code} {resp.text[:200]}")
             return None, None, None
@@ -1218,7 +1177,7 @@ def fetch_osrm_route(waypoints):
 
 
 def fetch_best_matrix(locations, k_nearest=None, sentinel_factor=None,
-                      departure_min=None, hist_blend_weight=None):
+                      departure_min=None):
     """Try HERE (live traffic) → OSRM → haversine. Returns (dist, time, source).
 
     Spatial pre-filtering: for N locations we compute the straight-line
@@ -1234,15 +1193,13 @@ def fetch_best_matrix(locations, k_nearest=None, sentinel_factor=None,
     departure) and the traffic cache contains data for this set of locations,
     the live/OSRM time matrix is blended with historical averages:
 
-        blended_time[i][j] = (1-w) * live[i][j] + w * hist[i][j]
+        blended_time[i][j] = 0.5 * live[i][j] + 0.5 * hist[i][j]
 
-    where w = hist_blend_weight (0 = live only, 1 = historical only).
     For pairs with no historical data the live value is kept unchanged.
-    The default blend weight (0.5) is a conservative starting point; tune
-    it via the Advanced Parameters panel once you have enough cached data.
+    The blend weight (0.5/0.5) is a conservative default; you can tune
+    _HIST_BLEND_WEIGHT below once you have enough data to evaluate accuracy.
     """
-    _DEFAULT_HIST_BLEND_WEIGHT = 0.5   # weight given to historical average (0=live only, 1=hist only)
-    blend_w = hist_blend_weight if hist_blend_weight is not None else _DEFAULT_HIST_BLEND_WEIGHT
+    _HIST_BLEND_WEIGHT = 0.5   # weight given to historical average (0=live only, 1=hist only)
 
     k  = k_nearest      if k_nearest      is not None else K_NEAREST
     sf = sentinel_factor if sentinel_factor is not None else SENTINEL_FACTOR
@@ -1250,14 +1207,13 @@ def fetch_best_matrix(locations, k_nearest=None, sentinel_factor=None,
     hav_km, pairs = build_api_pairs(locations, k=k)
 
     if HERE_API_KEY:
-        d, t = fetch_here_matrix(locations, pairs=pairs, hav_km=hav_km,
-                                  sentinel_factor=sf, departure_min=departure_min)
+        d, t = fetch_here_matrix(locations, pairs=pairs, hav_km=hav_km, sentinel_factor=sf)
         if d is not None:
-            t = _blend_historical(t, locations, departure_min, pairs, blend_w)
+            t = _blend_historical(t, locations, departure_min, pairs, _HIST_BLEND_WEIGHT)
             return d, t, "here"
     d, t = fetch_osrm_matrix(locations, pairs=pairs, hav_km=hav_km, sentinel_factor=sf)
     if d is not None:
-        t = _blend_historical(t, locations, departure_min, pairs, blend_w)
+        t = _blend_historical(t, locations, departure_min, pairs, _HIST_BLEND_WEIGHT)
         return d, t, "osrm"
     d, t = build_haversine_matrix(locations)
     return d, t, "haversine"
@@ -1336,15 +1292,11 @@ def _mat_idx(cust_i, n_depots):
 
 
 def route_time(route_mat_indices, depot_mat_idx, dist_mat, time_mat, tw, svc,
-               start_time=None, svc_map=None, no_wait=False):
+               start_time=None, svc_map=None):
     """Walk route from depot, return (feasible, schedule).
     route_mat_indices : list of matrix indices of customers in visit order.
     start_time        : departure minute from depot; defaults to depot TW open time.
     svc_map           : dict {matrix_index: unloading_minutes}; falls back to svc scalar.
-    no_wait           : when True the driver never idles at a stop — they arrive and
-                        begin service immediately regardless of TW open time.  Used
-                        when a planned departure time is set so the route is a
-                        continuous drive with no pause between clusters.
     Returns (feasible: bool, schedule: list of dicts).
     """
     sched, feasible = [], True
@@ -1356,14 +1308,10 @@ def route_time(route_mat_indices, depot_mat_idx, dist_mat, time_mat, tw, svc,
         viol  = max(0.0, t - tw_e)
         if viol > 0:
             feasible = False
-        if no_wait:
-            wait = 0.0
-            # service starts immediately on arrival; TW open time is ignored
-        else:
-            wait = max(0.0, tw_s - t)
+        wait       = max(0.0, tw_s - t)
         arrival    = t
         stop_svc   = svc_map[c] if (svc_map and c in svc_map) else svc
-        t          = (t if no_wait else max(t, tw_s)) + stop_svc
+        t          = max(t, tw_s) + stop_svc
         sched.append({"customer_mat": c, "arrival": arrival,
                        "wait": wait, "violation": viol, "depart": t,
                        "service_time": stop_svc})
@@ -1372,8 +1320,7 @@ def route_time(route_mat_indices, depot_mat_idx, dist_mat, time_mat, tw, svc,
 
 # This is to prevent early start
 def latest_feasible_departure(route_mat_indices, depot_mat_idx,
-                               dist_mat, time_mat, tw, svc, svc_map=None,
-                               no_wait=False):
+                               dist_mat, time_mat, tw, svc, svc_map=None):
     """Find the latest departure minute from depot within depot hours that keeps
     all customer TW constraints feasible (5-minute precision binary search).
     Drivers depart as late as possible to minimise wage cost.
@@ -1383,7 +1330,7 @@ def latest_feasible_departure(route_mat_indices, depot_mat_idx,
     depot_open  = tw[depot_mat_idx][0]
     depot_close = tw[depot_mat_idx][1]
     ok, _ = route_time(route_mat_indices, depot_mat_idx, dist_mat, time_mat,
-                        tw, svc, depot_open, svc_map, no_wait=no_wait)
+                        tw, svc, depot_open, svc_map)
     if not ok:
         return depot_open
     best = depot_open
@@ -1391,7 +1338,7 @@ def latest_feasible_departure(route_mat_indices, depot_mat_idx,
     while hi - lo > 5:
         mid = (lo + hi) // 2
         ok, _ = route_time(route_mat_indices, depot_mat_idx, dist_mat, time_mat,
-                            tw, svc, mid, svc_map, no_wait=no_wait)
+                            tw, svc, mid, svc_map)
         if ok:
             best = mid
             lo   = mid
@@ -1401,13 +1348,12 @@ def latest_feasible_departure(route_mat_indices, depot_mat_idx,
 
 
 def route_working_minutes(route_mat_indices, depot_mat_idx,
-                           dist_mat, time_mat, tw, svc, start_time, svc_map=None,
-                           no_wait=False):
+                           dist_mat, time_mat, tw, svc, start_time, svc_map=None):
     """Total working minutes: departure -> last customer depart -> return depot."""
     if not route_mat_indices:
         return 0.0
     _, sched = route_time(route_mat_indices, depot_mat_idx, dist_mat, time_mat,
-                           tw, svc, start_time, svc_map, no_wait=no_wait)
+                           tw, svc, start_time, svc_map)
     last_depart = sched[-1]["depart"] if sched else start_time
     return_time = last_depart + time_mat[route_mat_indices[-1]][depot_mat_idx]
     return max(0.0, return_time - start_time)
@@ -1478,43 +1424,45 @@ def route_fuel_litres(route_mat_indices, depot_mat_idx, dist_mat,
 
 # ── Route-overlap penalty ─────────────────────────────────────────────────────
 #
-# Penalises routes that physically share road segments.  For every pair of
-# active routes (A, B) we compare every directed edge on A (consecutive stop
-# pair i→j) against every directed edge on B.  An edge is considered shared
-# when both endpoints appear on the other route in either direction (i→j or
-# j→i), i.e. the two vehicles traverse the same stretch of road.  The penalty
-# for each shared edge is its road distance (km) × overlap_weight_rsd, so the
-# total penalty is proportional to the total overlapping km — exactly the
-# user-set parameter acts as a "RSD cost per shared km" multiplier.
+# Measures how much different vehicles' routes geographically interleave.
+# For every pair of active routes (A, B) we find the minimum straight-line
+# distance between any stop on A and any stop on B.  When that minimum is
+# smaller than OVERLAP_THRESHOLD_KM we apply a soft quadratic penalty.
+#
+# Effect: the solver is incentivised to assign geographically close stops to
+# the same vehicle rather than splitting them across vehicles — reducing
+# criss-crossing and improving driver familiarity with their zones.
 #
 # Tuning:
-#   OVERLAP_THRESHOLD_KM — kept for the _overlap_remove destroy operator which
-#                          uses stop-proximity scoring to pick candidates.
-#   OVERLAP_WEIGHT_RSD   — RSD penalty per shared km of road between any two
-#                          routes.  Higher → solver pushes harder to separate
-#                          vehicle zones.  Default 500 RSD/km ≈ 25 km of extra
-#                          solo driving in solver-cost terms.
+#   OVERLAP_THRESHOLD_KM — routes that interleave closer than this (straight-
+#                          line, km) are penalised.  Default 3 km works well
+#                          for city-scale Belgrade routing; increase for
+#                          country-wide deliveries.
+#   OVERLAP_WEIGHT_RSD   — multiplier that puts the penalty on the same RSD
+#                          cost scale as fuel/wages.  Default 500 RSD per
+#                          km-under-threshold matches roughly 25 km of extra
+#                          driving in terms of solver pressure.
 
-OVERLAP_THRESHOLD_KM = 3.0    # km — used by _overlap_remove heuristic
-OVERLAP_WEIGHT_RSD   = 500.0  # RSD per shared km between any route pair
+OVERLAP_THRESHOLD_KM = 3.0    # km — penalise pairs closer than this
+OVERLAP_WEIGHT_RSD   = 500.0  # RSD per km-under-threshold (quadratic)
 
 
-def route_overlap_penalty(routes, dist_mat, depot_of,
+def route_overlap_penalty(routes, dist_mat,
                           threshold_km=None, weight_rsd=None):
-    """Compute the total route-overlap penalty across all route pairs.
+    """Compute the total geographic overlap penalty across all route pairs.
 
-    For each pair of active routes (A, B) every directed edge (i→j) on route A
-    is compared to every directed edge on route B.  An edge is counted as
-    shared when both matrix indices appear as an edge on the other route (in
-    either direction).  The penalty contribution is:
+    For each pair of non-empty routes (A, B) the penalty contribution is:
+        sum over (a in A, b in B): max(0, threshold_km - dist[a][b])²
+                                   * weight_rsd
 
-        shared_km(edge) × weight_rsd
-
-    summed over all shared edges across all route pairs.  Each shared edge is
-    counted once per route-pair regardless of how many times it appears.
+    Using the sum (not just the minimum) means a route with *many* stops near
+    another route's stops is penalised more than one with just a single
+    near-miss, which gives ALNS a gradient to work against.
 
     Returns a float in RSD-equivalent units.
     """
+    if threshold_km is None:
+        threshold_km = OVERLAP_THRESHOLD_KM
     if weight_rsd is None:
         weight_rsd = OVERLAP_WEIGHT_RSD
 
@@ -1522,31 +1470,16 @@ def route_overlap_penalty(routes, dist_mat, depot_of,
     if len(active) < 2:
         return 0.0
 
-    def route_edges(v, route):
-        """Return a set of frozensets {i, j} for every consecutive pair,
-        including depot→first and last→depot legs."""
-        d = depot_of[v]
-        full = [d] + list(route) + [d]
-        edges = set()
-        for k in range(len(full) - 1):
-            edges.add(frozenset((full[k], full[k + 1])))
-        return full, edges
-
     penalty = 0.0
-    edge_cache = {v: route_edges(v, r) for v, r in active}
-
     for idx_a in range(len(active)):
         v_a, route_a = active[idx_a]
-        full_a, edges_a = edge_cache[v_a]
         for idx_b in range(idx_a + 1, len(active)):
             v_b, route_b = active[idx_b]
-            full_b, edges_b = edge_cache[v_b]
-            shared = edges_a & edges_b
-            for edge in shared:
-                i, j = tuple(edge)
-                # Use average of both directions as the edge distance estimate
-                shared_km = (dist_mat[i][j] + dist_mat[j][i]) / 2.0
-                penalty += shared_km * weight_rsd
+            for a in route_a:
+                for b in route_b:
+                    gap = threshold_km - dist_mat[a][b]
+                    if gap > 0:
+                        penalty += gap * gap * weight_rsd
     return penalty
 
 
@@ -1569,8 +1502,6 @@ class VRPState:
     depot_of[v]: depot matrix index (0..n_depots-1) for vehicle v
     use_tw     : when True, TW lateness is a soft penalty (100x) not hard-inf
     svc_map    : {matrix_index: unloading_minutes} per customer
-    no_wait    : when True drivers never idle at stops — used with a pinned
-                 departure time so the route is a continuous drive
     """
     def __init__(self, routes, depot_of, dist_mat, time_mat,
                  demands, fleet, tw, n_depots, svc=SERVICE_TIME,
@@ -1579,8 +1510,7 @@ class VRPState:
                  fuel_price_rsd_l=None, driver_wage_rsd_h=None,
                  fuel_load_factor=None,
                  overlap_threshold_km=None, overlap_weight_rsd=None,
-                 dist_rsd_per_km=None, tw_penalty_rsd=None,
-                 no_wait=False):
+                 dist_rsd_per_km=None, tw_penalty_rsd=None):
         self.routes     = routes
         self.depot_of   = depot_of
         self.dist_mat   = dist_mat
@@ -1592,7 +1522,6 @@ class VRPState:
         self.n_depots   = n_depots
         self.svc        = svc
         self.use_tw     = use_tw
-        self.no_wait    = no_wait
         self.svc_map    = svc_map or {}
         # obj_weights: dict controlling which cost components enter the objective.
         # Keys: "fuel" (bool), "wages" (bool), "distance" (bool), "vehicles" (bool)
@@ -1644,8 +1573,7 @@ class VRPState:
             self.fuel_price_rsd_l, self.driver_wage_rsd_h,
             self.fuel_load_factor,
             self.overlap_threshold_km, self.overlap_weight_rsd,
-            self.dist_rsd_per_km, self.tw_penalty_rsd,
-            self.no_wait)
+            self.dist_rsd_per_km, self.tw_penalty_rsd)
 
     def cap(self, v):
         return self.fleet[v]["capacity"] if v < len(self.fleet) else float("inf")
@@ -1730,10 +1658,9 @@ class VRPState:
             depot = self.depot_of[v]
             start = latest_feasible_departure(
                 route, depot, self.dist_mat, self.time_mat, self.tw, self.svc,
-                self.svc_map, no_wait=self.no_wait)
+                self.svc_map)
             _, sched = route_time(route, depot, self.dist_mat, self.time_mat,
-                                   self.tw, self.svc, start, self.svc_map,
-                                   no_wait=self.no_wait)
+                                   self.tw, self.svc, start, self.svc_map)
             tw_viol = sum(e["violation"] for e in sched)
             if not self.use_tw and tw_viol > 0:
                 return float("inf")
@@ -1751,7 +1678,7 @@ class VRPState:
             if do_wages:
                 work_mins = route_working_minutes(
                     route, depot, self.dist_mat, self.time_mat, self.tw, self.svc,
-                    start, self.svc_map, no_wait=self.no_wait)
+                    start, self.svc_map)
                 total += (work_mins / 60.0) * self.driver_wage_rsd_h
             if do_dist:
                 total += dist_km * DIST_RSD_PER_KM
@@ -1761,7 +1688,6 @@ class VRPState:
                 total += tw_viol * TW_PENALTY
         if do_overlap:
             total += route_overlap_penalty(self.routes, self.dist_mat,
-                                           self.depot_of,
                                            self.overlap_threshold_km,
                                            self.overlap_weight_rsd)
         return total
@@ -1794,30 +1720,19 @@ class VRPState:
 # ─── ALNS operators ──────────────────────────────────────────────────────────
 
 def _ins_cost(route, pos, c, state, depot):
+    """Insertion cost of customer c at position pos in route."""
     new_r = route[:pos] + [c] + route[pos:]
-    ok, new_sched = route_time(new_r, depot, state.dist_mat, state.time_mat,
-                                state.tw, state.svc, svc_map=state.svc_map,
-                                no_wait=state.no_wait)
+    ok, _ = route_time(new_r, depot, state.dist_mat, state.time_mat, state.tw, state.svc,
+                        svc_map=state.svc_map)
+    # Only hard-reject on TW infeasibility when TW constraints are actually enforced.
+    # When use_tw=False, a long route may still violate the default TW window used
+    # internally, but that must not prevent consolidation onto a single vehicle.
     if not ok and state.use_tw:
         return float("inf")
-
-    do_wages = (state.obj_weights or {}).get("wages", False)
-    dist_delta = (state.dist_mat[route[pos-1] if pos > 0 else depot][c]
-                + state.dist_mat[c][route[pos] if pos < len(route) else depot]
-                - state.dist_mat[route[pos-1] if pos > 0 else depot]
-                                [route[pos] if pos < len(route) else depot])
-
-    if do_wages:
-        # Extra wait introduced by this insertion
-        extra_wait_min = sum(e["wait"] for e in new_sched)
-        old_ok, old_sched = route_time(route, depot, state.dist_mat, state.time_mat,
-                                        state.tw, state.svc, svc_map=state.svc_map,
-                                        no_wait=state.no_wait)
-        old_wait = sum(e["wait"] for e in old_sched) if old_ok else 0.0
-        wait_cost = (extra_wait_min - old_wait) / 60.0 * state.driver_wage_rsd_h
-        return dist_delta + wait_cost
-
-    return dist_delta
+    prev = route[pos-1] if pos > 0 else depot
+    nxt  = route[pos]   if pos < len(route) else depot
+    return (state.dist_mat[prev][c] + state.dist_mat[c][nxt]
+            - state.dist_mat[prev][nxt])
 
 
 def _rand_remove(state, rng):
@@ -2049,7 +1964,7 @@ def optimize_nn(dist_mat, time_mat, n_depots, n_cust, tw, demands,
                 use_volume_cap=True, use_weight_cap=True,
                 fuel_price_rsd_l=None, driver_wage_rsd_h=None, fuel_load_factor=None,
                 overlap_threshold_km=None, overlap_weight_rsd=None,
-                dist_rsd_per_km=None, tw_penalty_rsd=None, no_wait=False):
+                dist_rsd_per_km=None, tw_penalty_rsd=None):
     """Single-vehicle nearest-neighbour. Returns VRPState."""
     depot = 0
     unvis = list(range(n_depots, n_depots + n_cust))
@@ -2067,8 +1982,7 @@ def optimize_nn(dist_mat, time_mat, n_depots, n_cust, tw, demands,
                     overlap_threshold_km=overlap_threshold_km,
                     overlap_weight_rsd=overlap_weight_rsd,
                     dist_rsd_per_km=dist_rsd_per_km,
-                    tw_penalty_rsd=tw_penalty_rsd,
-                    no_wait=no_wait)
+                    tw_penalty_rsd=tw_penalty_rsd)
 
 
 def optimize_2opt(dist_mat, time_mat, n_depots, n_cust, tw, demands,
@@ -2076,7 +1990,7 @@ def optimize_2opt(dist_mat, time_mat, n_depots, n_cust, tw, demands,
                   use_volume_cap=True, use_weight_cap=True,
                   fuel_price_rsd_l=None, driver_wage_rsd_h=None, fuel_load_factor=None,
                   overlap_threshold_km=None, overlap_weight_rsd=None,
-                  dist_rsd_per_km=None, tw_penalty_rsd=None, no_wait=False):
+                  dist_rsd_per_km=None, tw_penalty_rsd=None):
     """Single-vehicle 2-opt. Returns VRPState."""
     s = optimize_nn(dist_mat, time_mat, n_depots, n_cust, tw, demands,
                     use_tw=use_tw, svc_map=svc_map, demands_kg=demands_kg,
@@ -2087,8 +2001,7 @@ def optimize_2opt(dist_mat, time_mat, n_depots, n_cust, tw, demands,
                     overlap_threshold_km=overlap_threshold_km,
                     overlap_weight_rsd=overlap_weight_rsd,
                     dist_rsd_per_km=dist_rsd_per_km,
-                    tw_penalty_rsd=tw_penalty_rsd,
-                    no_wait=no_wait)
+                    tw_penalty_rsd=tw_penalty_rsd)
     route = s.routes[0][:]
     depot = s.depot_of[0]
 
@@ -2117,8 +2030,7 @@ def _alns_optimize(fleet, dist_mat, time_mat, n_depots, n_cust, tw, demands,
                    fuel_price_rsd_l, driver_wage_rsd_h, fuel_load_factor,
                    temperature, max_iter, svc_map, use_tw,
                    overlap_threshold_km=None, overlap_weight_rsd=None,
-                   dist_rsd_per_km=None, tw_penalty_rsd=None, alns_cooling=None,
-                   no_wait=False):
+                   dist_rsd_per_km=None, tw_penalty_rsd=None, alns_cooling=None):
     """Run a single ALNS optimisation with the given fleet (list of vehicle dicts)."""
     num_v = len(fleet)
     all_ci = list(range(n_depots, n_depots + n_cust))
@@ -2219,8 +2131,7 @@ def _alns_optimize(fleet, dist_mat, time_mat, n_depots, n_cust, tw, demands,
                      overlap_threshold_km=overlap_threshold_km,
                      overlap_weight_rsd=overlap_weight_rsd,
                      dist_rsd_per_km=dist_rsd_per_km,
-                     tw_penalty_rsd=tw_penalty_rsd,
-                     no_wait=no_wait)
+                     tw_penalty_rsd=tw_penalty_rsd)
     state.reassign_depots()
 
     best = state.copy()
@@ -2266,8 +2177,7 @@ def optimize_alns(dist_mat, time_mat, n_depots, n_cust, tw, demands,
                   demands_kg=None, obj_weights=None, use_volume_cap=True, use_weight_cap=True,
                   fuel_price_rsd_l=None, driver_wage_rsd_h=None, fuel_load_factor=None,
                   overlap_threshold_km=None, overlap_weight_rsd=None,
-                  dist_rsd_per_km=None, tw_penalty_rsd=None, alns_cooling=None,
-                  no_wait=False):
+                  dist_rsd_per_km=None, tw_penalty_rsd=None, alns_cooling=None):
     """ALNS multi‑vehicle optimiser. When only vehicle minimisation is selected,
     it sorts the fleet by capacity so the largest vehicles are tried first,
     then incrementally adds vehicles until a feasible solution is found."""
@@ -2289,7 +2199,6 @@ def optimize_alns(dist_mat, time_mat, n_depots, n_cust, tw, demands,
         dist_rsd_per_km=dist_rsd_per_km,
         tw_penalty_rsd=tw_penalty_rsd,
         alns_cooling=alns_cooling,
-        no_wait=no_wait,
     )
 
     if only_vehicles:
@@ -2374,8 +2283,6 @@ def optimize():
         dist_rsd_per_km      = float(adv_params.get("dist_rsd_per_km",      20.0))
         tw_penalty_rsd       = float(adv_params.get("tw_penalty_rsd",       100.0))
         alns_cooling         = float(adv_params.get("alns_cooling",         0.995))
-        hist_blend_weight    = float(adv_params.get("hist_blend_weight",    0.5))
-        hist_blend_weight    = max(0.0, min(1.0, hist_blend_weight))  # clamp to [0, 1]
 
         if not depots_raw:
             return jsonify({"ok": False, "error": "No depot provided"})
@@ -2418,7 +2325,7 @@ def optimize():
         # Pass departure_min so the time matrix is blended with historical averages.
         dist_mat, time_mat, matrix_source = fetch_best_matrix(
             all_locs_orig, k_nearest=k_nearest, sentinel_factor=sentinel_factor,
-            departure_min=departure_min, hist_blend_weight=hist_blend_weight)
+            departure_min=departure_min)
 
         # Fire off background pre-fetch of historical traffic for this set of
         # locations so future optimisation runs have richer cache data.
@@ -2558,15 +2465,6 @@ def optimize():
         else:
             tw = [(6*60, 12*60)] * n_depots + [(540, 1020)] * n_cust
 
-        # If a planned departure time was set, pin the depot TW to that exact
-        # minute.  This enforces the departure time in the solver whether or not
-        # customer time windows are active: latest_feasible_departure will find
-        # only one feasible starting point — the planned one.
-        if departure_min is not None:
-            for d in range(n_depots):
-                tw[d] = (departure_min, departure_min)
-            print(f"[optimize] depot departure pinned to {mins_to_hhmm(departure_min)}")
-
         # svc_map for expanded sub-orders
         svc_map = {}
         for sub_i, orig_i in enumerate(sub_to_orig):
@@ -2603,16 +2501,11 @@ def optimize():
               f"source={matrix_source}")
 
         # Phase 2: run optimiser → VRPState
-        # no_wait: suppress idle waiting at stops so the route is a continuous
-        # drive.  Activated automatically whenever a departure time is set.
-        no_wait = departure_min is not None
-
         adv_kwargs = dict(
             overlap_threshold_km=overlap_threshold_km,
             overlap_weight_rsd=overlap_weight_rsd,
             dist_rsd_per_km=dist_rsd_per_km,
             tw_penalty_rsd=tw_penalty_rsd,
-            no_wait=no_wait,
         )
         if "Nearest Neighbor" in algorithm:
             state = optimize_nn(dist_mat, time_mat, n_depots, n_cust, tw, demands,
@@ -2664,11 +2557,10 @@ def optimize():
 
             # Optimal (latest feasible) departure for this driver
             depart_min = latest_feasible_departure(
-                route, depot_mat, dist_mat, time_mat, tw, SERVICE_TIME, svc_map,
-                no_wait=no_wait)
+                route, depot_mat, dist_mat, time_mat, tw, SERVICE_TIME, svc_map)
 
             _, sched = route_time(route, depot_mat, dist_mat, time_mat, tw,
-                                   SERVICE_TIME, depart_min, svc_map, no_wait=no_wait)
+                                   SERVICE_TIME, depart_min, svc_map)
             stops = []
             for entry in sched:
                 cmat     = entry["customer_mat"]
@@ -2723,7 +2615,7 @@ def optimize():
             fuel_cost       = round(fuel_l * fuel_price_rsd_l, 0)
             work_mins   = route_working_minutes(
                 route, depot_mat, dist_mat, time_mat, tw, SERVICE_TIME, depart_min,
-                svc_map, no_wait=no_wait)
+                svc_map)
             work_h      = round(work_mins / 60.0, 2)
             wage_cost   = round(work_h * driver_wage_rsd_h, 0)
 
