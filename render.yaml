@@ -32,19 +32,39 @@ services:
       - key: WEB_CONCURRENCY
         value: "2"
 
+<<<<<<< HEAD
+=======
+  # ── Celery worker ────────────────────────────────────────────────────────────
+  # THIS SERVICE MUST BE DEPLOYED for optimization jobs to run.
+  # Without it, tasks are dispatched to Redis but never consumed.
+  # Deploy via: Render dashboard → New → Background Worker, or via render.yaml IaC.
+>>>>>>> a6fcd79ffe6833cae139cd230c7ba54cc79a30d5
   - type: worker
     name: grps-celery-worker
     runtime: python
     pythonVersion: "3.12"
     buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+<<<<<<< HEAD
     startCommand: >
       celery -A app.celery worker
       --loglevel=warning
+=======
+    # "celery -A app" tells Celery to import app.py and find the `celery` instance.
+    # --loglevel=info so optimization progress is visible in Render worker logs.
+    startCommand: >
+      celery -A app.celery worker
+      --loglevel=info
+>>>>>>> a6fcd79ffe6833cae139cd230c7ba54cc79a30d5
       --concurrency=2
       --max-tasks-per-child=50
       --without-gossip
       --without-mingle
     envVars:
+<<<<<<< HEAD
+=======
+      - key: SECRET_KEY
+        generateValue: true
+>>>>>>> a6fcd79ffe6833cae139cd230c7ba54cc79a30d5
       - key: HERE_API_KEY
         sync: false
       - key: APP_USER
@@ -76,4 +96,8 @@ databases:
   - type: redis
     name: grps-redis
     plan: free
+<<<<<<< HEAD
     maxmemoryPolicy: allkeys-lru
+=======
+    maxmemoryPolicy: allkeys-lru
+>>>>>>> a6fcd79ffe6833cae139cd230c7ba54cc79a30d5
