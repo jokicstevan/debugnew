@@ -1121,14 +1121,9 @@ async function runOptimize() {
       setProgress(prog, prog < 40 ? t('phase1short') : t('phase2'));
     }, 800);
 
-    const POLL_INTERVAL_MS  = 1500;
-    const MAX_WAIT_MS       = 20 * 60 * 1000;  // 20 min hard client timeout
-    const MAX_RETRY_ERRORS  = 10;              // tolerate this many transient errors
-    // HTTP statuses treated as transient: worker restarting (502/503/504) or
-    // job not yet visible on this worker after a bounce (404).
-    const RETRYABLE_STATUSES = new Set([404, 502, 503, 504]);
-    const pollStart          = Date.now();
-    let   transientErrors    = 0;
+    const POLL_INTERVAL_MS = 1500;
+    const MAX_WAIT_MS      = 20 * 60 * 1000;   // 20 min hard client timeout
+    const pollStart        = Date.now();
 
     const data = await new Promise((resolve, reject) => {
       const poll = async () => {
@@ -1138,22 +1133,8 @@ async function runOptimize() {
         }
         try {
           const r = await fetch(`/api/optimize/status/${jobId}`);
-          if (!r.ok) {
-            if (RETRYABLE_STATUSES.has(r.status) && transientErrors < MAX_RETRY_ERRORS) {
-              // Back off and retry — worker may be restarting.
-              transientErrors++;
-              const backoff = Math.min(POLL_INTERVAL_MS * transientErrors, 10000);
-              setTimeout(poll, backoff);
-              return;
-            }
-            // Permanent error or retry budget exhausted — surface it.
-            const text = await r.text().catch(() => r.statusText);
-            reject(new Error(`Status poll failed (${r.status}): ${text}`));
-            return;
-          }
-          transientErrors = 0;  // reset on a good response
           const d = await r.json();
-          if (d.status === 'error') {
+          if (!r.ok || d.status === 'error') {
             reject(new Error(d.error || 'Optimization failed on server'));
             return;
           }
@@ -1164,14 +1145,7 @@ async function runOptimize() {
           // still running — poll again
           setTimeout(poll, POLL_INTERVAL_MS);
         } catch (fetchErr) {
-          // Network-level failure (offline, DNS) — retry up to the same limit.
-          if (transientErrors < MAX_RETRY_ERRORS) {
-            transientErrors++;
-            const backoff = Math.min(POLL_INTERVAL_MS * transientErrors, 10000);
-            setTimeout(poll, backoff);
-          } else {
-            reject(fetchErr);
-          }
+          reject(fetchErr);
         }
       };
       setTimeout(poll, POLL_INTERVAL_MS);
@@ -1466,21 +1440,9 @@ function drawRoutes(data) {
           `🚪 Departs: ${stop.depart}<br>` +
           `⏱ Window: ${stop.tw_start}–${stop.tw_end}${flag}`
         );
-        // Update icon to show visit order (stop_number) in the vehicle's colour
         try {
-          const stopNum = stop.stop_number ?? stop.stop_num ?? '';
-          const updatedIcon = L.divIcon({
-            className: '',
-            html: `<div style="
-              width:26px;height:26px;border-radius:50%;
-              background:${vr.color};border:3px solid #fff;
-              box-shadow:0 2px 6px rgba(0,0,0,.45);
-              color:#fff;font-size:11px;font-weight:700;
-              display:flex;align-items:center;justify-content:center;
-              line-height:1;">${stopNum}</div>`,
-            iconSize:[26,26], iconAnchor:[13,13], popupAnchor:[0,-16]
-          });
-          state.markers[custEntry.id].setIcon(updatedIcon);
+          const el = state.markers[custEntry.id].getElement();
+          if (el) { const dot = el.querySelector('div'); if (dot) dot.style.background = vr.color; }
         } catch(e) {}
       }
     });
