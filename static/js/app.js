@@ -2657,3 +2657,46 @@ async function exportWorkspace() {
     if (btn) { btn.disabled = false; btn.textContent = '📤 Export'; }
   }
 }
+
+// ── JSON Import ───────────────────────────────────────────────────────────────
+
+function importWorkspaceJson(input) {
+  const file = input.files[0];
+  if (!file) return;
+  // Reset so re-selecting the same file fires onchange again
+  input.value = '';
+
+  if (!file.name.endsWith('.json')) {
+    alert('Please select a .json workspace file (exported from GRPS).');
+    return;
+  }
+
+  const reader = new FileReader();
+  reader.onload = function(e) {
+    let ws;
+    try {
+      ws = JSON.parse(e.target.result);
+    } catch (err) {
+      alert('Invalid JSON file: ' + err.message);
+      return;
+    }
+
+    // Basic sanity check — must look like a GRPS workspace
+    if (!ws || (!ws.customers && !ws.depots && !ws.fleet)) {
+      alert('This does not appear to be a valid GRPS workspace file.');
+      return;
+    }
+
+    if (!confirm(
+      `Import workspace "${ws.name || file.name}"?\n` +
+      `${(ws.depots || []).length} depot(s), ${(ws.customers || []).length} customer(s).\n\n` +
+      `This will replace your current workspace.`
+    )) return;
+
+    clearAll();
+    _applyWorkspaceSnapshot(ws);
+    console.log('[GRPS] workspace imported from', file.name);
+  };
+  reader.onerror = () => alert('Failed to read file: ' + reader.error);
+  reader.readAsText(file);
+}

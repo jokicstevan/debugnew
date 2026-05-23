@@ -468,6 +468,10 @@
         <button class="btn-sm btn-secondary btn-full" onclick="loadWorkspaceList()" style="margin-bottom:8px">
           🔄 Refresh list
         </button>
+        <label class="btn-sm btn-secondary btn-full" style="margin-bottom:8px;cursor:pointer;display:block;text-align:center" title="Import a previously exported workspace JSON file">
+          📥 Import JSON
+          <input type="file" accept=".json" style="display:none" onchange="importWorkspaceJson(this)">
+        </label>
         <div id="workspace-status" style="font-size:10px;color:var(--muted);text-align:center;padding:4px 0;display:none"></div>
         <div id="workspace-list" style="max-height:340px;overflow-y:auto;display:flex;flex-direction:column;gap:4px"></div>
       </div>

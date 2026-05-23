@@ -1815,7 +1815,9 @@ class VRPState:
     """Immutable-style VRP state.
     routes[v]  : list of matrix indices for vehicle v's customers
     depot_of[v]: depot matrix index (0..n_depots-1) for vehicle v
-    use_tw     : when True, TW lateness is a soft penalty (100x) not hard-inf
+    use_tw     : when True, TW violations by any customer make the objective
+                 return inf (hard constraint).  When False, time windows are
+                 completely ignored (tw_viol is forced to 0).
     svc_map    : {matrix_index: unloading_minutes} per customer
     no_wait    : when True drivers never idle at stops — used with a pinned
                  departure time so the route is a continuous drive
@@ -1922,7 +1924,7 @@ class VRPState:
         Hard constraints (enforced unless the corresponding toggle is disabled):
           - Volume capacity overload → inf  (if use_volume_cap)
           - Weight capacity overload → inf  (if use_weight_cap)
-          - TW violation (hard mode) → inf  (if not use_tw)
+          - TW violation → inf  (if use_tw is True)
 
         Selectable objective components (via self.obj_weights):
           "fuel"     — fuel cost in RSD (load-dependent)
@@ -1982,8 +1984,8 @@ class VRPState:
             _, sched = route_time(route, depot, self.dist_mat, self.time_mat,
                                    self.tw, self.svc, start, self.svc_map,
                                    no_wait=self.no_wait)
-            tw_viol = sum(e["violation"] for e in sched)
-            if not self.use_tw and tw_viol > 0:
+            tw_viol = sum(e["violation"] for e in sched) if self.use_tw else 0.0
+            if self.use_tw and tw_viol > 0:
                 return float("inf")
             dist_km    = route_dist(route, depot, self.dist_mat)
 
@@ -2005,8 +2007,8 @@ class VRPState:
                 total += dist_km * DIST_RSD_PER_KM
             if do_vehicles:
                 total += VEHICLE_PENALTY_RSD
-            if self.use_tw:
-                total += tw_viol * TW_PENALTY
+            # Note: tw_viol > 0 already returned inf above when use_tw is True,
+            # so no soft-penalty branch is needed here.
         if do_overlap:
             total += route_overlap_penalty(self.routes, self.dist_mat,
                                            self.depot_of,
@@ -2642,8 +2644,6 @@ def _alns_optimize(fleet, dist_mat, time_mat, n_depots, n_cust, tw, demands,
                 return i
         return len(w) - 1
 
-    LOG_EVERY = max(1, max_iter // 10)   # log at most 10 milestone lines
-
     for it in range(max_iter):
         # Cancellation check — every iteration (cheap: just flag test)
         if cancel_event is not None and cancel_event.is_set():
@@ -2686,14 +2686,15 @@ def _alns_optimize(fleet, dist_mat, time_mat, n_depots, n_cust, tw, demands,
 
         temp *= cooling
 
-        # Milestone logging
-        if (it + 1) % LOG_EVERY == 0:
-            elapsed = time.time() - t_start
-            active  = sum(1 for r in best.routes if r)
-            print(f"[ALNS] iter {it+1:>{len(str(max_iter))}}/{max_iter}  "
-                  f"best={best_obj:.1f}  cur={cur_obj:.1f}  "
-                  f"T={temp:.2f}  active_v={active}  "
-                  f"elapsed={elapsed:.1f}s")
+        # Per-iteration log — every single iteration with full detail
+        elapsed  = time.time() - t_start
+        active   = sum(1 for r in best.routes if r)
+        new_best_tag = "  ★ NEW BEST" if (sigma == SIGMA1 and accepted) else ""
+        print(f"[ALNS] {it+1:>{len(str(max_iter))}}/{max_iter}  "
+              f"d={destroy_names[di]:<8}  r={repair_names[ri]:<7}  "
+              f"cand={cand_obj:>12.2f}  cur={cur_obj:>12.2f}  best={best_obj:>12.2f}  "
+              f"sigma={sigma:.0f}  {'acc' if accepted else 'rej'}  "
+              f"T={temp:>9.3f}  v={active}  t={elapsed:.2f}s{new_best_tag}")
 
     best.reassign_depots()
     elapsed = time.time() - t_start
