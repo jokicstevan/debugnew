@@ -3402,6 +3402,9 @@ def _do_optimize(data, user, job_id=None, cancel_event=None):
         f"dist={round(real_total_dist or total_dist, 2)} km, "
         f"cost={total_cost_rsd:,} RSD")
 
+    final_obj    = state.objective()
+    is_infeasible = final_obj == float("inf")
+
     return {
         "ok":                  True,
         "matrix_source":       matrix_source,
@@ -3431,6 +3434,7 @@ def _do_optimize(data, user, job_id=None, cancel_event=None):
         "use_volume_capacity": use_volume_cap,
         "use_weight_capacity": use_weight_cap,
         "service_time":        SERVICE_TIME,
+        "infeasible":          is_infeasible,
     }
     # NOTE: no try/except here — exceptions propagate to the job runner thread
     #       which stores them in _jobs[job_id]["error"] and sets status="error".

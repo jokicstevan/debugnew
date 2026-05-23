@@ -130,6 +130,7 @@ const TRANSLATIONS = {
     clickToConfigure: 'Click to configure',
     fuelConsumption: 'Fuel consumption',
     unservedWarning: (n, names) => `⚠️ ${n} customer(s) NOT served: ${names}`,
+    infeasibleWarning: '🚫 No feasible solution found — hard constraints (capacity, time windows) cannot all be satisfied. Try relaxing constraints or adding vehicles.',
     stopsLabel: n => `${n} stops`,
     splitDelivery: (part, total) => `Split delivery: part ${part} of ${total}`,
     minUnloading: min => `${min} min unloading`,
@@ -322,6 +323,7 @@ const TRANSLATIONS = {
     clickToConfigure: 'Kliknite za podešavanje',
     fuelConsumption: 'Potrošnja goriva',
     unservedWarning: (n, names) => `⚠️ ${n} mušterija nije opsluž.: ${names}`,
+    infeasibleWarning: '🚫 Nije pronađeno izvodljivo rešenje — tvrda ograničenja (kapacitet, vremenski okviri) ne mogu sva biti zadovoljena. Pokušajte da olabavite ograničenja ili dodate vozila.',
     stopsLabel: n => `${n} stanica`,
     splitDelivery: (part, total) => `Podeljena isporuka: deo ${part} od ${total}`,
     minUnloading: min => `${min} min istovar`,
@@ -1215,7 +1217,14 @@ async function runOptimize() {
       routingBanner.style.display = 'block';
     }
     state.lastResult = data;
-    document.getElementById('geocode-status').style.color = '';
+
+    // Infeasible solution: solver could not satisfy all hard constraints
+    if (data.infeasible) {
+      const st = document.getElementById('geocode-status');
+      st.textContent = t('infeasibleWarning');
+      st.style.color = '#e74c3c';
+    }
+
     drawResults(data);
     drawRoutes(data);
     renderLegend(data);
@@ -1655,6 +1664,9 @@ function resetResults() {
     const el = document.getElementById(id);
     if (el) { el.textContent = '—'; el.style.color = ''; }
   });
+  // Clear any stale unserved-customers warning from a previous run
+  const st = document.getElementById('geocode-status');
+  if (st) { st.textContent = ''; st.style.color = ''; }
   state.lastResult = null;
 }
 
