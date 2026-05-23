@@ -1,8 +1,7 @@
 /* ═══ GRPS WEB — FRONTEND JS ═════════════════════════════════════════════════
    Full port of the PyQt5 desktop app to browser JS.
    Covers: Leaflet map, fleet management, route optimization (via Flask API),
-           OSRM routing, results panel, legend, route simulation, PDF, Excel,
-           workspaces, job cancellation, export.
+           OSRM routing, results panel, legend, route simulation, PDF, Excel.
 ══════════════════════════════════════════════════════════════════════════════ */
 
 // ─── I18N ─────────────────────────────────────────────────────────────────────
@@ -198,7 +197,6 @@ const TRANSLATIONS = {
     historyColStops: 'Stops',
     historyColBy: 'Saved by',
     historyViewBtn: 'View',
-    cancelOptimization: 'Cancel Optimization',
   },
   sr: {
     routePlanner: 'Planer ruta',
@@ -306,7 +304,7 @@ const TRANSLATIONS = {
     noVehicles: 'Nema podešenih vozila — kliknite na karticu',
     configureDash: name => `Podesi — ${name}`,
     captureMaps: '📸 Snimanje mapa…',
-    captureVehicle: (i, n) => `📸 Vozilo ${i}/${n}…',
+    captureVehicle: (i, n) => `📸 Vozilo ${i}/${n}…`,
     buildingPDF: '📄 Generisanje PDF-a…',
     exportPDF: '📄 Izvezi PDF',
     pdfError: 'Greška PDF-a: ',
@@ -391,12 +389,34 @@ const TRANSLATIONS = {
     historyColStops: 'Stanice',
     historyColBy: 'Sačuvao',
     historyViewBtn: 'Pregled',
-    cancelOptimization: 'Otkaži optimizaciju',
   }
 };
 
 let currentLang = localStorage.getItem('grps_lang') || 'en';
 function t(key) { return TRANSLATIONS[currentLang][key] ?? TRANSLATIONS['en'][key] ?? key; }
+
+// ─── Current optimization job tracking ───────────────────────────────────────
+let _currentJobId = null;
+
+async function cancelCurrentJob() {
+  if (!_currentJobId) return;
+  const jobId = _currentJobId;
+  console.log(`[GRPS] ✖ cancelling job ${jobId}`);
+  try {
+    const res  = await fetch(`/api/optimize/${jobId}/cancel`, { method: 'POST' });
+    const data = await res.json();
+    if (data.ok) {
+      console.log(`[GRPS] cancel request accepted for job ${jobId}`);
+      document.getElementById('cancel-job-btn').disabled = true;
+      document.getElementById('cancel-job-btn').textContent = '⏳ Cancelling…';
+      setProgress(0, '✖ Cancellation requested — waiting for solver to stop…');
+    } else {
+      console.warn(`[GRPS] cancel failed: ${data.error}`);
+    }
+  } catch (e) {
+    console.warn(`[GRPS] cancel fetch error: ${e.message}`);
+  }
+}
 
 function setLanguage(lang) {
   currentLang = lang;
@@ -405,7 +425,10 @@ function setLanguage(lang) {
 }
 
 function applyLanguage() {
+  // Update <html lang>
   document.documentElement.lang = currentLang;
+
+  // Update all data-i18n elements in HTML
   document.querySelectorAll('[data-i18n]').forEach(el => {
     const key = el.getAttribute('data-i18n');
     const attr = el.getAttribute('data-i18n-attr');
@@ -413,27 +436,41 @@ function applyLanguage() {
     if (attr) el.setAttribute(attr, val);
     else el.textContent = val;
   });
+
+  // Update language toggle button state
   document.querySelectorAll('.lang-btn').forEach(btn => {
     btn.classList.toggle('active', btn.dataset.lang === currentLang);
   });
+
+  // Re-render dynamic elements that build their own HTML
   renderFleetCards();
   updateFleetFooter();
   updateObjHint();
   updateConstraintHint();
   updatePkgSizes();
   updatePkgWeights();
+
+  // Update results placeholder if visible
   const ph = document.getElementById('results-placeholder');
   if (ph && !ph.classList.contains('hidden')) ph.textContent = t('runOptimizationHint');
+
+  // Update OSRM warning text
   const mw = document.getElementById('matrix-warning');
   if (mw) mw.innerHTML = t('osrmWarning');
+
+  // Update address input placeholder
   const ai = document.getElementById('address-input');
   if (ai) ai.placeholder = t('searchAddress');
-  if (state && state.lastResult) drawResults(state.lastResult);
+
+  // Re-draw results if we have them
+  if (state && state.lastResult) {
+    drawResults(state.lastResult);
+  }
 }
 
 // ─── STATE ────────────────────────────────────────────────────────────────────
 const state = {
-  depots: [],
+  depots: [],       // multi-depot: array of {lat,lng,name,time_window}
   customers: [],
   mode: 'depot',
   markers: {},
@@ -444,11 +481,15 @@ const state = {
   lastResult: null,
   excelRows: null,
   fleet: [
+    // weight_capacity in kg (0 = unlimited). Realistic max payloads:
+    // Small Van ~800 kg, Medium Van ~1400 kg, Large Van ~2500 kg
     { name:'Small Van',    emoji:'🚐', capacity: 5.0,  weight_capacity:  800, count:1, color:'#3b82f6', fuel_consumption: 8.0  },
     { name:'Medium Van',   emoji:'🚐', capacity: 12.0, weight_capacity: 1400, count:1, color:'#f97316', fuel_consumption: 11.0 },
     { name:'Large Van',    emoji:'🚐', capacity: 20.0, weight_capacity: 2500, count:1, color:'#ef4444', fuel_consumption: 15.0 },
   ],
+  // Package type weights in kg — Type 1: small parcel 5 kg, Type 2: medium box 15 kg, Type 3: large 30 kg
   pkg_weights_kg: [5.0, 15.0, 30.0],
+  // Package type sizes in m³
   pkg_sizes: [0.10, 0.30, 0.60],
   editingFleetIdx: null,
 };
@@ -456,27 +497,9 @@ const state = {
 const VEHICLE_COLORS = ['#e74c3c','#3498db','#2ecc71','#f39c12',
                         '#9b59b6','#1abc9c','#e67e22','#e84342'];
 
-// ─── JOB CANCELLATION GLOBALS ─────────────────────────────────────────────────
-let currentJobId = null;           // ID of the running optimization job
-let isPollingCancelled = false;    // flag set by cancel button
-let pollIntervalId = null;         // interval for polling status
-
 // ─── MAP INIT ─────────────────────────────────────────────────────────────────
 let map;
 window.addEventListener('DOMContentLoaded', () => {
-  // Create cancel button if missing
-  if (!document.getElementById('cancel-optimize-btn')) {
-    const progressWrap = document.getElementById('progress-wrap');
-    if (progressWrap) {
-      const btn = document.createElement('button');
-      btn.id = 'cancel-optimize-btn';
-      btn.textContent = t('cancelOptimization');
-      btn.className = 'cancel-job-btn hidden';
-      btn.onclick = cancelCurrentJob;
-      progressWrap.appendChild(btn);
-    }
-  }
-
   map = L.map('map', {
     zoomControl: true,
     minZoom: 7, maxZoom: 18,
@@ -496,6 +519,8 @@ window.addEventListener('DOMContentLoaded', () => {
   L.control.layers(layers, {}, { position:'topright' }).addTo(map);
 
   map.on('click', onMapClick);
+
+  // Redraw routes on zoom so shared-segment stripe width stays visually constant
   map.on('zoomend', () => {
     if (state.lastResult) {
       clearRoutes();
@@ -513,41 +538,11 @@ window.addEventListener('DOMContentLoaded', () => {
       this.value.startsWith('Model 1') ? '' : 'none';
   });
 
+  // Apply saved language on load
   applyLanguage();
 });
 
-// ─── JOB CANCELLATION FUNCTIONS ──────────────────────────────────────────────
-async function cancelCurrentJob() {
-  if (!currentJobId) return;
-  console.log('Cancel requested for job', currentJobId);
-  isPollingCancelled = true;
-  const cancelBtn = document.getElementById('cancel-optimize-btn');
-  if (cancelBtn) {
-    cancelBtn.disabled = true;
-    cancelBtn.textContent = '⏳ Cancelling...';
-  }
-  try {
-    const res = await fetch(`/api/optimize/cancel/${currentJobId}`, { method: 'POST' });
-    const data = await res.json();
-    if (data.ok) {
-      console.log('Cancel request sent successfully');
-    } else {
-      console.warn('Cancel request error:', data.error);
-    }
-  } catch (e) {
-    console.error('Cancel request failed:', e);
-  } finally {
-    currentJobId = null;
-    if (cancelBtn) {
-      cancelBtn.classList.add('hidden');
-      cancelBtn.disabled = false;
-      cancelBtn.textContent = t('cancelOptimization');
-    }
-    // The polling loop will stop because isPollingCancelled is true
-  }
-}
-
-// ─── SERBIA BBOX ──────────────────────────────────────────────────────────────
+// Serbia bounding box
 const SERBIA_BBOX = { minLat:41.85, maxLat:46.2, minLng:18.8, maxLng:23.0 };
 function inSerbia(lat, lng) {
   return lat >= SERBIA_BBOX.minLat && lat <= SERBIA_BBOX.maxLat &&
@@ -589,7 +584,8 @@ function safeRemove(layer) {
   try { if (layer && map && map.hasLayer && map.hasLayer(layer)) map.removeLayer(layer); } catch(e) {}
 }
 
-const DEPOT_COLOR = '#1a1a1a';
+// Depot colours: each depot gets a distinct warm colour
+const DEPOT_COLOR = '#1a1a1a';  // all depots are black
 
 function placeDepot(lat, lng, name) {
   if (typeof L === 'undefined') { alert(t('mapNotLoaded')); return; }
@@ -623,6 +619,7 @@ function placeDepot(lat, lng, name) {
   renderLocationsList();
 }
 
+// Monotonic counter — guarantees unique IDs even after deletions + rapid re-adds
 let _custSeq = 0;
 
 function placeCustomer(lat, lng, name, pkg_counts, time_window, unloading_time) {
@@ -630,6 +627,7 @@ function placeCustomer(lat, lng, name, pkg_counts, time_window, unloading_time) 
   const id = 'customer_' + (++_custSeq);
   const num = state.customers.length + 1;
   const cname = name || `Customer ${num}`;
+  // Normalise pkg_counts to array of 3
   if (!Array.isArray(pkg_counts)) pkg_counts = [pkg_counts || 1, 0, 0];
   while (pkg_counts.length < 3) pkg_counts.push(0);
   const vol = calcVolume(pkg_counts);
@@ -662,6 +660,7 @@ function placeCustomer(lat, lng, name, pkg_counts, time_window, unloading_time) 
 }
 
 function removeDepot(id) {
+  // If no id given, remove the last depot
   if (!id) {
     if (state.depots.length === 0) return;
     id = state.depots[state.depots.length - 1].id;
@@ -669,6 +668,7 @@ function removeDepot(id) {
   safeRemove(state.markers[id]);
   delete state.markers[id];
   state.depots = state.depots.filter(d => d.id !== id);
+  // Re-number remaining depots
   state.depots.forEach((d, i) => { d.idx = i; });
   renderLocationsList();
 }
@@ -686,8 +686,8 @@ function clearAll() {
   state.depots = [];
   state.customers = [];
   clearRoutes();
-  resetResults();
   renderLocationsList();
+  resetResults();
 }
 
 // ─── LOCATIONS LIST ───────────────────────────────────────────────────────────
@@ -871,6 +871,7 @@ async function confirmExcelImport() {
   let importedCount = 0;
   for (let i=0; i<rows.length; i++) {
     const r = rows[i];
+    // If the row already has coordinates, skip the geocoding API call entirely
     if (r.lat != null && r.lng != null) {
       st.textContent = `📍 (${i+1}/${rows.length}) ${r.name}`;
       const pc = r.pkg_counts || [r.packages||1, 0, 0];
@@ -891,7 +892,7 @@ async function confirmExcelImport() {
         importedCount++;
       }
     } catch(e) {}
-    await sleep(1100);
+    await sleep(1100); // Nominatim rate limit
   }
   renumberCustomers();
   st.textContent = t('importedCustomers')(importedCount);
@@ -955,6 +956,7 @@ function updateModalHint() {
   document.getElementById('modal-hint').textContent = hint;
 }
 
+
 function applyFleetModal() {
   const idx = state.editingFleetIdx;
   if (idx === null) return;
@@ -978,6 +980,7 @@ function togglePanel(id) {
   const el = document.getElementById(id);
   if (!el) return;
   el.classList.toggle('collapsed');
+  // persist state
   try {
     const states = JSON.parse(localStorage.getItem('grps_panels') || '{}');
     states[id] = el.classList.contains('collapsed');
@@ -1008,8 +1011,10 @@ function updateCostHint() {
   const p = getCostParams();
   const el = document.getElementById('cost-hint');
   if (el) el.textContent = `${p.fuel_price_rsd_l} RSD/L · ${p.driver_wage_rsd_h} RSD/h · +${p.fuel_load_factor_pct}%/t`;
+  // update the static note below the inputs
   const note = document.getElementById('cost-load-note');
   if (note) note.textContent = `⛽ ${t('fuelLoadFactorLabel')}: +${p.fuel_load_factor_pct}% per 1 000 kg`;
+  // update the note inside the vehicle modal if it's open
   _refreshModalFuelNote(p.fuel_load_factor_pct);
 }
 
@@ -1079,7 +1084,8 @@ function updateConstraintHint() {
   }
 }
 
-// ─── OPTIMIZATION (with cancellation support) ────────────────────────────────
+
+// ─── OPTIMIZATION ────────────────────────────────────────────────────────────
 async function runOptimize() {
   if (state.depots.length === 0) { alert(t('addDepotFirst')); return; }
   if (state.customers.length < 1) { alert(t('addCustomerFirst')); return; }
@@ -1090,10 +1096,12 @@ async function runOptimize() {
 
   const btn = document.getElementById('optimize-btn');
   const pw  = document.getElementById('progress-wrap');
+  const cancelBtn = document.getElementById('cancel-job-btn');
   const routingBanner = document.getElementById('routing-source-banner');
   if (routingBanner) routingBanner.style.display = 'none';
   btn.disabled = true;
   pw.classList.remove('hidden');
+  if (cancelBtn) { cancelBtn.style.display = 'inline-block'; cancelBtn.disabled = false; cancelBtn.textContent = '✕ Cancel'; }
   setProgress(10, t('phase1'));
 
   const payload = {
@@ -1114,7 +1122,10 @@ async function runOptimize() {
     departure_time:   document.getElementById('adv-dep-time')?.value || '',
   };
 
+  console.log(`[GRPS] submitting optimize job — ${state.customers.length} customers, ${state.depots.length} depots`);
+
   try {
+    // ── Step 1: submit job, get job_id immediately ──────────────────────────
     setProgress(5, t('phase1'));
     const submitRes = await fetch('/api/optimize', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
@@ -1125,38 +1136,39 @@ async function runOptimize() {
       alert(t('optimizationError') + (submitData.error || 'Unknown'));
       btn.disabled = false;
       pw.classList.add('hidden');
+      if (cancelBtn) cancelBtn.style.display = 'none';
       return;
     }
-    currentJobId = submitData.job_id;
-    isPollingCancelled = false;
-    const cancelBtn = document.getElementById('cancel-optimize-btn');
-    if (cancelBtn) cancelBtn.classList.remove('hidden');
+    const jobId = submitData.job_id;
+    _currentJobId = jobId;
+    console.log(`[GRPS] job submitted: ${jobId}`);
 
+    // ── Step 2: poll /api/optimize/status/:job_id until done ───────────────
+    // Progress bar ticks forward slowly; messaging flips at ~40 %
     let prog = 5;
     const ticker = setInterval(() => {
-      if (isPollingCancelled) return;
       prog = Math.min(prog + 2, 90);
       setProgress(prog, prog < 40 ? t('phase1short') : t('phase2'));
     }, 800);
 
     const POLL_INTERVAL_MS = 1500;
-    const MAX_WAIT_MS      = 20 * 60 * 1000;
+    const MAX_WAIT_MS      = 20 * 60 * 1000;   // 20 min hard client timeout
     const pollStart        = Date.now();
 
     const data = await new Promise((resolve, reject) => {
       const poll = async () => {
-        if (isPollingCancelled) {
-          clearInterval(ticker);
-          reject(new Error('Cancelled by user'));
-          return;
-        }
         if (Date.now() - pollStart > MAX_WAIT_MS) {
           reject(new Error('Optimization timed out after 20 minutes'));
           return;
         }
         try {
-          const r = await fetch(`/api/optimize/status/${currentJobId}`);
+          const r = await fetch(`/api/optimize/status/${jobId}`);
           const d = await r.json();
+          console.log(`[GRPS] poll job ${jobId.slice(0,8)}: status=${d.status}`);
+          if (d.status === 'cancelled') {
+            reject(new Error('Job was cancelled'));
+            return;
+          }
           if (!r.ok || d.status === 'error') {
             reject(new Error(d.error || 'Optimization failed on server'));
             return;
@@ -1165,6 +1177,7 @@ async function runOptimize() {
             resolve(d.result);
             return;
           }
+          // still running — poll again
           setTimeout(poll, POLL_INTERVAL_MS);
         } catch (fetchErr) {
           reject(fetchErr);
@@ -1174,14 +1187,19 @@ async function runOptimize() {
     });
 
     clearInterval(ticker);
-    if (isPollingCancelled) throw new Error('Cancelled by user');
+    _currentJobId = null;
 
     if (!data.ok) {
       alert(t('optimizationError') + (data.error || 'Unknown'));
       btn.disabled = false;
       pw.classList.add('hidden');
+      if (cancelBtn) cancelBtn.style.display = 'none';
       return;
     }
+
+    console.log(`[GRPS] job ${jobId.slice(0,8)} done — `
+      + `${data.vehicle_routes?.length} routes, dist=${data.total_distance} km, `
+      + `cost=${data.total_cost_rsd} RSD, matrix=${data.matrix_source}`);
 
     const srcBadges = t('srcBadges');
     const src     = data.matrix_source || 'osrm';
@@ -1189,6 +1207,8 @@ async function runOptimize() {
     const srcMsg  = data.matrix_msg ? ` · ${data.matrix_msg}` : '';
     setProgress(100, t('routesCalculated') + srcMsg);
 
+    // Show routing source banner below the progress bar
+    const routingBanner = document.getElementById('routing-source-banner');
     if (routingBanner) {
       routingBanner.textContent = badge.label;
       routingBanner.style.color = badge.color;
@@ -1203,19 +1223,18 @@ async function runOptimize() {
     document.getElementById('simulate-btn').disabled = false;
     document.getElementById('pdf-btn').disabled = false;
   } catch(e) {
-    if (e.message === 'Cancelled by user') {
-      console.log('Optimization cancelled by user');
-      setProgress(0, 'Cancelled');
+    _currentJobId = null;
+    if (e.message === 'Job was cancelled') {
+      setProgress(0, '✖ Job cancelled');
+      console.log('[GRPS] job cancelled by user');
     } else {
       alert(t('errorPrefix') + e.message);
+      console.error('[GRPS] optimization error:', e.message);
     }
   } finally {
     btn.disabled = false;
+    if (cancelBtn) cancelBtn.style.display = 'none';
     setTimeout(() => pw.classList.add('hidden'), 2000);
-    currentJobId = null;
-    const cancelBtn = document.getElementById('cancel-optimize-btn');
-    if (cancelBtn) cancelBtn.classList.add('hidden');
-    isPollingCancelled = false;
   }
 }
 
@@ -1224,8 +1243,9 @@ function setProgress(pct, msg) {
   document.getElementById('progress-label').textContent = msg;
 }
 
-// ─── DRAW ROUTES ──────────────────────────────────────────────────────────────
+// ─── DRAW ROUTES ──────────────────────────────────────────────────
 function drawRoutes(data) {
+  // Reset all customer markers back to default blue before colouring served ones
   state.customers.forEach(c => {
     const marker = state.markers[c.id];
     if (marker) {
@@ -1244,6 +1264,9 @@ function drawRoutes(data) {
     }
   });
 
+  // Highlight unserved customers in red with a warning icon.
+  // Count per-name so that if two customers share a name and only one stop is
+  // served, the second is correctly flagged — not both marked served via Set.
   const _servedCount = {};
   (data.vehicle_routes || []).flatMap(vr => (vr.stops || []).map(s => s.name))
     .forEach(n => { _servedCount[n] = (_servedCount[n] || 0) + 1; });
@@ -1273,6 +1296,7 @@ function drawRoutes(data) {
     }
   });
 
+  // Show warning banner if any customers are unserved
   const unserved = data.unserved_customers || [];
   if (unserved.length > 0) {
     const st = document.getElementById('geocode-status');
@@ -1280,45 +1304,69 @@ function drawRoutes(data) {
     st.style.color = '#e74c3c';
   }
 
+  // ── Overlap detection & zoom-invariant alternating-color splitting ─────────
+  // pixel-based dashArray shifts with zoom, so instead we split each shared
+  // run geographically: slice the coordinate array into chunks of equal
+  // geographic length (CHUNK_DEG), then assign each chunk to vehicles in
+  // round-robin order. Each chunk is drawn as a short solid polyline in that
+  // vehicle's color, stored in that vehicle's LayerGroup → toggle still works.
+  // Because the slices are defined by coordinates, the 1/N split is exact at
+  // every zoom level.
+  //
+  // Grid resolution: 1 cell ≈ 0.00025° ≈ 22–27 m at mid-European latitudes.
   const GRID_RES = 0.00025;
   function cellKey(lat, lng) {
     return `${Math.round(lat / GRID_RES)}_${Math.round(lng / GRID_RES)}`;
   }
 
-  const STRIPE_PX = 20;
+  // Compute chunk size in degrees so stripes are always ~STRIPE_PX pixels wide
+  // on screen, regardless of zoom level. We convert via Leaflet's CRS scale:
+  //   metersPerPx = 156543.03 * cos(centerLat) / 2^zoom   (Web Mercator)
+  //   degPerPx    = metersPerPx / 111320
+  const STRIPE_PX = 20;  // target stripe width in screen pixels
   const zoom = map.getZoom();
   const centerLat = map.getCenter().lat;
   const metersPerPx = (156543.03392 * Math.cos(centerLat * Math.PI / 180)) / Math.pow(2, zoom);
   const degPerPx = metersPerPx / 111320;
   const CHUNK_DEG = STRIPE_PX * degPerPx;
 
+  // Euclidean distance in degrees (fine for short segments)
   function segLen(a, b) {
     const dlat = b[0] - a[0], dlng = b[1] - a[1];
     return Math.sqrt(dlat * dlat + dlng * dlng);
   }
+
+  // Interpolate between two [lat,lng] points at fraction t ∈ [0,1]
   function interp(a, b, t) {
     return [a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])];
   }
+
+  // Slice a polyline (array of [lat,lng]) into equal-length geographic chunks.
+  // Uses cumulative arc length so each chunk is exactly chunkLen degrees long.
   function slicePolylineClean(pts, chunkLen) {
     const chunks = [];
     let cur = [pts[0]];
     let budget = chunkLen;
+
     for (let i = 0; i + 1 < pts.length; i++) {
       const A = pts[i], B = pts[i + 1];
       let d = segLen(A, B);
-      let t0 = 0;
+      let t0 = 0; // fraction of AB already consumed
+
       while (t0 < 1) {
-        const tNeeded = budget / d;
+        const tNeeded = budget / d;          // fraction of AB needed to fill budget
         if (t0 + tNeeded >= 1 - 1e-10) {
+          // Rest of AB fits within budget
           cur.push(B);
           budget -= d * (1 - t0);
           t0 = 1;
-          if (budget < 1e-10) {
+          if (budget < 1e-10) {             // chunk exactly full
             if (cur.length >= 2) chunks.push(cur);
             cur = [B];
             budget = chunkLen;
           }
         } else {
+          // Cut AB at t0+tNeeded
           const cutPt = interp(A, B, t0 + tNeeded);
           cur.push(cutPt);
           if (cur.length >= 2) chunks.push(cur);
@@ -1332,6 +1380,7 @@ function drawRoutes(data) {
     return chunks;
   }
 
+  // Build grid: cellKey → Set of vehicle_ids
   const cellVehicles = {};
   (data.vehicle_routes || []).forEach(vr => {
     if (!vr.geometry || vr.geometry.length < 2) return;
@@ -1345,14 +1394,17 @@ function drawRoutes(data) {
     }
   });
 
+  // sharedCells: cellKey → sorted vehicle_id[] (only cells with 2+ vehicles)
   const sharedCells = {};
   Object.entries(cellVehicles).forEach(([k, vids]) => {
     if (vids.size > 1) sharedCells[k] = [...vids].sort((a, b) => a - b);
   });
 
+  // Color lookup
   const vehicleColor = {};
   (data.vehicle_routes || []).forEach(vr => { vehicleColor[vr.vehicle_id] = vr.color; });
 
+  // Accumulate sub-layers per vehicle before building LayerGroups
   const vehicleSubLayers = {};
   (data.vehicle_routes || []).forEach(vr => { vehicleSubLayers[vr.vehicle_id] = []; });
 
@@ -1360,6 +1412,7 @@ function drawRoutes(data) {
     if (!vr.geometry || vr.geometry.length < 2) return;
     const pts = vr.geometry.map(([lng, lat]) => [lat, lng]);
 
+    // Split route into runs by sharing-group signature
     const runs = [];
     let currentSig = undefined;
     let currentRun = null;
@@ -1382,11 +1435,15 @@ function drawRoutes(data) {
 
     runs.forEach(run => {
       if (run.latlngs.length < 2) return;
+
       if (!run.sharingVids) {
+        // Solid, non-shared segment
         vehicleSubLayers[vr.vehicle_id].push(
           L.polyline(run.latlngs, { color: vr.color, weight: 4, opacity: 0.85, smoothFactor: 1 })
         );
       } else {
+        // Shared segment: slice into geographic chunks and assign round-robin.
+        // Each vehicle gets every N-th chunk → exact 1/N split at all zoom levels.
         const n = run.sharingVids.length;
         const chunks = slicePolylineClean(run.latlngs, CHUNK_DEG);
         chunks.forEach((chunkPts, ci) => {
@@ -1397,7 +1454,7 @@ function drawRoutes(data) {
               color:        vehicleColor[vid],
               weight:       5,
               opacity:      0.95,
-              smoothFactor: 0,
+              smoothFactor: 0,   // no smoothing — preserve exact cut points
             })
           );
         });
@@ -1405,12 +1462,15 @@ function drawRoutes(data) {
     });
   });
 
+  // Build LayerGroups and add to map
   data.vehicle_routes.forEach(vr => {
     if (!vr.geometry || vr.geometry.length < 2) return;
     const group = L.layerGroup(vehicleSubLayers[vr.vehicle_id]).addTo(map);
     state.routeLayers[vr.vehicle_id] = group;
     state.vehicleVisible[vr.vehicle_id] = true;
 
+    // Update each customer marker: popup with schedule + dot colour = vehicle colour
+    // Build per-name queue so duplicate-named customers are matched in order
     const _nameQueue = {};
     state.customers.forEach(c => {
       (_nameQueue[c.name] = _nameQueue[c.name] || []).push(c);
@@ -1436,7 +1496,7 @@ function drawRoutes(data) {
       }
     });
   });
-
+  // Fit map to routes + all depot markers
   try {
     const routeLayers = Object.values(state.routeLayers).filter(l => l);
     const depotLayers = state.depots.map(d => state.markers[d.id]).filter(m => m);
@@ -1467,6 +1527,7 @@ function drawResults(data) {
   document.getElementById('r-pkgs').textContent = (data.total_volume ?? data.total_packages ?? 0).toFixed(2) + ' m³';
   document.getElementById('r-vehs').textContent = data.vehicle_routes.length;
 
+  // ── Fleet-wide capacity utilisation ──────────────────────────────────────
   const routes = data.vehicle_routes || [];
   const totalVolUsed = routes.reduce((s, vr) => s + (vr.volume_used  ?? 0), 0);
   const totalVolCap  = routes.reduce((s, vr) => s + (vr.volume_capacity ?? 0), 0);
@@ -1474,10 +1535,10 @@ function drawResults(data) {
   const totalWtCap   = routes.reduce((s, vr) => s + (vr.weight_capacity ?? 0), 0);
 
   function pctColor(pct) {
-    if (pct >= 90) return '#ef4444';
-    if (pct >= 70) return '#f97316';
-    if (pct >= 40) return '#22c55e';
-    return 'var(--muted)';
+    if (pct >= 90) return '#ef4444';   // red   — very full
+    if (pct >= 70) return '#f97316';   // orange — high
+    if (pct >= 40) return '#22c55e';   // green  — healthy
+    return 'var(--muted)';             // grey   — low utilisation
   }
 
   const volPctEl = document.getElementById('r-vol-pct');
@@ -1507,12 +1568,14 @@ function drawResults(data) {
   document.getElementById('r-wage-cost').textContent = (data.total_wage_cost_rsd ?? 0).toLocaleString();
   document.getElementById('r-total-cost').textContent = (data.total_cost_rsd ?? 0).toLocaleString();
 
+  // Show which objective was active during this run
   const owLabels = t('owLabels');
   const ow = data.obj_weights || { fuel: true, wages: true };
   const activeObj = Object.entries(ow).filter(([,v]) => v).map(([k]) => owLabels[k]).join(' + ');
   const objEl = document.getElementById('r-objective');
   if (objEl) objEl.textContent = activeObj ? t('optimisedFor') + activeObj : '';
 
+  // Show active constraint info
   const constraintEl = document.getElementById('r-constraints');
   if (constraintEl) {
     const cList = [];
@@ -1671,6 +1734,7 @@ function startSimulation() {
     const coords = vr.geometry.map(([lng, lat]) => [lat, lng]);
     const color  = vr.color;
 
+    // Create moving dot
     const el = document.createElement('div');
     el.className = 'sim-marker';
     el.style.background = color;
@@ -1699,6 +1763,8 @@ function stopSimulation() {
 }
 
 // ─── PDF ──────────────────────────────────────────────────────────────────────
+
+/** Capture the current Leaflet map view into a base64 PNG string (or null). */
 async function captureMapCanvas() {
   try {
     const mapEl   = document.getElementById('map');
@@ -1710,6 +1776,7 @@ async function captureMapCanvas() {
     merged.height = H;
     const ctx = merged.getContext('2d');
 
+    // Draw tile canvases
     const canvases = mapEl.querySelectorAll('canvas');
     for (const c of canvases) {
       if (c.width > 0 && c.height > 0) {
@@ -1718,6 +1785,7 @@ async function captureMapCanvas() {
       }
     }
 
+    // Draw SVG overlays (markers, polylines)
     const svgEls = mapEl.querySelectorAll('svg');
     for (const svg of svgEls) {
       const r   = svg.getBoundingClientRect();
@@ -1743,11 +1811,18 @@ async function captureMapCanvas() {
   }
 }
 
+/**
+ * Spin up a fully independent, offscreen Leaflet map for a single vehicle,
+ * draw only its route + stop markers, capture it, then tear it down.
+ * This never touches the main map at all.
+ */
 async function captureVehicleMap(vr) {
   if (!vr.geometry || vr.geometry.length < 2) return null;
 
   const W = 900, H = 500;
 
+  // 1. Container stacked ON TOP of the page but hidden behind a high-z overlay
+  //    Must be on-screen so the browser actually loads tiles.
   const overlay = document.createElement('div');
   overlay.style.cssText =
     'position:fixed;inset:0;background:rgba(0,0,0,0.01);z-index:9998;pointer-events:none;';
@@ -1758,16 +1833,23 @@ async function captureVehicleMap(vr) {
     `position:fixed;left:0;top:0;width:${W}px;height:${H}px;z-index:9999;pointer-events:none;opacity:0;`;
   document.body.appendChild(container);
 
+  // 2. Fresh Leaflet map
   const vMap = L.map(container, { zoomControl:false, attributionControl:false, animate:false });
+
   L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
     maxZoom: 19, crossOrigin: true,
   }).addTo(vMap);
 
+  // 3. Route polyline
   const latlngs = vr.geometry.map(([lng, lat]) => [lat, lng]);
   L.polyline(latlngs, { color: vr.color, weight: 5, opacity: 0.9, smoothFactor: 1 }).addTo(vMap);
+
+  // 4. Depot marker
   L.circleMarker(latlngs[0], {
     radius: 10, color: '#fff', weight: 3, fillColor: '#1a1a1a', fillOpacity: 1,
   }).addTo(vMap);
+
+  // 5. Stop circle markers (SVG — always captured)
   (vr.stops || []).forEach((stop) => {
     if (stop.lat == null || stop.lng == null) return;
     L.circleMarker([stop.lat, stop.lng], {
@@ -1776,15 +1858,21 @@ async function captureVehicleMap(vr) {
     }).addTo(vMap);
   });
 
+  // 6. Fit to route bounds
   vMap.fitBounds(L.latLngBounds(latlngs), { padding: [40, 40], animate: false });
+
+  // 7. Wait for tiles — use tileload event with a timeout fallback
   await new Promise(resolve => {
     let done = false;
     const finish = () => { if (!done) { done = true; resolve(); } };
     vMap.once('idle', finish);
+    // fallback: wait 3s regardless
     setTimeout(finish, 3000);
   });
+  // Extra frame settle
   await sleep(400);
 
+  // 8. Composite canvas
   let b64 = null;
   try {
     const merged = document.createElement('canvas');
@@ -1793,6 +1881,7 @@ async function captureVehicleMap(vr) {
     const ctx = merged.getContext('2d');
     const rect = container.getBoundingClientRect();
 
+    // Tile canvases
     for (const c of container.querySelectorAll('canvas')) {
       if (c.width > 0 && c.height > 0) {
         const r = c.getBoundingClientRect();
@@ -1800,6 +1889,7 @@ async function captureVehicleMap(vr) {
       }
     }
 
+    // SVG overlays (polyline + circles)
     for (const svg of container.querySelectorAll('svg')) {
       const r   = svg.getBoundingClientRect();
       const xml = new XMLSerializer().serializeToString(svg);
@@ -1813,6 +1903,7 @@ async function captureVehicleMap(vr) {
       });
     }
 
+    // Draw numbers on top of each stop circle
     ctx.font = 'bold 11px Arial, sans-serif';
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
@@ -1828,9 +1919,11 @@ async function captureVehicleMap(vr) {
     console.warn(`Vehicle ${vr.vehicle_id} map capture failed:`, e);
   }
 
+  // 9. Teardown
   vMap.remove();
   document.body.removeChild(container);
   document.body.removeChild(overlay);
+
   return b64;
 }
 
@@ -1842,6 +1935,8 @@ async function generatePDF() {
   btn.disabled = true;
   btn.textContent = t('captureMaps');
 
+  // ── Capture full overview map ──────────────────────────────────────────────
+  // First fit map to show all routes
   try {
     const allLayers = Object.values(state.routeLayers).filter(l => l);
     if (allLayers.length) {
@@ -1851,6 +1946,7 @@ async function generatePDF() {
   } catch(e) {}
   const mapImageB64 = await captureMapCanvas();
 
+  // ── Capture per-vehicle maps ───────────────────────────────────────────────
   const vehicleMaps = {};
   const totalVehicles = d.vehicle_routes.length;
   for (let i = 0; i < d.vehicle_routes.length; i++) {
@@ -1860,6 +1956,7 @@ async function generatePDF() {
     await sleep(200);
   }
 
+  // Restore full overview view after captures
   try {
     const allLayers = Object.values(state.routeLayers).filter(l => l);
     if (allLayers.length) {
@@ -1869,6 +1966,7 @@ async function generatePDF() {
 
   btn.textContent = t('buildingPDF');
 
+  // Attach per-vehicle map images to each vehicle_route object
   const vehicleRoutesWithMaps = d.vehicle_routes.map(vr => ({
     ...vr,
     vehicle_map_image: vehicleMaps[vr.vehicle_id] || null,
@@ -1940,6 +2038,7 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
       document.body.style.cursor = 'col-resize';
       document.body.style.userSelect = 'none';
 
+      // Disable pointer events on map iframe/canvas during drag
       const mapEl = document.getElementById('map');
       if (mapEl) mapEl.style.pointerEvents = 'none';
 
@@ -1950,12 +2049,13 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
         const newWidth = getEdge(ev.clientX, layoutRect);
         const clamped  = Math.max(MIN_SIDEBAR, newWidth);
 
+        // Also ensure map doesn't shrink below minimum
         const mapArea   = document.getElementById('map-area');
         const leftSide  = document.getElementById('sidebar-left');
         const rightSide = document.getElementById('sidebar-right');
         const leftW     = parseInt(leftSide.style.width)  || leftSide.offsetWidth;
         const rightW    = parseInt(rightSide.style.width) || rightSide.offsetWidth;
-        const handles   = 10;
+        const handles   = 10; // 2 × 5px handles
         const available = layoutRect.width - handles;
 
         let mapW;
@@ -1967,6 +2067,7 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
         if (mapW < MIN_MAP) return;
 
         sidebar.style.width = clamped + 'px';
+        // Invalidate Leaflet size after resize
         if (window.map) map.invalidateSize();
       };
 
@@ -2000,6 +2101,7 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 })();
 
 // ─── ROUTE HISTORY ───────────────────────────────────────────────────────────
+
 let _historyCurrentId = null;
 
 async function loadRouteHistory() {
@@ -2098,7 +2200,7 @@ async function openHistoryRoute(routeId) {
               <th style="padding:3px 5px;text-align:center">Window</th>
               <th style="padding:3px 5px;text-align:right">Vol m³</th>
               <th style="padding:3px 5px;text-align:right">Wt kg</th>
-            </table>
+            </tr>
           </thead>
           <tbody>
             ${r.stops.map((s, i) => {
@@ -2173,9 +2275,11 @@ async function deleteHistoryRoute() {
 }
 
 // ─── WORKSPACE MANAGEMENT ────────────────────────────────────────────────────
-let _workspacePendingId = null;
+
+let _workspacePendingId = null;   // id of workspace selected for load/delete
 
 function _getWorkspaceSnapshot() {
+  // Collect all current UI state into a saveable object
   return {
     depots:    state.depots,
     customers: state.customers,
@@ -2198,14 +2302,17 @@ function _getWorkspaceSnapshot() {
 }
 
 function _applyWorkspaceSnapshot(ws) {
+  // Restore depots
   state.depots = ws.depots || [];
   state.customers = ws.customers || [];
   state.fleet = ws.fleet || state.fleet;
 
+  // Restore settings
   const s = ws.settings || {};
   if (s.pkg_sizes)      state.pkg_sizes      = s.pkg_sizes;
   if (s.pkg_weights_kg) state.pkg_weights_kg = s.pkg_weights_kg;
 
+  // UI inputs
   if (s.algorithm)        document.getElementById('algo-select').value          = s.algorithm;
   if (s.max_iterations)   document.getElementById('max-iter').value             = s.max_iterations;
   if (s.temperature)      document.getElementById('temperature').value          = s.temperature;
@@ -2244,8 +2351,10 @@ function _applyWorkspaceSnapshot(ws) {
     document.getElementById('pkg-weight-3').value = s.pkg_weights_kg[2] || 30;
   }
 
+  // Restore result
   state.lastResult = ws.result || null;
 
+  // Re-render everything
   clearRoutes();
   redrawAllMarkers();
   renderLocationsList();
@@ -2268,6 +2377,7 @@ function _applyWorkspaceSnapshot(ws) {
 }
 
 function redrawAllMarkers() {
+  // Clear existing markers and re-add from state
   Object.values(state.markers || {}).forEach(m => safeRemove(m));
   state.markers = {};
 
@@ -2334,6 +2444,7 @@ function redrawAllMarkers() {
 }
 
 // ── Save modal ────────────────────────────────────────────────────────────────
+
 let _overwriteWorkspaceId = null;
 
 function openSaveWorkspaceModal(overwriteId, overwriteName) {
@@ -2386,6 +2497,7 @@ async function confirmSaveWorkspace() {
     if (data.ok) {
       closeWorkspaceSaveModal();
       loadWorkspaceList();
+      // Briefly flash the panel open
       const panel = document.getElementById('panel-workspaces');
       if (panel && panel.classList.contains('collapsed')) {
         panel.classList.remove('collapsed');
@@ -2404,6 +2516,7 @@ async function confirmSaveWorkspace() {
 }
 
 // ── List ──────────────────────────────────────────────────────────────────────
+
 async function loadWorkspaceList() {
   const listEl   = document.getElementById('workspace-list');
   const statusEl = document.getElementById('workspace-status');
@@ -2426,13 +2539,11 @@ async function loadWorkspaceList() {
     listEl.innerHTML = data.workspaces.map(w => {
       const dt = new Date(w.updated_at).toLocaleString([], { dateStyle:'short', timeStyle:'short' });
       return `
-        <div class="history-card" style="cursor:pointer;padding:8px 10px;background:var(--bg3);border:1px solid var(--border2);border-radius:6px">
-          <div style="display:flex;justify-content:space-between;align-items:center">
-            <div style="font-weight:600;font-size:12px;color:var(--fg);margin-bottom:2px" onclick="openWorkspaceLoadModal(${w.id})">${w.name}</div>
-            <button onclick="event.stopPropagation(); exportWorkspace(${w.id})" style="background:var(--accent2);border:none;border-radius:4px;color:#fff;padding:2px 6px;font-size:9px;cursor:pointer">📎 Export</button>
-          </div>
-          ${w.description ? `<div style="font-size:10px;color:var(--muted);margin-bottom:3px" onclick="openWorkspaceLoadModal(${w.id})">${w.description}</div>` : ''}
-          <div style="font-size:10px;color:var(--muted)" onclick="openWorkspaceLoadModal(${w.id})">
+        <div class="history-card" onclick="openWorkspaceLoadModal(${w.id})"
+             style="cursor:pointer;padding:8px 10px;background:var(--bg3);border:1px solid var(--border2);border-radius:6px">
+          <div style="font-weight:600;font-size:12px;color:var(--fg);margin-bottom:2px">${w.name}</div>
+          ${w.description ? `<div style="font-size:10px;color:var(--muted);margin-bottom:3px">${w.description}</div>` : ''}
+          <div style="font-size:10px;color:var(--muted)">
             ${w.n_depots} depot${w.n_depots!==1?'s':''} · ${w.n_customers} customer${w.n_customers!==1?'s':''}
             · by <b>${w.updated_by}</b> · ${dt}
           </div>
@@ -2444,24 +2555,8 @@ async function loadWorkspaceList() {
   }
 }
 
-// ── Workspace export function ─────────────────────────────────────────────────
-async function exportWorkspace(workspaceId) {
-  try {
-    const res = await fetch(`/api/workspaces/${workspaceId}/export`);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const blob = await res.blob();
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `workspace_${workspaceId}.json`;
-    a.click();
-    URL.revokeObjectURL(url);
-  } catch (e) {
-    alert('Export failed: ' + e.message);
-  }
-}
-
 // ── Load / Delete modal ───────────────────────────────────────────────────────
+
 async function openWorkspaceLoadModal(id) {
   _workspacePendingId = id;
   document.getElementById('workspace-load-body').innerHTML = '<div style="color:var(--muted);font-size:12px">Loading…</div>';
@@ -2491,6 +2586,7 @@ async function openWorkspaceLoadModal(id) {
       <div style="margin-top:12px;padding:8px;background:rgba(231,76,60,.08);border:1px solid rgba(231,76,60,.2);border-radius:5px;font-size:11px;color:#e74c3c">
         ⚠️ Loading will replace your current workspace.
       </div>`;
+    // Store data for use in confirmLoadWorkspace
     document.getElementById('workspace-load-btn')._wsData = data;
   } catch (e) {
     document.getElementById('workspace-load-body').innerHTML =
@@ -2525,5 +2621,39 @@ async function confirmDeleteWorkspace() {
     }
   } catch (e) {
     alert('Delete failed: ' + e.message);
+  }
+}
+
+async function exportWorkspace() {
+  if (!_workspacePendingId) return;
+  const wsId = _workspacePendingId;
+  console.log(`[GRPS] exporting workspace ${wsId}`);
+  const btn = document.getElementById('workspace-export-btn');
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ Exporting…'; }
+  try {
+    const res = await fetch(`/api/workspaces/${wsId}/export`);
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
+      alert('Export failed: ' + (err.error || 'Unknown error'));
+      return;
+    }
+    // Trigger browser download via a temporary anchor
+    const blob     = await res.blob();
+    const fname    = res.headers.get('content-disposition')?.match(/filename="?([^"]+)"?/)?.[1]
+                     || `grps_workspace_${wsId}.json`;
+    const url      = URL.createObjectURL(blob);
+    const anchor   = document.createElement('a');
+    anchor.href    = url;
+    anchor.download = fname;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    URL.revokeObjectURL(url);
+    console.log(`[GRPS] workspace ${wsId} exported as ${fname}`);
+  } catch (e) {
+    alert('Export error: ' + e.message);
+    console.error('[GRPS] export error:', e);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '📤 Export'; }
   }
 }

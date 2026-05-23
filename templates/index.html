@@ -351,7 +351,15 @@
       </button>
       <div id="progress-wrap" class="hidden">
         <div id="progress-bar-track"><div id="progress-bar-fill"></div></div>
-        <div id="progress-label" class="status-line"></div>
+        <div style="display:flex;align-items:center;gap:6px;margin-top:4px">
+          <div id="progress-label" class="status-line" style="flex:1"></div>
+          <button id="cancel-job-btn"
+                  onclick="cancelCurrentJob()"
+                  style="display:none;padding:3px 10px;font-size:10px;font-weight:700;
+                         background:rgba(231,76,60,.15);color:#e74c3c;border:1px solid rgba(231,76,60,.4);
+                         border-radius:5px;cursor:pointer;white-space:nowrap;font-family:var(--font-mono)"
+                  title="Cancel this optimization job">✕ Cancel</button>
+        </div>
       </div>
       <div id="routing-source-banner" style="display:none;font-size:9px;font-weight:600;padding:3px 6px;margin-top:4px;border-radius:4px;background:var(--bg3);letter-spacing:.03em"></div>
       </div><!-- /panel-body -->
@@ -511,6 +519,7 @@
     <div class="modal-footer">
       <button class="btn-secondary" onclick="closeWorkspaceLoadModal()">Cancel</button>
       <button class="btn-danger" id="workspace-delete-btn" onclick="confirmDeleteWorkspace()" style="margin-right:auto">🗑 Delete</button>
+      <button class="btn-secondary" id="workspace-export-btn" onclick="exportWorkspace()" title="Download workspace as JSON file">📤 Export</button>
       <button class="btn-primary" id="workspace-load-btn" onclick="confirmLoadWorkspace()">📂 Load</button>
     </div>
   </div>
