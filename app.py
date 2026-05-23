@@ -7,6 +7,23 @@ import os, copy, math, json, io, tempfile, threading, time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 import numpy as np
+
+
+def _json_default(obj):
+    """Custom JSON serializer for types stdlib json cannot handle.
+
+    numpy.int32 / numpy.int64 appear in route indices and schedule entries.
+    numpy.float32 / numpy.float64 appear in distance/time matrix values.
+    Without this, json.dumps() raises TypeError and _job_set_done() silently
+    discards the optimization result, leaving the job stuck as 'running'.
+    """
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.floating):
+        return float(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
 import psycopg
 from collections import defaultdict
 from datetime import datetime, date, timedelta
@@ -220,12 +237,15 @@ def _job_set_done(job_id: str, result_dict: dict):
         cur  = conn.cursor()
         cur.execute(
             "UPDATE grps_jobs SET status='done', result_json=%s, updated_at=NOW() WHERE job_id=%s",
-            (json.dumps(result_dict), job_id)
+            (json.dumps(result_dict, default=_json_default), job_id)
         )
         conn.commit()
         conn.close()
     except Exception as exc:
         print(f"[jobs] set_done failed: {exc}")
+        # DB write failed — fall back to in-process dict so the result is not lost.
+        # This covers DB unavailability, connection limits, and serialization errors.
+        _local_jobs[job_id] = {"status": "done", "result": result_dict}
 
 
 def _job_set_error(job_id: str, error: str):
@@ -244,6 +264,8 @@ def _job_set_error(job_id: str, error: str):
         conn.close()
     except Exception as exc:
         print(f"[jobs] set_error failed: {exc}")
+        # DB write failed — fall back to in-process dict so the error is not lost.
+        _local_jobs[job_id] = {"status": "error", "error": error}
 
 
 def _job_get(job_id: str):

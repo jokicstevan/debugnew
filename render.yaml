@@ -6,7 +6,9 @@ services:
     buildCommand: pip install --upgrade pip && pip install -r requirements.txt
     startCommand: >
       gunicorn app:app
-      --workers 2
+      --workers 1
+      --worker-class gthread
+      --threads 8
       --timeout 900
       --graceful-timeout 30
       --keep-alive 5
@@ -33,9 +35,9 @@ services:
       - key: PYTHONUNBUFFERED
         value: "1"
       - key: WEB_CONCURRENCY
-        value: "2"
+        value: "1"
       - key: GUNICORN_CMD_ARGS
-        value: "--timeout 900 --graceful-timeout 30 --keep-alive 5"
+        value: "--timeout 900 --graceful-timeout 30 --keep-alive 5 --worker-class gthread --threads 8"
 
 databases:
   - name: grps-db
