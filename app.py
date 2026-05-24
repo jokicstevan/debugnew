@@ -1011,30 +1011,49 @@ def _here_departure_time():
 
 def fetch_here_matrix(locations, pairs=None, hav_km=None, sentinel_factor=None,
                       departure_min=None):
-    """Build N×N matrix using HERE Router v8 /routes with live traffic.
-    Avoids the async Matrix API (which requires OAuth2 for polling).
-    Uses one API call per origin row — fast enough for ≤25 locations.
+    """Build N×N matrix using HERE Matrix Routing API v8 — row-batched.
+
+    Instead of one HTTP call per pair (the old approach), this function groups
+    each unique origin with all of its K-nearest destinations and fires one
+    Matrix API call per origin row.  For 200 customers with K=12 neighbours:
+
+        Old approach : 4 824 individual /routes calls  ≈ 12 minutes
+        New approach :   201 /matrix  calls (1×K each) ≈  20–30 seconds
+
+    HERE Matrix v8 response (synchronous, apiKey auth):
+        {
+          "matrix": {
+            "numOrigins":      1,
+            "numDestinations": K,
+            "travelTimes":     [t0, t1, ..., tK-1],   # seconds, flat row-major
+            "distances":       [d0, d1, ..., dK-1],   # metres
+            "errorCodes":      [0,  0,  ...,  0 ]     # 0 = OK
+          }
+        }
+
+    Falls back to OSRM if >20 % of rows fail or the wall-clock budget runs out.
 
     Parameters
     ----------
-    locations        : list of {"lat": float, "lng": float}
-    pairs            : optional set of (i, j) tuples that *must* be fetched from HERE.
-                       Pairs not in the set receive a haversine-based sentinel value
-                       (hav_km[i][j] * sentinel_factor) so the VRP solver never routes
-                       through them.  When None, every pair is fetched (original behaviour).
-    hav_km           : optional np.ndarray of precomputed haversine distances (km).
-                       Required when pairs is not None.
-    sentinel_factor  : multiplier for haversine distance to produce sentinel values.
-                       Defaults to SENTINEL_FACTOR module constant.
+    locations   : list of {"lat": float, "lng": float}
+    pairs       : optional set of (i, j) — only these pairs are fetched.
+                  Absent pairs receive a haversine-based sentinel value.
+    hav_km      : N×N haversine distance array (required when pairs is given).
+    sentinel_factor : multiplier applied to hav_km for skipped-pair sentinels.
+    departure_min   : minutes since midnight for the planned departure
+                      (enables live-traffic time prediction).
     """
     if not HERE_API_KEY:
         return None, None
-    sf       = sentinel_factor if sentinel_factor is not None else SENTINEL_FACTOR
-    n        = len(locations)
-    dist_mat = np.zeros((n, n), dtype=np.float64)
-    time_mat = np.zeros((n, n), dtype=np.float64)
+
+    sf = sentinel_factor if sentinel_factor is not None else SENTINEL_FACTOR
+    n  = len(locations)
+    dist_mat = np.zeros((n, n), dtype=np.float32)
+    time_mat = np.zeros((n, n), dtype=np.float32)
+
+    # ── Departure time ────────────────────────────────────────────────────────
     if departure_min is not None:
-        today = datetime.utcnow().date()
+        today  = datetime.utcnow().date()
         dh, dm = divmod(int(departure_min), 60)
         dep_time = datetime(today.year, today.month, today.day,
                             dh % 24, dm % 60).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -1042,9 +1061,10 @@ def fetch_here_matrix(locations, pairs=None, hav_km=None, sentinel_factor=None,
     else:
         dep_time = _here_departure_time()
 
-    # Pre-fill sentinel values for skipped pairs using haversine * factor.
-    # Use numpy vectorised fill: build a boolean mask of skipped pairs, then
-    # write all sentinel values in two array assignments (no Python loop).
+    # ── Pre-fill sentinel values for pairs that will not be fetched ───────────
+    fetch_set = (pairs if pairs is not None
+                 else {(i, j) for i in range(n) for j in range(n) if i != j})
+
     if pairs is not None and hav_km is not None:
         skip_mask = np.ones((n, n), dtype=bool)
         np.fill_diagonal(skip_mask, False)
@@ -1054,82 +1074,124 @@ def fetch_here_matrix(locations, pairs=None, hav_km=None, sentinel_factor=None,
         dist_mat[skip_mask] = sentinel_d[skip_mask]
         time_mat[skip_mask] = sentinel_d[skip_mask] / 30.0 * 60.0
 
-    fetch_set = pairs if pairs is not None else {(i, j) for i in range(n) for j in range(n) if i != j}
+    # ── Group pairs by origin: {origin_i → [dest_j, dest_k, ...]} ────────────
+    from collections import defaultdict
+    origin_to_dests = defaultdict(list)
+    for i, j in fetch_set:
+        origin_to_dests[i].append(j)
 
-    # ── Concurrent HERE API calls ─────────────────────────────────────────────
-    # Strategy:
-    #   • Tolerate individual timeouts — failed pair keeps its haversine sentinel
-    #   • Abort the whole HERE attempt (fall back to OSRM) if EITHER:
-    #       a) >20% of pairs fail  (API key / quota problem), OR
-    #       b) the wall-clock deadline is exceeded (HERE is just too slow today)
-    #   • Hard per-request timeout of 6 s (connect 3 s + read 6 s)
-    #   • Wall-clock budget: 45 s for ≤50 pairs, 90 s for larger sets
-    MAX_HERE_WORKERS    = 4
-    HERE_FAIL_THRESHOLD = 0.20   # abort if >20% of pairs fail
-    wall_budget         = 90.0 if len(fetch_set) > 50 else 45.0
-    wall_deadline       = time.time() + wall_budget
+    n_rows      = len(origin_to_dests)
+    HERE_BATCH_WORKERS  = 8       # concurrent Matrix API calls
+    HERE_FAIL_THRESHOLD = 0.20    # fall back to OSRM if >20 % of rows fail
+    # Budget: at least 60 s, or 0.8 s per row (generous for slow networks)
+    wall_budget   = max(60.0, n_rows * 0.8)
+    wall_deadline = time.time() + wall_budget
+    abort_flag    = threading.Event()
 
-    abort_flag = threading.Event()   # set to signal all threads to stop fast
-
-    def _fetch_pair(i, j):
-        """Fetch one (i,j) route. Returns (i, j, dist_km, time_min) or None."""
+    # ── Row fetcher: 1 origin × K destinations → one Matrix API call ─────────
+    def _fetch_row(origin_i, dest_indices):
+        """POST to HERE Matrix v8 for one origin row. Returns list of
+        (origin_i, dest_j, dist_km, time_min) tuples, or None on failure."""
         if abort_flag.is_set():
             return None
-        params = {
-            "apiKey":        HERE_API_KEY,
-            "transportMode": "car",
-            "routingMode":   "fast",
-            "departureTime": dep_time,
-            "origin":        f"{locations[i]['lat']},{locations[i]['lng']}",
-            "destination":   f"{locations[j]['lat']},{locations[j]['lng']}",
-            "return":        "summary",
+
+        origin_loc = locations[origin_i]
+        dest_locs  = [locations[j] for j in dest_indices]
+
+        # Compute a tight bounding box so HERE can use regional routing —
+        # slightly faster than "world" and avoids region-mismatch errors.
+        all_lats = [origin_loc["lat"]] + [l["lat"] for l in dest_locs]
+        all_lngs = [origin_loc["lng"]] + [l["lng"] for l in dest_locs]
+        margin   = 0.05   # ~5 km padding
+        region   = {
+            "type":  "boundingBox",
+            "north": max(all_lats) + margin,
+            "south": min(all_lats) - margin,
+            "east":  max(all_lngs) + margin,
+            "west":  min(all_lngs) - margin,
+        }
+
+        payload = {
+            "origins":          [{"lat": origin_loc["lat"], "lng": origin_loc["lng"]}],
+            "destinations":     [{"lat": l["lat"], "lng": l["lng"]} for l in dest_locs],
+            "routingMode":      "fast",
+            "transportMode":    "car",
+            "matrixAttributes": ["travelTimes", "distances"],
+            "regionDefinition": region,
         }
         try:
-            resp = requests.get("https://router.hereapi.com/v8/routes",
-                                params=params, timeout=(3, 6))
-            if resp.status_code == 200:
-                routes = resp.json().get("routes", [])
-                if routes:
-                    s = routes[0]["sections"][0]["summary"]
-                    return (i, j, s["length"] / 1000.0, s["duration"] / 60.0)
-            print(f"[HERE matrix] ({i},{j}) failed: {resp.status_code}")
-        except Exception as e:
-            print(f"[HERE matrix] ({i},{j}) exception: {e}")
-        return None
+            resp = requests.post(
+                "https://matrix.router.hereapi.com/v8/matrix",
+                json=payload,
+                params={"apiKey": HERE_API_KEY, "departureTime": dep_time,
+                        "async": "false"},
+                timeout=(5, 25),
+            )
+            if resp.status_code != 200:
+                print(f"[HERE matrix] row {origin_i}: HTTP {resp.status_code}")
+                return None
 
-    api_calls = failures = 0
-    timed_out = False
-    with ThreadPoolExecutor(max_workers=MAX_HERE_WORKERS) as pool:
-        futures = {pool.submit(_fetch_pair, i, j): (i, j) for (i, j) in fetch_set}
-        n_pairs = len(futures)
+            data        = resp.json()
+            mat_data    = data.get("matrix", {})
+            travel_secs = mat_data.get("travelTimes", [])
+            dist_metres = mat_data.get("distances",   [])
+            error_codes = mat_data.get("errorCodes",  [])
+
+            results = []
+            for col, dest_j in enumerate(dest_indices):
+                if col >= len(travel_secs) or col >= len(dist_metres):
+                    continue
+                # errorCodes: 0 = OK, non-zero = routing failure for this cell
+                if error_codes and col < len(error_codes) and error_codes[col] != 0:
+                    continue
+                t_val = travel_secs[col]
+                d_val = dist_metres[col]
+                if t_val is not None and d_val is not None:
+                    results.append((origin_i, dest_j,
+                                    float(d_val) / 1000.0,   # m → km
+                                    float(t_val) / 60.0))    # s → min
+            return results
+
+        except Exception as exc:
+            print(f"[HERE matrix] row {origin_i} exception: {exc}")
+            return None
+
+    # ── Dispatch all row calls concurrently ───────────────────────────────────
+    rows         = list(origin_to_dests.items())   # [(origin_i, [dest_j, ...]), ...]
+    api_calls    = 0
+    pair_hits    = 0
+    failures     = 0
+
+    with ThreadPoolExecutor(max_workers=HERE_BATCH_WORKERS) as pool:
+        futures = {pool.submit(_fetch_row, i, dests): i for i, dests in rows}
         for future in as_completed(futures):
-            # Wall-clock deadline check
             if time.time() > wall_deadline:
-                timed_out = True
                 abort_flag.set()
                 print(f"[HERE matrix] wall-clock deadline exceeded after "
-                      f"{api_calls} successes / {failures} failures — falling back to OSRM")
+                      f"{api_calls} rows / {pair_hits} pairs — falling back to OSRM")
                 pool.shutdown(wait=False, cancel_futures=True)
                 return None, None
 
             result = future.result()
             if result is None:
                 failures += 1
-                if failures > n_pairs * HERE_FAIL_THRESHOLD:
+                if failures > n_rows * HERE_FAIL_THRESHOLD:
                     abort_flag.set()
                     print(f"[HERE matrix] failure threshold exceeded "
-                          f"({failures}/{n_pairs}) — falling back to OSRM")
+                          f"({failures}/{n_rows} rows) — falling back to OSRM")
                     pool.shutdown(wait=False, cancel_futures=True)
                     return None, None
             else:
-                i, j, dist, time_val = result
-                dist_mat[i][j] = dist
-                time_mat[i][j] = time_val
                 api_calls += 1
+                for origin_i, dest_j, dist_km, time_min in result:
+                    dist_mat[origin_i][dest_j] = dist_km
+                    time_mat[origin_i][dest_j] = time_min
+                    pair_hits += 1
 
-    skipped = n * (n - 1) - api_calls
-    print(f"[HERE matrix] ✅ {n}×{n} matrix built with live traffic "
-          f"({api_calls} API calls, {failures} failed→sentinel, {skipped} skipped)")
+    skipped = n * (n - 1) - pair_hits
+    print(f"[HERE matrix] ✅ {n}×{n} built — {api_calls} batch calls, "
+          f"{pair_hits} pairs fetched, {skipped} sentinel-filled, "
+          f"{failures} rows failed→sentinel")
     return dist_mat, time_mat
 
 
