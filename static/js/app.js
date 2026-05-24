@@ -11,6 +11,21 @@ const _B = (window.BACKEND_URL || "").replace(/\/$/, "");
 /** Prepend backend URL to an API path. */
 function apiUrl(path) { return _B + path; }
 
+// Wrap fetch so every cross-origin API call automatically sends session cookies.
+// Without credentials:'include', the browser never attaches the session cookie
+// on Render-frontend → Cloudflare-tunnel-backend requests, causing login_required
+// to fire and return an HTML redirect that breaks res.json().
+;(function () {
+  const _orig = window.fetch.bind(window);
+  window.fetch = function (url, opts) {
+    opts = opts || {};
+    if (typeof url === "string" && _B !== "" && url.startsWith(_B)) {
+      opts = Object.assign({}, opts, { credentials: "include" });
+    }
+    return _orig(url, opts);
+  };
+})();
+
 
 // ─── I18N ─────────────────────────────────────────────────────────────────────
 const TRANSLATIONS = {
