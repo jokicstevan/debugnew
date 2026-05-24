@@ -2740,13 +2740,27 @@ def _alns_optimize(fleet, dist_mat, time_mat, n_depots, n_cust, tw, demands,
         loads[current_v] += dem
         wloads[current_v] += kg
 
-    # NN ordering
+    # Preliminary depot assignment for NN ordering:
+    # pick the depot that minimises total distance to each vehicle's customers.
+    prelim_depot_of = []
+    for v, route in enumerate(routes):
+        if not route or n_depots <= 1:
+            prelim_depot_of.append(0)
+        else:
+            best_d, best_di = float('inf'), 0
+            for di in range(n_depots):
+                total = sum(dist_mat[di][c] for c in route)
+                if total < best_d:
+                    best_d, best_di = total, di
+            prelim_depot_of.append(best_di)
+
+    # NN ordering — sequence each vehicle's customers from its own depot outward
     ordered = []
     for v, route in enumerate(routes):
         if not route:
             ordered.append([])
             continue
-        depot = 0
+        depot = prelim_depot_of[v]
         unvis, cur, nr = route[:], depot, []
         while unvis:
             nn = min(unvis, key=lambda x: dist_mat[cur][x])
