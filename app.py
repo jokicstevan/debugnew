@@ -1382,76 +1382,154 @@ def fetch_osrm_matrix(locations, pairs=None, hav_km=None, sentinel_factor=None):
     hav_km           : optional np.ndarray of precomputed haversine distances (km).
     sentinel_factor  : multiplier for haversine distance to produce sentinel values.
                        Defaults to SENTINEL_FACTOR module constant.
+
+    Batching
+    --------
+    The public OSRM demo server (router.project-osrm.org) rejects requests with
+    more than ~100 locations ("TooBig").  When pairs is provided we group origins
+    with their destinations into greedy batches that stay under OSRM_MAX_LOCS_PER_CALL.
+    Each batch uses OSRM's sources/destinations parameters so only the needed
+    (origin, destination) cells are fetched — every requested pair is covered
+    across the batch set.
     """
-    sf = sentinel_factor if sentinel_factor is not None else SENTINEL_FACTOR
-    n = len(locations)
+    from collections import defaultdict
 
-    # Determine which location indices actually need to be in the OSRM call
-    if pairs is not None:
-        needed_idx = sorted({i for p in pairs for i in p})
-    else:
-        needed_idx = list(range(n))
-
-    sub_locs = [locations[i] for i in needed_idx]
-    idx_map  = {orig: sub for sub, orig in enumerate(needed_idx)}  # orig → sub-matrix index
-
-    coords = ";".join(f"{loc['lng']},{loc['lat']}" for loc in sub_locs)
-    osrm_base = os.environ.get('OSRM_URL', 'https://router.project-osrm.org')
-    url    = f"{osrm_base}/table/v1/driving/{coords}"
+    OSRM_MAX_LOCS_PER_CALL = 100   # conservative; public server limit is ~100
     delays = [2, 5, 10, 15]
+
+    sf = sentinel_factor if sentinel_factor is not None else SENTINEL_FACTOR
+    n  = len(locations)
+
+    osrm_base = os.environ.get('OSRM_URL', 'https://router.project-osrm.org')
     print(f"[OSRM matrix] base URL: {osrm_base}")
-    print(f"[OSRM matrix] requesting {len(needed_idx)} locations, {len(needed_idx)*(len(needed_idx)-1)} pairs")
 
     dist_mat = np.zeros((n, n), dtype=np.float64)
     time_mat = np.zeros((n, n), dtype=np.float64)
 
-    # Pre-fill sentinel values for pairs that won't be fetched.
-    # Vectorised: build a boolean mask once, then write all sentinels together.
-    if pairs is not None and hav_km is not None:
-        skip_mask = np.ones((n, n), dtype=bool)
-        np.fill_diagonal(skip_mask, False)
-        for i, j in pairs:
-            skip_mask[i, j] = False
+    # Pre-fill sentinel values for all off-diagonal pairs; real OSRM values
+    # overwrite them below.
+    if hav_km is not None:
         sentinel_d = hav_km * sf
-        dist_mat[skip_mask] = sentinel_d[skip_mask]
-        time_mat[skip_mask] = sentinel_d[skip_mask] / 30.0 * 60.0
+        dist_mat[:] = sentinel_d
+        time_mat[:] = sentinel_d / 30.0 * 60.0
+    np.fill_diagonal(dist_mat, 0.0)
+    np.fill_diagonal(time_mat, 0.0)
 
+    # ── Build per-origin destination lists ───────────────────────────────────
+    if pairs is not None:
+        origin_dests: dict = defaultdict(list)
+        for i, j in pairs:
+            origin_dests[i].append(j)
+    else:
+        # No pair filter — every location is both origin and destination.
+        origin_dests = {i: [j for j in range(n) if j != i] for i in range(n)}
 
-    for attempt in range(4):
-        try:
-            print(f"[OSRM matrix] attempt {attempt+1}/4 ...")
-            resp = requests.get(url, params={"annotations": "distance,duration"},
-                                headers={"User-Agent": "GRPSWeb/1.0"}, timeout=15)
-            if resp.status_code in (429, 500, 503):
-                print(f"[OSRM matrix] attempt {attempt+1} failed: HTTP {resp.status_code} — retrying in {delays[attempt]}s")
-                time.sleep(delays[attempt]); continue
-            if resp.status_code != 200:
-                print(f"[OSRM matrix] attempt {attempt+1} failed: unexpected HTTP {resp.status_code} body={resp.text[:200]} — retrying in {delays[attempt]}s")
-                time.sleep(delays[attempt]); continue
-            data = resp.json()
-            if data.get("code") != "Ok":
-                print(f"[OSRM matrix] attempt {attempt+1} failed: OSRM code={data.get('code')} message={data.get('message', '')} — retrying in {delays[attempt]}s")
-                time.sleep(delays[attempt]); continue
+    needed_idx = sorted(origin_dests.keys())
+    total_pairs = sum(len(v) for v in origin_dests.values())
+    print(f"[OSRM matrix] {len(needed_idx)} origins, {total_pairs} pairs to fetch")
 
-            # Map sub-matrix results back into the full N×N matrix
-            for si, i in enumerate(needed_idx):
-                for sj, j in enumerate(needed_idx):
-                    if i == j:
-                        continue
-                    d = data["distances"][si][sj]
-                    t = data["durations"][si][sj]
-                    dist_mat[i][j] = (d / 1000.0) if d else 0.0
-                    time_mat[i][j] = (t / 60.0)   if t else 0.0
+    # ── Greedy batch builder ──────────────────────────────────────────────────
+    # Pack as many origins as possible into each batch without exceeding
+    # OSRM_MAX_LOCS_PER_CALL unique location indices per request.
+    batches: list[tuple[list, set]] = []   # [(origin_list, loc_set), ...]
+    cur_origins: list = []
+    cur_locs:    set  = set()
 
-            skipped = n * (n - 1) - len(needed_idx) * (len(needed_idx) - 1)
-            print(f"[OSRM matrix] ✅ {n}×{n} (fetched {len(needed_idx)} locs, "
-                  f"{skipped} sentinel-filled)")
-            return dist_mat, time_mat
-        except Exception as exc:
-            print(f"[OSRM matrix] attempt {attempt+1} exception: {type(exc).__name__}: {exc}")
-            time.sleep(delays[attempt])
-    print(f"[OSRM matrix] ❌ all 4 attempts failed — falling back to haversine")
-    return None, None
+    for orig in needed_idx:
+        dests    = origin_dests[orig]
+        new_locs = {orig} | set(dests)
+        if cur_locs and len(cur_locs | new_locs) > OSRM_MAX_LOCS_PER_CALL:
+            batches.append((cur_origins, cur_locs))
+            cur_origins, cur_locs = [], set()
+        cur_origins.append(orig)
+        cur_locs |= new_locs
+
+    if cur_origins:
+        batches.append((cur_origins, cur_locs))
+
+    print(f"[OSRM matrix] {len(needed_idx)} unique locs → {len(batches)} batch call(s) "
+          f"(max {OSRM_MAX_LOCS_PER_CALL} locs/call)")
+
+    # ── Execute batches ───────────────────────────────────────────────────────
+    filled_pairs   = 0
+    failed_batches = 0
+
+    for batch_no, (batch_origins, batch_locs) in enumerate(batches):
+        sorted_locs  = sorted(batch_locs)
+        sub_locs     = [locations[i] for i in sorted_locs]
+        orig_to_sub  = {orig: sub for sub, orig in enumerate(sorted_locs)}
+
+        source_sub_idx = [orig_to_sub[o] for o in batch_origins]
+        dest_sub_idx   = sorted({orig_to_sub[d]
+                                  for o in batch_origins
+                                  for d in origin_dests[o]
+                                  if d in orig_to_sub})
+
+        coords_str = ";".join(f"{loc['lng']},{loc['lat']}" for loc in sub_locs)
+        batch_url  = f"{osrm_base}/table/v1/driving/{coords_str}"
+        params     = {
+            "annotations":   "distance,duration",
+            "sources":       ";".join(str(s) for s in source_sub_idx),
+            "destinations":  ";".join(str(d) for d in dest_sub_idx),
+        }
+
+        success = False
+        for attempt in range(4):
+            try:
+                print(f"[OSRM matrix] batch {batch_no+1}/{len(batches)} "
+                      f"({len(sorted_locs)} locs, {len(source_sub_idx)} src × "
+                      f"{len(dest_sub_idx)} dst) attempt {attempt+1}/4")
+                resp = requests.get(batch_url, params=params,
+                                    headers={"User-Agent": "GRPSWeb/1.0"}, timeout=15)
+                if resp.status_code in (429, 500, 503):
+                    print(f"[OSRM matrix] batch {batch_no+1} attempt {attempt+1}: "
+                          f"HTTP {resp.status_code} — retrying in {delays[attempt]}s")
+                    time.sleep(delays[attempt]); continue
+                if resp.status_code != 200:
+                    print(f"[OSRM matrix] batch {batch_no+1} attempt {attempt+1}: "
+                          f"unexpected HTTP {resp.status_code} "
+                          f"body={resp.text[:300]} — retrying in {delays[attempt]}s")
+                    time.sleep(delays[attempt]); continue
+                data = resp.json()
+                if data.get("code") != "Ok":
+                    print(f"[OSRM matrix] batch {batch_no+1} attempt {attempt+1}: "
+                          f"OSRM code={data.get('code')} "
+                          f"message={data.get('message', '')} — retrying in {delays[attempt]}s")
+                    time.sleep(delays[attempt]); continue
+
+                # Map results back into the full N×N matrix
+                dest_orig_idx = [sorted_locs[s] for s in dest_sub_idx]
+                for row_no, orig_i in enumerate(batch_origins):
+                    for col_no, dest_j in enumerate(dest_orig_idx):
+                        if orig_i == dest_j:
+                            continue
+                        d = data["distances"][row_no][col_no]
+                        t = data["durations"][row_no][col_no]
+                        dist_mat[orig_i][dest_j] = (d / 1000.0) if d else 0.0
+                        time_mat[orig_i][dest_j] = (t / 60.0)   if t else 0.0
+                        filled_pairs += 1
+
+                print(f"[OSRM matrix] batch {batch_no+1}/{len(batches)} ✅")
+                success = True
+                break
+
+            except Exception as exc:
+                print(f"[OSRM matrix] batch {batch_no+1} attempt {attempt+1} "
+                      f"exception: {type(exc).__name__}: {exc}")
+                time.sleep(delays[attempt])
+
+        if not success:
+            failed_batches += 1
+            print(f"[OSRM matrix] batch {batch_no+1}/{len(batches)} ❌ all attempts failed")
+
+    if failed_batches > 0:
+        print(f"[OSRM matrix] ❌ {failed_batches}/{len(batches)} batches failed — returning None")
+        return None, None
+
+    skipped = n * (n - 1) - filled_pairs
+    print(f"[OSRM matrix] ✅ {n}×{n} complete — {len(batches)} batch call(s), "
+          f"{filled_pairs} pairs fetched, {skipped} sentinel-filled")
+    return dist_mat, time_mat
 
 
 def haversine(lat1, lon1, lat2, lon2):
