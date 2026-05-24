@@ -1396,8 +1396,11 @@ def fetch_osrm_matrix(locations, pairs=None, hav_km=None, sentinel_factor=None):
     idx_map  = {orig: sub for sub, orig in enumerate(needed_idx)}  # orig → sub-matrix index
 
     coords = ";".join(f"{loc['lng']},{loc['lat']}" for loc in sub_locs)
-    url    = f"{os.environ.get('OSRM_URL', 'https://router.project-osrm.org')}/table/v1/driving/{coords}"
+    osrm_base = os.environ.get('OSRM_URL', 'https://router.project-osrm.org')
+    url    = f"{osrm_base}/table/v1/driving/{coords}"
     delays = [2, 5, 10, 15]
+    print(f"[OSRM matrix] base URL: {osrm_base}")
+    print(f"[OSRM matrix] requesting {len(needed_idx)} locations, {len(needed_idx)*(len(needed_idx)-1)} pairs")
 
     dist_mat = np.zeros((n, n), dtype=np.float64)
     time_mat = np.zeros((n, n), dtype=np.float64)
@@ -1416,14 +1419,18 @@ def fetch_osrm_matrix(locations, pairs=None, hav_km=None, sentinel_factor=None):
 
     for attempt in range(4):
         try:
+            print(f"[OSRM matrix] attempt {attempt+1}/4 ...")
             resp = requests.get(url, params={"annotations": "distance,duration"},
                                 headers={"User-Agent": "GRPSWeb/1.0"}, timeout=15)
             if resp.status_code in (429, 500, 503):
+                print(f"[OSRM matrix] attempt {attempt+1} failed: HTTP {resp.status_code} — retrying in {delays[attempt]}s")
                 time.sleep(delays[attempt]); continue
             if resp.status_code != 200:
+                print(f"[OSRM matrix] attempt {attempt+1} failed: unexpected HTTP {resp.status_code} body={resp.text[:200]} — retrying in {delays[attempt]}s")
                 time.sleep(delays[attempt]); continue
             data = resp.json()
             if data.get("code") != "Ok":
+                print(f"[OSRM matrix] attempt {attempt+1} failed: OSRM code={data.get('code')} message={data.get('message', '')} — retrying in {delays[attempt]}s")
                 time.sleep(delays[attempt]); continue
 
             # Map sub-matrix results back into the full N×N matrix
@@ -1440,8 +1447,10 @@ def fetch_osrm_matrix(locations, pairs=None, hav_km=None, sentinel_factor=None):
             print(f"[OSRM matrix] ✅ {n}×{n} (fetched {len(needed_idx)} locs, "
                   f"{skipped} sentinel-filled)")
             return dist_mat, time_mat
-        except Exception:
+        except Exception as exc:
+            print(f"[OSRM matrix] attempt {attempt+1} exception: {type(exc).__name__}: {exc}")
             time.sleep(delays[attempt])
+    print(f"[OSRM matrix] ❌ all 4 attempts failed — falling back to haversine")
     return None, None
 
 
@@ -1604,10 +1613,14 @@ def fetch_best_matrix(locations, k_nearest=None, sentinel_factor=None,
         if d is not None:
             t = _blend_historical(t, locations, departure_min, pairs, blend_w)
             return d, t, "here"
+        print(f"[fetch_best_matrix] HERE returned None — trying OSRM")
+    else:
+        print(f"[fetch_best_matrix] HERE_API_KEY not set — skipping HERE, trying OSRM")
     d, t = fetch_osrm_matrix(locations, pairs=pairs, hav_km=hav_km, sentinel_factor=sf)
     if d is not None:
         t = _blend_historical(t, locations, departure_min, pairs, blend_w)
         return d, t, "osrm"
+    print(f"[fetch_best_matrix] OSRM returned None — falling back to haversine (straight-line estimates)")
     d, t = build_haversine_matrix(locations)
     return d, t, "haversine"
 
