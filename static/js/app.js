@@ -1507,7 +1507,7 @@ function drawRoutes(data) {
     state.customers.forEach(c => {
       (_nameQueue[c.name] = _nameQueue[c.name] || []).push(c);
     });
-    (vr.stops || []).forEach(stop => {
+    (vr.stops || []).forEach((stop, stopIdx) => {
       const custEntry = (_nameQueue[stop.name] || []).shift();
       if (custEntry && state.markers[custEntry.id]) {
         const flag = stop.violation > 0 ? ` ⚠️ +${stop.violation}m late`
@@ -1521,10 +1521,19 @@ function drawRoutes(data) {
           `🚪 Departs: ${stop.depart}<br>` +
           `⏱ Window: ${stop.tw_start}–${stop.tw_end}${flag}`
         );
-        try {
-          const el = state.markers[custEntry.id].getElement();
-          if (el) { const dot = el.querySelector('div'); if (dot) dot.style.background = vr.color; }
-        } catch(e) {}
+        // Update marker icon to show visit-order number in vehicle colour
+        const visitNum = stopIdx + 1;
+        state.markers[custEntry.id].setIcon(L.divIcon({
+          className: '',
+          html: `<div style="
+            width:26px;height:26px;border-radius:50%;
+            background:${vr.color};border:3px solid #fff;
+            box-shadow:0 2px 6px rgba(0,0,0,.45);
+            color:#fff;font-size:11px;font-weight:700;
+            display:flex;align-items:center;justify-content:center;
+            line-height:1;">${visitNum}</div>`,
+          iconSize:[26,26], iconAnchor:[13,13], popupAnchor:[0,-16]
+        }));
       }
     });
   });
