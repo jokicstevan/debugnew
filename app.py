@@ -48,6 +48,8 @@ from reportlab.lib.enums import TA_CENTER, TA_LEFT
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "grps-secret-2024-change-me")
 app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024  # 10 MB upload limit
+app.config["SESSION_COOKIE_SAMESITE"] = "None"
+app.config["SESSION_COOKIE_SECURE"]   = True
 
 # ── Cross-origin session cookies (Render frontend → local backend via Cloudflare)
 # RENDER_FRONTEND_URL must be set to your Render app URL, e.g. https://grps-routing.onrender.com
