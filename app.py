@@ -19,6 +19,8 @@ def _json_default(obj):
     Without this, json.dumps() raises TypeError and _job_set_done() silently
     discards the optimization result, leaving the job stuck as 'running'.
     """
+    if isinstance(obj, np.bool_):
+        return bool(obj)
     if isinstance(obj, np.integer):
         return int(obj)
     if isinstance(obj, np.floating):
@@ -255,16 +257,18 @@ def _job_create(job_id: str, owner: str):
 
 
 def _job_set_done(job_id: str, result_dict: dict):
+    # Sanitize numpy types once so both storage paths get plain Python objects.
+    clean = json.loads(json.dumps(result_dict, default=_json_default))
     if not DATABASE_URL:
         if job_id in _local_jobs:
-            _local_jobs[job_id].update({"status": "done", "result": result_dict})
+            _local_jobs[job_id].update({"status": "done", "result": clean})
         return
     try:
         conn = _get_db_conn()
         cur  = conn.cursor()
         cur.execute(
             "UPDATE grps_jobs SET status='done', result_json=%s, updated_at=NOW() WHERE job_id=%s",
-            (json.dumps(result_dict, default=_json_default), job_id)
+            (json.dumps(clean), job_id)
         )
         conn.commit()
         conn.close()
@@ -272,7 +276,7 @@ def _job_set_done(job_id: str, result_dict: dict):
         print(f"[jobs] set_done failed: {exc}")
         # DB write failed — fall back to in-process dict so the result is not lost.
         # This covers DB unavailability, connection limits, and serialization errors.
-        _local_jobs[job_id] = {"status": "done", "result": result_dict}
+        _local_jobs[job_id] = {"status": "done", "result": clean}
 
 
 def _job_set_error(job_id: str, error: str):
