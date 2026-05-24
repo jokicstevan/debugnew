@@ -10,6 +10,9 @@ venv/
 uploads/
 reports/
 
+# Render build output (generated, not committed)
+dist/
+
 # OS
 .DS_Store
 Thumbs.db

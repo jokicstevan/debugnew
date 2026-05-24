@@ -8,58 +8,28 @@
 <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Syne:wght@700;800&display=swap" rel="stylesheet">
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-
   :root {
-    --bg: #0d1117;
-    --surface: #161b22;
-    --border: #30363d;
-    --accent: #2ecc71;
-    --accent2: #3498db;
-    --text: #e6edf3;
-    --muted: #8b949e;
-    --danger: #e74c3c;
+    --bg: #0d1117; --surface: #161b22; --border: #30363d;
+    --accent: #2ecc71; --accent2: #3498db; --text: #e6edf3;
+    --muted: #8b949e; --danger: #e74c3c;
   }
-
   body {
-    font-family: 'DM Mono', monospace;
-    background: var(--bg);
-    color: var(--text);
-    min-height: 100vh;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    overflow: hidden;
+    font-family: 'DM Mono', monospace; background: var(--bg); color: var(--text);
+    min-height: 100vh; display: flex; align-items: center; justify-content: center; overflow: hidden;
   }
-
   body::before {
-    content: '';
-    position: fixed; inset: 0;
-    background-image:
-      linear-gradient(rgba(46,204,113,.04) 1px, transparent 1px),
-      linear-gradient(90deg, rgba(46,204,113,.04) 1px, transparent 1px);
-    background-size: 40px 40px;
-    pointer-events: none;
+    content: ''; position: fixed; inset: 0;
+    background-image: linear-gradient(rgba(46,204,113,.04) 1px, transparent 1px),
+                      linear-gradient(90deg, rgba(46,204,113,.04) 1px, transparent 1px);
+    background-size: 40px 40px; pointer-events: none;
   }
-
   .login-wrap { width: 380px; animation: fadeUp .5s ease both; }
-
-  @keyframes fadeUp {
-    from { opacity:0; transform:translateY(24px); }
-    to   { opacity:1; transform:translateY(0); }
-  }
-
+  @keyframes fadeUp { from { opacity:0; transform:translateY(24px); } to { opacity:1; transform:translateY(0); } }
   .logo { text-align: center; margin-bottom: 36px; }
-  .logo-mark {
-    display: inline-block;
-    font-family: 'Syne', sans-serif;
-    font-size: 42px; font-weight: 800;
-    letter-spacing: -2px; color: var(--accent); line-height: 1;
-  }
+  .logo-mark { display: inline-block; font-family: 'Syne', sans-serif; font-size: 42px; font-weight: 800; letter-spacing: -2px; color: var(--accent); line-height: 1; }
   .logo-sub { font-size: 11px; color: var(--muted); letter-spacing: .18em; text-transform: uppercase; margin-top: 6px; }
-
   .card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 32px; }
   .card h2 { font-family: 'Syne', sans-serif; font-size: 18px; font-weight: 700; margin-bottom: 24px; color: var(--text); }
-
   .field { margin-bottom: 16px; }
   .field label { display: block; font-size: 11px; color: var(--muted); letter-spacing: .1em; text-transform: uppercase; margin-bottom: 6px; }
   .field input {
@@ -68,13 +38,11 @@
     font-size: 14px; padding: 10px 14px; outline: none; transition: border-color .2s;
   }
   .field input:focus { border-color: var(--accent2); }
-
   .error-msg {
     background: rgba(231,76,60,.1); border: 1px solid rgba(231,76,60,.3);
     border-radius: 7px; color: var(--danger); font-size: 12px;
-    padding: 10px 14px; margin-bottom: 16px;
+    padding: 10px 14px; margin-bottom: 16px; display: none;
   }
-
   .btn-login {
     width: 100%; background: var(--accent); color: #0d1117; border: none;
     border-radius: 7px; font-family: 'Syne', sans-serif; font-size: 15px;
@@ -83,10 +51,9 @@
   }
   .btn-login:hover  { opacity: .88; }
   .btn-login:active { transform: scale(.98); }
-
+  .btn-login:disabled { opacity: .5; cursor: not-allowed; }
   .hint { text-align: center; font-size: 11px; color: var(--muted); margin-top: 20px; }
   .hint code { color: var(--accent2); }
-
   .lang-row { display:flex; justify-content:center; gap:8px; margin-bottom:18px; }
   .lang-btn {
     font-family: 'DM Mono', monospace; font-size: 11px;
@@ -110,24 +77,55 @@
   </div>
   <div class="card">
     <h2 id="signin-title">Sign in</h2>
-    {% if error %}
-    <div class="error-msg">{{ error }}</div>
-    {% endif %}
-    <form method="POST">
-      <div class="field">
-        <label id="label-user">Username</label>
-        <input type="text" name="username" autocomplete="username" autofocus>
-      </div>
-      <div class="field">
-        <label id="label-pass">Password</label>
-        <input type="password" name="password" autocomplete="current-password">
-      </div>
-      <button type="submit" class="btn-login" id="btn-signin">Sign in →</button>
-    </form>
+    <div class="error-msg" id="error-msg"></div>
+    <div class="field">
+      <label id="label-user">Username</label>
+      <input type="text" id="inp-user" autocomplete="username" autofocus>
+    </div>
+    <div class="field">
+      <label id="label-pass">Password</label>
+      <input type="password" id="inp-pass" autocomplete="current-password">
+    </div>
+    <button class="btn-login" id="btn-signin" onclick="doLogin()">Sign in →</button>
   </div>
   <div class="hint" id="hint-default">Default: <code>admin</code> / <code>grps2024</code></div>
 </div>
 <script>
+// ── Backend URL (injected at build time by Render, same as index.html) ───────
+window.BACKEND_URL = "%%BACKEND_URL%%";
+const _b = (window.BACKEND_URL || "").replace(/\/$/, "");
+
+async function doLogin() {
+  const u = document.getElementById('inp-user').value.trim();
+  const p = document.getElementById('inp-pass').value;
+  const btn = document.getElementById('btn-signin');
+  const err = document.getElementById('error-msg');
+  btn.disabled = true;
+  err.style.display = 'none';
+  try {
+    const res = await fetch(_b + '/api/login', {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: u, password: p })
+    });
+    const data = await res.json();
+    if (data.ok) {
+      window.location.href = 'index.html';
+    } else {
+      err.textContent = data.error || 'Invalid credentials';
+      err.style.display = 'block';
+    }
+  } catch (e) {
+    err.textContent = 'Cannot reach backend. Check tunnel.';
+    err.style.display = 'block';
+  }
+  btn.disabled = false;
+}
+
+// Allow Enter key to submit
+document.addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
+
 const LOGIN_I18N = {
   en: { sub:'Global Route Planning System', title:'Sign in', user:'Username', pass:'Password', btn:'Sign in →', hint:'Default: ' },
   sr: { sub:'Globalni sistem planiranja ruta', title:'Prijavite se', user:'Korisničko ime', pass:'Lozinka', btn:'Prijava →', hint:'Podrazumevano: ' }

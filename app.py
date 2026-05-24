@@ -4,6 +4,8 @@ Flask backend: auth, optimization, OSRM, PDF, Excel import
 """
 
 import os, copy, math, json, io, tempfile, threading, time
+# ── CORS (needed for cross-origin Render frontend → local backend) ─────────────
+from flask_cors import CORS
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 import numpy as np
@@ -46,6 +48,22 @@ from reportlab.lib.enums import TA_CENTER, TA_LEFT
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "grps-secret-2024-change-me")
 app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024  # 10 MB upload limit
+
+# ── Cross-origin session cookies (Render frontend → local backend via Cloudflare)
+# RENDER_FRONTEND_URL must be set to your Render app URL, e.g. https://grps-routing.onrender.com
+# Multiple origins can be comma-separated: https://grps.onrender.com,https://grps-staging.onrender.com
+_frontend_origins_raw = os.environ.get("RENDER_FRONTEND_URL", "")
+_frontend_origins = [o.strip().rstrip("/") for o in _frontend_origins_raw.split(",") if o.strip()]
+CORS(
+    app,
+    origins=_frontend_origins or "*",   # * only used in local dev when env var not set
+    supports_credentials=True,           # allow cookies / session
+    allow_headers=["Content-Type", "X-Requested-With"],
+    methods=["GET", "POST", "DELETE", "OPTIONS"],
+)
+# Cookies must be SameSite=None; Secure when sent cross-origin (Render HTTPS → local HTTPS via CF tunnel)
+app.config["SESSION_COOKIE_SAMESITE"] = "None"
+app.config["SESSION_COOKIE_SECURE"]   = True
 UPLOAD_FOLDER = os.path.join(os.path.dirname(__file__), "uploads")
 REPORT_FOLDER = os.path.join(os.path.dirname(__file__), "reports")
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -750,6 +768,32 @@ def login():
         error = "Invalid credentials"
     return render_template("login.html", error=error)
 
+# ── JSON auth endpoints for Render frontend ────────────────────────────────────
+
+@app.route("/api/login", methods=["POST"])
+def api_login():
+    """JSON login — used by the Render static frontend."""
+    data = request.get_json(silent=True) or {}
+    u = data.get("username", "").strip()
+    p = data.get("password", "")
+    if USERS.get(u) == p:
+        session["user"] = u
+        return jsonify({"ok": True, "user": u})
+    return jsonify({"ok": False, "error": "Invalid credentials"}), 401
+
+@app.route("/api/logout", methods=["POST"])
+def api_logout():
+    """JSON logout."""
+    session.clear()
+    return jsonify({"ok": True})
+
+@app.route("/api/me")
+def api_me():
+    """Returns current session user, or 401 if not logged in."""
+    if "user" not in session:
+        return jsonify({"ok": False}), 401
+    return jsonify({"ok": True, "user": session["user"]})
+
 @app.route("/logout")
 def logout():
     session.clear()
@@ -1344,7 +1388,7 @@ def fetch_osrm_matrix(locations, pairs=None, hav_km=None, sentinel_factor=None):
     idx_map  = {orig: sub for sub, orig in enumerate(needed_idx)}  # orig → sub-matrix index
 
     coords = ";".join(f"{loc['lng']},{loc['lat']}" for loc in sub_locs)
-    url    = f"https://router.project-osrm.org/table/v1/driving/{coords}"
+    url    = f"{os.environ.get('OSRM_URL', 'https://router.project-osrm.org')}/table/v1/driving/{coords}"
     delays = [2, 5, 10, 15]
 
     dist_mat = np.zeros((n, n), dtype=np.float64)
@@ -1492,7 +1536,7 @@ def straight_line_geometry(waypoints):
 def fetch_osrm_route(waypoints):
     """Fetch road geometry from OSRM. Falls back to straight-line."""
     coord_str = ";".join(f"{lng},{lat}" for lng, lat in waypoints)
-    url       = f"https://router.project-osrm.org/route/v1/driving/{coord_str}"
+    url       = f"{os.environ.get('OSRM_URL', 'https://router.project-osrm.org')}/route/v1/driving/{coord_str}"
     delays    = [2, 5, 10, 15]
     for attempt in range(4):
         try:

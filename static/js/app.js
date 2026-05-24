@@ -3,6 +3,14 @@
    Covers: Leaflet map, fleet management, route optimization (via Flask API),
            OSRM routing, results panel, legend, route simulation, PDF, Excel.
 ══════════════════════════════════════════════════════════════════════════════ */
+// ─── BACKEND URL ──────────────────────────────────────────────────────────────
+// In local-backend mode this is set by the <script> in index.html to the
+// Cloudflare tunnel URL (e.g. https://xxxx.trycloudflare.com).
+// Falls back to "" (same-origin) so the app still works when run locally.
+const _B = (window.BACKEND_URL || "").replace(/\/$/, "");
+/** Prepend backend URL to an API path. */
+function apiUrl(path) { return _B + path; }
+
 
 // ─── I18N ─────────────────────────────────────────────────────────────────────
 const TRANSLATIONS = {
@@ -405,7 +413,7 @@ async function cancelCurrentJob() {
   const jobId = _currentJobId;
   console.log(`[GRPS] ✖ cancelling job ${jobId}`);
   try {
-    const res  = await fetch(`/api/optimize/${jobId}/cancel`, { method: 'POST' });
+    const res  = await fetch(apiUrl(`/api/optimize/${jobId}/cancel`), { method: 'POST' });
     const data = await res.json();
     if (data.ok) {
       console.log(`[GRPS] cancel request accepted for job ${jobId}`);
@@ -728,7 +736,7 @@ async function geocodeAddress() {
   const st = document.getElementById('geocode-status');
   st.textContent = t('searching');
   try {
-    const res = await fetch('/api/geocode', {
+    const res = await fetch(apiUrl('/api/geocode'), {
       method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({ address: addr })
     });
@@ -808,7 +816,7 @@ async function importExcel(input) {
   const st = document.getElementById('geocode-status');
   st.textContent = t('parsingExcel');
   try {
-    const res = await fetch('/api/import_excel', { method:'POST', body: fd });
+    const res = await fetch(apiUrl('/api/import_excel'), { method:'POST', body: fd });
     const data = await res.json();
     input.value = '';
     if (!data.ok) { st.textContent = `❌ ${data.error}`; return; }
@@ -883,7 +891,7 @@ async function confirmExcelImport() {
     }
     st.textContent = t('geocodingProgress')(i, rows.length, r.name);
     try {
-      const res = await fetch('/api/geocode', {
+      const res = await fetch(apiUrl('/api/geocode'), {
         method:'POST', headers:{'Content-Type':'application/json'},
         body: JSON.stringify({ address: r.address })
       });
@@ -1129,7 +1137,7 @@ async function runOptimize() {
   try {
     // ── Step 1: submit job, get job_id immediately ──────────────────────────
     setProgress(5, t('phase1'));
-    const submitRes = await fetch('/api/optimize', {
+    const submitRes = await fetch(apiUrl('/api/optimize'), {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify(payload)
     });
@@ -1164,7 +1172,7 @@ async function runOptimize() {
           return;
         }
         try {
-          const r = await fetch(`/api/optimize/status/${jobId}`);
+          const r = await fetch(apiUrl(`/api/optimize/status/${jobId}`));
           const d = await r.json();
           console.log(`[GRPS] poll job ${jobId.slice(0,8)}: status=${d.status}`);
           if (d.status === 'cancelled') {
@@ -2008,7 +2016,7 @@ async function generatePDF() {
   };
 
   try {
-    const res  = await fetch('/api/pdf', {
+    const res  = await fetch(apiUrl('/api/pdf'), {
       method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify(payload)
     });
@@ -2126,7 +2134,7 @@ async function loadRouteHistory() {
   statusEl.textContent = t('loading');
 
   try {
-    const res  = await fetch('/api/routes');
+    const res  = await fetch(apiUrl('/api/routes'));
     const data = await res.json();
 
     if (!data.ok) {
@@ -2190,7 +2198,7 @@ async function openHistoryRoute(routeId) {
   modal.classList.remove('hidden');
 
   try {
-    const res  = await fetch(`/api/routes/${routeId}`);
+    const res  = await fetch(apiUrl(`/api/routes/${routeId}`));
     const data = await res.json();
     if (!data.ok) { bodyEl.innerHTML = `<div style="color:var(--danger)">${data.error}</div>`; return; }
     const r = data.route;
@@ -2273,7 +2281,7 @@ async function deleteHistoryRoute() {
   if (!_historyCurrentId) return;
   if (!confirm(t('historyDeleteConfirm'))) return;
   try {
-    const res  = await fetch(`/api/routes/${_historyCurrentId}`, { method: 'DELETE' });
+    const res  = await fetch(apiUrl(`/api/routes/${_historyCurrentId}`), { method: 'DELETE' });
     const data = await res.json();
     if (data.ok) {
       closeHistoryModal();
@@ -2500,7 +2508,7 @@ async function confirmSaveWorkspace() {
   try {
     const payload = { name, description: desc, ...snap };
     if (_overwriteWorkspaceId) payload.id = _overwriteWorkspaceId;
-    const res  = await fetch('/api/workspaces', {
+    const res  = await fetch(apiUrl('/api/workspaces'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
@@ -2537,7 +2545,7 @@ async function loadWorkspaceList() {
   statusEl.style.display = 'block';
   listEl.innerHTML = '';
   try {
-    const res  = await fetch('/api/workspaces');
+    const res  = await fetch(apiUrl('/api/workspaces'));
     const data = await res.json();
     statusEl.style.display = 'none';
     if (!data.ok) {
@@ -2574,7 +2582,7 @@ async function openWorkspaceLoadModal(id) {
   document.getElementById('workspace-load-body').innerHTML = '<div style="color:var(--muted);font-size:12px">Loading…</div>';
   document.getElementById('workspace-load-modal').classList.remove('hidden');
   try {
-    const res  = await fetch(`/api/workspaces/${id}`);
+    const res  = await fetch(apiUrl(`/api/workspaces/${id}`));
     const data = await res.json();
     if (!data.ok) {
       document.getElementById('workspace-load-body').innerHTML =
@@ -2623,7 +2631,7 @@ async function confirmDeleteWorkspace() {
   if (!_workspacePendingId) return;
   if (!confirm('Delete this workspace? This cannot be undone.')) return;
   try {
-    const res  = await fetch(`/api/workspaces/${_workspacePendingId}`, { method: 'DELETE' });
+    const res  = await fetch(apiUrl(`/api/workspaces/${_workspacePendingId}`), { method: 'DELETE' });
     const data = await res.json();
     if (data.ok) {
       closeWorkspaceLoadModal();
@@ -2643,7 +2651,7 @@ async function exportWorkspace() {
   const btn = document.getElementById('workspace-export-btn');
   if (btn) { btn.disabled = true; btn.textContent = '⏳ Exporting…'; }
   try {
-    const res = await fetch(`/api/workspaces/${wsId}/export`);
+    const res = await fetch(apiUrl(`/api/workspaces/${wsId}/export`));
     if (!res.ok) {
       const err = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
       alert('Export failed: ' + (err.error || 'Unknown error'));
