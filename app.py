@@ -1043,6 +1043,95 @@ def import_excel():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)})
 
+# ─────────────────────── DRIVER IMPORT ──────────────────────────────────────
+
+@app.route("/api/import_drivers", methods=["POST"])
+@login_required
+def import_drivers():
+    """Parse a driver roster Excel file.
+
+    Expected columns (order matters; headers are flexible):
+      Col 1: Name & Surname  (string)
+      Col 2: Availability    (0 or 1 — 1 = available for this shift)
+      Col 3: Vehicle Preference  (small / medium / large — case-insensitive)
+
+    Returns a JSON array of driver objects:
+      { name, available: bool, vehicle_pref: "small"|"medium"|"large"|null }
+    """
+    if "file" not in request.files:
+        return jsonify({"ok": False, "error": "No file uploaded"})
+    f = request.files["file"]
+    fname = secure_filename(f.filename)
+    path = os.path.join(UPLOAD_FOLDER, fname)
+    f.save(path)
+    try:
+        import openpyxl
+        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+        ws = wb.active
+        rows_iter = ws.iter_rows(values_only=True)
+
+        # Skip header row if first cell looks like a heading (non-numeric)
+        first_row = next(rows_iter, None)
+        if first_row is None:
+            return jsonify({"ok": False, "error": "Empty workbook"})
+
+        def _looks_like_header(row):
+            """True when the first cell is a non-numeric string (typical header)."""
+            v = row[0]
+            if v is None:
+                return False
+            try:
+                float(v)
+                return False
+            except (TypeError, ValueError):
+                return True
+
+        data_rows = []
+        if _looks_like_header(first_row):
+            # First row is a header — skip it, read the rest
+            for row in rows_iter:
+                data_rows.append(row)
+        else:
+            # No header — include the first row
+            data_rows.append(first_row)
+            for row in rows_iter:
+                data_rows.append(row)
+
+        VALID_PREFS = {"small", "medium", "large"}
+        drivers = []
+        errors  = []
+        for rn, row in enumerate(data_rows, start=2):
+            if not row or row[0] is None:
+                continue  # skip blank rows
+            name = str(row[0]).strip() if row[0] is not None else ""
+            if not name:
+                errors.append(f"Row {rn}: missing driver name — skipped")
+                continue
+
+            # Column 2: availability (0 / 1 / True / False / blank → True)
+            avail_raw = row[1] if len(row) > 1 else None
+            try:
+                available = bool(int(float(str(avail_raw)))) if avail_raw is not None else True
+            except (ValueError, TypeError):
+                available = True  # unknown → assume available
+
+            # Column 3: vehicle preference
+            pref_raw  = str(row[2]).strip().lower() if (len(row) > 2 and row[2] is not None) else ""
+            vehicle_pref = pref_raw if pref_raw in VALID_PREFS else None
+
+            drivers.append({
+                "name":         name,
+                "available":    available,
+                "vehicle_pref": vehicle_pref,
+            })
+
+        return jsonify({"ok": True, "drivers": drivers, "errors": errors})
+    except ImportError:
+        return jsonify({"ok": False, "error": "openpyxl not installed"})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+
+
 # ─────────────────────── OSRM MATRIX ─────────────────────────────────────────
 
 # Serbia bounding box
@@ -2067,6 +2156,9 @@ class VRPState:
         self.overlap_weight_rsd   = overlap_weight_rsd   if overlap_weight_rsd   is not None else OVERLAP_WEIGHT_RSD
         self.dist_rsd_per_km      = dist_rsd_per_km      if dist_rsd_per_km      is not None else 20.0
         self.tw_penalty_rsd       = tw_penalty_rsd       if tw_penalty_rsd       is not None else 100.0
+        # Driver soft-penalty support
+        self.driver_assignments      = []   # set externally after construction
+        self.driver_pref_penalty_rsd = 5000.0  # set externally after construction
 
     def fuel_per_100km(self, v, payload_kg=0.0):
         """Base fuel + linear load surcharge.
@@ -2222,6 +2314,21 @@ class VRPState:
                                            self.depot_of,
                                            self.overlap_threshold_km,
                                            self.overlap_weight_rsd)
+        # ── Driver vehicle-preference soft penalty (low priority) ────────────
+        # For each active vehicle v, if a driver assignment exists and the
+        # driver has a vehicle_pref, add a penalty when the vehicle type string
+        # does not contain the preferred size keyword (small/medium/large).
+        if self.driver_assignments and self.driver_pref_penalty_rsd > 0:
+            for v, route in enumerate(self.routes):
+                if not route:
+                    continue
+                if v < len(self.driver_assignments):
+                    assignment = self.driver_assignments[v]
+                    if assignment and assignment.get("vehicle_pref"):
+                        pref = assignment["vehicle_pref"].lower()
+                        vtype = (self.fleet[v].get("type", "") if v < len(self.fleet) else "").lower()
+                        if pref not in vtype:
+                            total += self.driver_pref_penalty_rsd
         return total
 
     def total_distance(self):
@@ -3415,6 +3522,18 @@ def _do_optimize(data, user, job_id=None, cancel_event=None):
         log("✖ cancelled after matrix phase")
         raise JobCancelledError("Cancelled by user")
 
+    # ── Driver assignments ─────────────────────────────────────────────────────
+    # The frontend sends a list of eligible driver objects sorted by index.
+    # We pair each vehicle (in order) with a driver; extras/shortfalls are fine.
+    # driver_assignments[v] = {"name": str, "vehicle_pref": str|None} or None
+    eligible_drivers = data.get("eligible_drivers", [])   # already filtered to available+checked
+    driver_pref_penalty_rsd = float(data.get("driver_pref_penalty_rsd", 5000.0))
+    driver_assignments = []
+    for v in range(len(fleet)):
+        driver_assignments.append(eligible_drivers[v] if v < len(eligible_drivers) else None)
+    log(f"Driver assignments: {len(eligible_drivers)} eligible drivers, "
+        f"pref_penalty={driver_pref_penalty_rsd} RSD")
+
     # Phase 2: run optimiser → VRPState
     log(f"Phase 2: running {algorithm} with {len(fleet)} vehicles, {n_cust} sub-orders "
         f"(expanded from {n_orig_cust} customers)")
@@ -3458,6 +3577,11 @@ def _do_optimize(data, user, job_id=None, cancel_event=None):
                                fuel_price_rsd_l=fuel_price_rsd_l, driver_wage_rsd_h=driver_wage_rsd_h,
                                fuel_load_factor=fuel_load_factor,
                                alns_cooling=alns_cooling, **adv_kwargs)
+    # Attach driver assignments so the objective function can apply
+    # vehicle-preference soft penalties during any post-optimisation evaluation.
+    state.driver_assignments      = driver_assignments
+    state.driver_pref_penalty_rsd = driver_pref_penalty_rsd
+
     log(f"Phase 2 done in {time.time()-_t2:.2f}s — "
         f"active_routes={sum(1 for r in state.routes if r)}, "
         f"objective={state.objective():.2f}")

@@ -645,3 +645,11 @@ body {
   font-family: var(--font-mono);
   white-space: nowrap;
 }
+
+/* ─── Drivers panel ────────────────────────────────────────────────────────── */
+#driver-checklist label:hover {
+  border-color: var(--accent);
+}
+#driver-checklist input[type="checkbox"] {
+  flex-shrink: 0;
+}

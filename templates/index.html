@@ -117,6 +117,55 @@
       </div><!-- /panel-body -->
     </section>
 
+    <!-- Drivers -->
+    <section class="panel" id="panel-drivers">
+      <div class="panel-title" onclick="togglePanel('panel-drivers')">🧑‍✈️ Drivers</div>
+      <div class="panel-body">
+        <div style="font-size:9px;color:var(--muted);margin-bottom:8px;">
+          Import driver roster from Excel (Name &amp; Surname | Availability (0/1) | Vehicle Preference: small/medium/large).
+          Drivers marked unavailable are excluded; vehicle preference is a soft penalty.
+        </div>
+
+        <!-- Import button -->
+        <label class="btn-sm btn-secondary btn-full" style="cursor:pointer;margin-bottom:8px;display:block;text-align:center">
+          📥 Import Drivers Excel
+          <input type="file" id="driver-excel-file" accept=".xlsx,.xls" style="display:none" onchange="importDriversExcel(this)">
+        </label>
+        <div id="driver-import-status" style="font-size:10px;color:var(--muted);margin-bottom:6px"></div>
+
+        <!-- Eligible drivers multi-select dropdown -->
+        <div id="driver-selector-wrap" style="display:none">
+          <div style="font-size:10px;color:var(--muted);letter-spacing:.05em;text-transform:uppercase;margin-bottom:4px">
+            Eligible Drivers for Routing
+          </div>
+          <div style="font-size:9px;color:var(--muted);margin-bottom:6px;font-style:italic">
+            Select which drivers are eligible. Unavailable (0) drivers are pre-deselected.
+          </div>
+          <div id="driver-checklist" style="max-height:200px;overflow-y:auto;display:flex;flex-direction:column;gap:3px;padding:4px 0"></div>
+          <div style="display:flex;gap:4px;margin-top:6px">
+            <button class="btn-sm btn-secondary" style="flex:1" onclick="selectAllDrivers(true)">✅ All</button>
+            <button class="btn-sm btn-secondary" style="flex:1" onclick="selectAllDrivers(false)">☐ None</button>
+          </div>
+        </div>
+
+        <!-- Summary badge -->
+        <div id="driver-summary" style="font-size:9px;color:var(--accent);padding:4px 6px;background:var(--bg3);border-radius:4px;font-family:var(--font-mono);margin-top:6px;display:none"></div>
+
+        <!-- Soft-penalty weight -->
+        <div id="driver-penalty-wrap" style="display:none;margin-top:8px;border-top:1px solid var(--border2);padding-top:8px">
+          <div class="field-row">
+            <label title="RSD penalty added to objective per vehicle that does NOT match its assigned driver's preferred vehicle type. Lower = softer; 0 = disabled.">
+              🔧 Vehicle pref. penalty (RSD)
+            </label>
+            <input type="number" id="driver-pref-penalty" value="5000" min="0" max="999999" step="500">
+          </div>
+          <div style="font-size:9px;color:var(--muted);font-style:italic;margin-top:3px">
+            Added per vehicle-driver mismatch. Higher = solver tries harder to match preferences.
+          </div>
+        </div>
+      </div>
+    </section>
+
     <!-- Fleet -->
     <section class="panel" id="panel-fleet">
       <div class="panel-title" data-i18n="fleet" onclick="togglePanel('panel-fleet')">🚛 Fleet</div>
