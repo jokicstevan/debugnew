@@ -198,6 +198,7 @@ const TRANSLATIONS = {
     twPenaltyRsdLabel: 'TW violation penalty (RSD/min)',
     alnsCoolingLabel: 'ALNS cooling rate',
     histBlendTitle: '🕑 Historical Traffic Blending',
+    depDateLabel: 'Planned delivery date',
     depTimeLabel: 'Planned departure time',
     histBlendWeightLabel: 'Blend weight (0 = live, 1 = historical)',
     routeHistory: '🗄️ Route History',
@@ -391,6 +392,7 @@ const TRANSLATIONS = {
     twPenaltyRsdLabel: 'Kazna kršenja vremenskog okvira (RSD/min)',
     alnsCoolingLabel: 'ALNS stopa hlađenja',
     histBlendTitle: '🕑 Mešanje istorijskih podataka o saobraćaju',
+    depDateLabel: 'Planirani datum dostave',
     depTimeLabel: 'Planirano vreme polaska',
     histBlendWeightLabel: 'Težina mešanja (0 = živo, 1 = istorijsko)',
     routeHistory: '🗄️ Istorija ruta',
@@ -1055,6 +1057,22 @@ function _refreshModalFuelNote(pct) {
 }
 
 // ─── ADVANCED PARAMETERS ─────────────────────────────────────────────────────
+
+const _DAY_NAMES_EN = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+const _DAY_NAMES_SR = ['Nedjelja','Ponedeljak','Utorak','Srijeda','Četvrtak','Petak','Subota'];
+
+function updateDepDayHint() {
+  const el   = document.getElementById('dep-day-hint');
+  const val  = document.getElementById('adv-dep-date')?.value;
+  if (!el) return;
+  if (!val) { el.style.display = 'none'; return; }
+  // new Date('YYYY-MM-DD') parses as UTC midnight; getUTCDay avoids local-tz shift
+  const dow   = new Date(val).getUTCDay();   // 0 = Sunday
+  const names = (state.lang === 'sr') ? _DAY_NAMES_SR : _DAY_NAMES_EN;
+  el.textContent  = `📅 ${names[dow]} — cache will be filtered to ${names[dow]}s only`;
+  el.style.display = '';
+}
+
 function getAdvancedParams() {
   return {
     k_nearest:            parseInt(document.getElementById('adv-k-nearest')?.value)        ?? 10,
@@ -1065,7 +1083,8 @@ function getAdvancedParams() {
     tw_penalty_rsd:       parseFloat(document.getElementById('adv-tw-penalty-rsd')?.value)  ?? 100,
     alns_cooling:         parseFloat(document.getElementById('adv-alns-cooling')?.value)    || 0.995,
     hist_blend_weight:    parseFloat(document.getElementById('adv-hist-blend-weight')?.value) || 0.5,
-    departure_time:       document.getElementById('adv-dep-time')?.value || '',
+    planned_date:         document.getElementById('adv-dep-date')?.value  || '',
+    departure_time:       document.getElementById('adv-dep-time')?.value  || '',
   };
 }
 
@@ -1146,7 +1165,8 @@ async function runOptimize() {
     max_iterations:   parseInt(document.getElementById('max-iter').value)||500,
     temperature:      parseFloat(document.getElementById('temperature').value)||150,
     advanced_params:  getAdvancedParams(),
-    departure_time:   document.getElementById('adv-dep-time')?.value || '',
+    planned_date:     document.getElementById('adv-dep-date')?.value  || '',
+    departure_time:   document.getElementById('adv-dep-time')?.value  || '',
     ...getDriverPayloadExtras(),
   };
 
@@ -2385,7 +2405,8 @@ function _applyWorkspaceSnapshot(ws) {
     if (a.tw_penalty_rsd !== undefined)       document.getElementById('adv-tw-penalty-rsd').value     = a.tw_penalty_rsd;
     if (a.alns_cooling !== undefined)         document.getElementById('adv-alns-cooling').value       = a.alns_cooling;
     if (a.hist_blend_weight !== undefined)    document.getElementById('adv-hist-blend-weight').value  = a.hist_blend_weight;
-    if (a.departure_time !== undefined)       document.getElementById('adv-dep-time').value           = a.departure_time;
+    if (a.planned_date !== undefined)         document.getElementById('adv-dep-date').value            = a.planned_date;
+    if (a.departure_time !== undefined)       document.getElementById('adv-dep-time').value            = a.departure_time;
   }
   if (s.pkg_sizes) {
     document.getElementById('pkg-size-1').value = s.pkg_sizes[0] || 0.10;

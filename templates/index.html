@@ -302,6 +302,13 @@
 
         <div style="border-top:1px solid var(--border2);margin:8px 0 4px;padding-top:6px;font-size:10px;color:var(--muted);letter-spacing:.05em;text-transform:uppercase" data-i18n="histBlendTitle">🕑 Historical Traffic Blending</div>
         <div class="field-row">
+          <label data-i18n="depDateLabel">Planned delivery date</label>
+          <input type="date" id="adv-dep-date" value=""
+                 title="Date of the planned delivery. The solver will use HERE traffic for that exact date and will blend only cache entries from the same day of the week."
+                 onchange="updateDepDayHint()">
+        </div>
+        <div id="dep-day-hint" style="font-size:9px;color:var(--accent);padding:2px 6px 4px;display:none"></div>
+        <div class="field-row">
           <label data-i18n="depTimeLabel">Planned departure time</label>
           <input type="time" id="adv-dep-time" value=""
                  title="Planned departure time (HH:MM). Required for historical traffic blending. Leave blank to use live traffic only.">

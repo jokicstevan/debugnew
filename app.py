@@ -660,7 +660,7 @@ def prefetch_traffic_history(locations, pairs):
     threading.Thread(target=_run, daemon=True).start()
 
 
-def get_historical_time_mat(locations, departure_min, pairs):
+def get_historical_time_mat(locations, departure_min, pairs, day_of_week=None):
     """Build an N×N matrix of *predicted* travel times using historical averages.
 
     For each pair (i, j) we look up all cached observations whose slot_minutes
@@ -669,6 +669,15 @@ def get_historical_time_mat(locations, departure_min, pairs):
     midnight of the overall route departure) as the base; in practice the solver
     uses the same value for all legs because we don't know per-leg times before
     optimisation — a second-pass refinement could supply per-leg estimates.
+
+    Parameters
+    ----------
+    day_of_week : int | None
+        When provided, only cache rows whose ``fetched_at`` falls on that day of
+        the week are included in the average.  Uses PostgreSQL EXTRACT(DOW)
+        convention: 0 = Sunday, 1 = Monday … 6 = Saturday.
+        When None (default) all stored days are averaged together, preserving
+        the original behaviour.
 
     Returns
     -------
@@ -706,12 +715,18 @@ def get_historical_time_mat(locations, departure_min, pairs):
     ii    = [i for i, j in pair_list]
     jj    = [j for i, j in pair_list]
 
+    # Optional day-of-week filter (PostgreSQL DOW: 0=Sun … 6=Sat)
+    dow_clause = "AND EXTRACT(DOW FROM c.fetched_at)::int = %s" if day_of_week is not None else ""
+    params = [olats, olngs, dlats, dlngs, ii, jj, slot_window]
+    if day_of_week is not None:
+        params.append(day_of_week)
+
     hit = miss = 0
     try:
         conn = _get_db_conn()
         cur  = conn.cursor()
         # Single round-trip: join all pairs at once via unnest arrays
-        cur.execute("""
+        cur.execute(f"""
             SELECT p.i, p.j, AVG(c.travel_time_min)
             FROM (
                 SELECT
@@ -728,8 +743,9 @@ def get_historical_time_mat(locations, departure_min, pairs):
               AND c.dest_lat     = p.dlat
               AND c.dest_lng     = p.dlng
               AND c.slot_minutes = ANY(%s)
+              {dow_clause}
             GROUP BY p.i, p.j
-        """, (olats, olngs, dlats, dlngs, ii, jj, slot_window))
+        """, params)
 
         for row in cur.fetchall():
             ri, rj, avg_t = row
@@ -745,8 +761,9 @@ def get_historical_time_mat(locations, departure_min, pairs):
 
     total    = hit + miss
     coverage = hit / total if total > 0 else 0.0
+    dow_note = f", DOW={day_of_week}" if day_of_week is not None else ""
     print(f"[traffic cache] historical lookup: {hit}/{total} pairs covered "
-          f"(slot window {sorted(slot_window)})")
+          f"(slot window {sorted(slot_window)}{dow_note})")
     return hist_mat, coverage
 
 
@@ -1050,10 +1067,19 @@ def import_excel():
 def import_drivers():
     """Parse a driver roster Excel file.
 
-    Expected columns (order matters; headers are flexible):
-      Col 1: Name & Surname  (string)
-      Col 2: Availability    (0 or 1 — 1 = available for this shift)
-      Col 3: Vehicle Preference  (small / medium / large — case-insensitive)
+    Columns are matched by header name (case-insensitive, order doesn't matter):
+      - Name / Ime / Driver / Vozač / Name & Surname / Ime i Prezime  → driver name (required)
+      - Availability / Dostupnost / Avail / Available                  → 0 or 1    (default: 1)
+      - Vehicle Preference / Vozilo / Preference / Pref / Tip /
+        Tip vozila                                                      → small / medium / large (optional)
+
+    When no recognised header row is found, falls back to positional columns
+    (col 1 = name, col 2 = availability, col 3 = vehicle preference).
+
+    Vehicle preference accepts English and Serbian spellings (case-insensitive):
+      small / mali / malo  |  medium / srednji / srednje  |  large / veliki / veliko / big
+
+    Supports both .xlsx and legacy .xls files.
 
     Returns a JSON array of driver objects:
       { name, available: bool, vehicle_pref: "small"|"medium"|"large"|null }
@@ -1065,59 +1091,82 @@ def import_drivers():
     path = os.path.join(UPLOAD_FOLDER, fname)
     f.save(path)
     try:
-        import openpyxl
-        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
-        ws = wb.active
-        rows_iter = ws.iter_rows(values_only=True)
+        # ── load workbook (.xlsx via openpyxl; .xls fallback via xlrd/pandas) ──
+        rows_raw = []
+        try:
+            import openpyxl
+            wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+            ws = wb.active
+            rows_raw = list(ws.iter_rows(values_only=True))
+        except Exception as load_err:
+            try:
+                import pandas as pd
+                df = pd.read_excel(path, engine="xlrd", header=None, dtype=str)
+                rows_raw = [tuple(r) for r in df.itertuples(index=False, name=None)]
+            except Exception:
+                return jsonify({"ok": False, "error": f"Cannot read file: {load_err}"})
 
-        # Skip header row if first cell looks like a heading (non-numeric)
-        first_row = next(rows_iter, None)
-        if first_row is None:
+        if not rows_raw:
             return jsonify({"ok": False, "error": "Empty workbook"})
 
-        def _looks_like_header(row):
-            """True when the first cell is a non-numeric string (typical header)."""
-            v = row[0]
-            if v is None:
-                return False
-            try:
-                float(v)
-                return False
-            except (TypeError, ValueError):
-                return True
+        # ── header aliases ───────────────────────────────────────────────────
+        NAME_ALIASES  = {
+            "name", "ime", "driver", "vozač", "vozac",
+            "name & surname", "name & prezime", "ime i prezime",
+        }
+        AVAIL_ALIASES = {"availability", "dostupnost", "avail", "available"}
+        PREF_ALIASES  = {
+            "vehicle preference", "vozilo", "preference",
+            "pref", "tip", "vehicle pref", "tip vozila",
+        }
+        # Maps raw cell value → canonical pref string
+        PREF_MAP = {
+            "small":   "small",  "mali":    "small",  "malo":    "small",
+            "medium":  "medium", "srednji": "medium", "srednje": "medium",
+            "large":   "large",  "veliki":  "large",  "veliko":  "large",  "big": "large",
+        }
 
-        data_rows = []
-        if _looks_like_header(first_row):
-            # First row is a header — skip it, read the rest
-            for row in rows_iter:
-                data_rows.append(row)
+        # ── detect header row ────────────────────────────────────────────────
+        first = rows_raw[0]
+        header_cells = [str(c).strip().lower() if c is not None else "" for c in first]
+
+        name_idx  = next((i for i, h in enumerate(header_cells) if h in NAME_ALIASES),  None)
+        avail_idx = next((i for i, h in enumerate(header_cells) if h in AVAIL_ALIASES), None)
+        pref_idx  = next((i for i, h in enumerate(header_cells) if h in PREF_ALIASES),  None)
+
+        if name_idx is not None:
+            # First row is a recognised header — use name-mapped columns
+            data_rows = rows_raw[1:]
         else:
-            # No header — include the first row
-            data_rows.append(first_row)
-            for row in rows_iter:
-                data_rows.append(row)
+            # No header found — fall back to strict positional order (col 0/1/2)
+            name_idx, avail_idx, pref_idx = 0, 1, 2
+            data_rows = rows_raw
 
-        VALID_PREFS = {"small", "medium", "large"}
-        drivers = []
-        errors  = []
+        # ── parse data rows ──────────────────────────────────────────────────
+        drivers, errors = [], []
         for rn, row in enumerate(data_rows, start=2):
-            if not row or row[0] is None:
+            if not row or (name_idx < len(row) and row[name_idx] is None):
                 continue  # skip blank rows
-            name = str(row[0]).strip() if row[0] is not None else ""
+
+            name = str(row[name_idx]).strip() if name_idx < len(row) and row[name_idx] is not None else ""
             if not name:
                 errors.append(f"Row {rn}: missing driver name — skipped")
                 continue
 
-            # Column 2: availability (0 / 1 / True / False / blank → True)
-            avail_raw = row[1] if len(row) > 1 else None
+            # Availability (0 / 1 / True / False / blank → True)
+            avail_raw = row[avail_idx] if avail_idx is not None and avail_idx < len(row) else None
             try:
                 available = bool(int(float(str(avail_raw)))) if avail_raw is not None else True
             except (ValueError, TypeError):
-                available = True  # unknown → assume available
+                available = True  # unrecognised value → assume available
 
-            # Column 3: vehicle preference
-            pref_raw  = str(row[2]).strip().lower() if (len(row) > 2 and row[2] is not None) else ""
-            vehicle_pref = pref_raw if pref_raw in VALID_PREFS else None
+            # Vehicle preference
+            pref_raw = (
+                str(row[pref_idx]).strip().lower()
+                if pref_idx is not None and pref_idx < len(row) and row[pref_idx] is not None
+                else ""
+            )
+            vehicle_pref = PREF_MAP.get(pref_raw, None)
 
             drivers.append({
                 "name":         name,
@@ -1154,7 +1203,7 @@ def _here_departure_time():
 # ── HERE Routing (live traffic) ───────────────────────────────────────────────
 
 def fetch_here_matrix(locations, pairs=None, hav_km=None, sentinel_factor=None,
-                      departure_min=None):
+                      departure_min=None, planned_date=None):
     """Build N×N matrix using HERE Matrix Routing API v8 — row-batched.
 
     Instead of one HTTP call per pair (the old approach), this function groups
@@ -1186,6 +1235,9 @@ def fetch_here_matrix(locations, pairs=None, hav_km=None, sentinel_factor=None,
     sentinel_factor : multiplier applied to hav_km for skipped-pair sentinels.
     departure_min   : minutes since midnight for the planned departure
                       (enables live-traffic time prediction).
+    planned_date    : date object for the planned delivery day.  When given,
+                      the HERE call requests traffic for that actual date
+                      (e.g. next Wednesday) rather than today.
     """
     if not HERE_API_KEY:
         return None, None
@@ -1197,9 +1249,9 @@ def fetch_here_matrix(locations, pairs=None, hav_km=None, sentinel_factor=None,
 
     # ── Departure time ────────────────────────────────────────────────────────
     if departure_min is not None:
-        today  = datetime.utcnow().date()
-        dh, dm = divmod(int(departure_min), 60)
-        dep_time = datetime(today.year, today.month, today.day,
+        ref_date = planned_date if planned_date is not None else datetime.utcnow().date()
+        dh, dm   = divmod(int(departure_min), 60)
+        dep_time = datetime(ref_date.year, ref_date.month, ref_date.day,
                             dh % 24, dm % 60).strftime("%Y-%m-%dT%H:%M:%SZ")
         print(f"[HERE matrix] using planned departure time {dep_time}")
     else:
@@ -1746,7 +1798,8 @@ def fetch_osrm_route(waypoints):
 
 
 def fetch_best_matrix(locations, k_nearest=None, sentinel_factor=None,
-                      departure_min=None, hist_blend_weight=None):
+                      departure_min=None, hist_blend_weight=None,
+                      planned_date=None, planned_dow=None):
     """Try HERE (live traffic) → OSRM → haversine. Returns (dist, time, source).
 
     Spatial pre-filtering: for N locations we compute the straight-line
@@ -1768,6 +1821,12 @@ def fetch_best_matrix(locations, k_nearest=None, sentinel_factor=None,
     For pairs with no historical data the live value is kept unchanged.
     The default blend weight (0.5) is a conservative starting point; tune
     it via the Advanced Parameters panel once you have enough cached data.
+
+    When `planned_date` is given the HERE live-traffic call uses that date
+    (so you get real Monday-morning traffic for a future Monday run).
+    When `planned_dow` is also given (0=Sun … 6=Sat, PostgreSQL convention)
+    the historical cache query is restricted to entries recorded on the same
+    day of the week, giving a more accurate weekday-specific average.
     """
     _DEFAULT_HIST_BLEND_WEIGHT = 0.5   # weight given to historical average (0=live only, 1=hist only)
     blend_w = hist_blend_weight if hist_blend_weight is not None else _DEFAULT_HIST_BLEND_WEIGHT
@@ -1779,23 +1838,27 @@ def fetch_best_matrix(locations, k_nearest=None, sentinel_factor=None,
 
     if HERE_API_KEY:
         d, t = fetch_here_matrix(locations, pairs=pairs, hav_km=hav_km,
-                                  sentinel_factor=sf, departure_min=departure_min)
+                                  sentinel_factor=sf, departure_min=departure_min,
+                                  planned_date=planned_date)
         if d is not None:
-            t = _blend_historical(t, locations, departure_min, pairs, blend_w)
+            t = _blend_historical(t, locations, departure_min, pairs, blend_w,
+                                  planned_dow=planned_dow)
             return d, t, "here"
         print(f"[fetch_best_matrix] HERE returned None — trying OSRM")
     else:
         print(f"[fetch_best_matrix] HERE_API_KEY not set — skipping HERE, trying OSRM")
     d, t = fetch_osrm_matrix(locations, pairs=pairs, hav_km=hav_km, sentinel_factor=sf)
     if d is not None:
-        t = _blend_historical(t, locations, departure_min, pairs, blend_w)
+        t = _blend_historical(t, locations, departure_min, pairs, blend_w,
+                              planned_dow=planned_dow)
         return d, t, "osrm"
     print(f"[fetch_best_matrix] OSRM returned None — falling back to haversine (straight-line estimates)")
     d, t = build_haversine_matrix(locations)
     return d, t, "haversine"
 
 
-def _blend_historical(live_time_mat, locations, departure_min, pairs, weight):
+def _blend_historical(live_time_mat, locations, departure_min, pairs, weight,
+                      planned_dow=None):
     """Return a blended time matrix mixing live values with historical averages.
     Pairs with no cached data are left unchanged.  departure_min=None disables
     the blend entirely (returns the original matrix).
@@ -1805,7 +1868,8 @@ def _blend_historical(live_time_mat, locations, departure_min, pairs, weight):
     if departure_min is None or not DATABASE_URL:
         return live_time_mat
 
-    hist_mat, coverage = get_historical_time_mat(locations, departure_min, pairs)
+    hist_mat, coverage = get_historical_time_mat(locations, departure_min, pairs,
+                                                 day_of_week=planned_dow)
     if hist_mat is None or coverage == 0.0:
         return live_time_mat
 
@@ -3298,10 +3362,23 @@ def _do_optimize(data, user, job_id=None, cancel_event=None):
     # to the corresponding original customer row — no extra matrix rows needed.
     all_locs_orig = depots + customers
 
-    # Parse planned departure time for historical traffic blending.
-    # Frontend sends e.g. "08:00"; convert to minutes-since-midnight.
+    # Parse planned delivery date and departure time for historical traffic blending.
+    # Frontend sends planned_date as "YYYY-MM-DD" and departure_time as "HH:MM".
+    # planned_dow is PostgreSQL DOW convention: 0=Sunday, 1=Monday … 6=Saturday.
+    planned_date_str  = data.get("planned_date", "")
     departure_time_str = data.get("departure_time", "")
+    planned_date = None
+    planned_dow  = None   # PostgreSQL EXTRACT(DOW): 0=Sun … 6=Sat
     departure_min = None
+
+    if planned_date_str:
+        try:
+            from datetime import date as _date
+            planned_date = datetime.strptime(planned_date_str, "%Y-%m-%d").date()
+            planned_dow  = planned_date.isoweekday() % 7   # Mon=1→1 … Sun=7→0
+        except Exception:
+            planned_date = None
+
     if departure_time_str:
         try:
             dh, dm = map(int, departure_time_str.split(":"))
@@ -3320,7 +3397,8 @@ def _do_optimize(data, user, job_id=None, cancel_event=None):
     _t1 = time.time()
     dist_mat, time_mat, matrix_source = fetch_best_matrix(
         all_locs_orig, k_nearest=k_nearest, sentinel_factor=sentinel_factor,
-        departure_min=departure_min, hist_blend_weight=hist_blend_weight)
+        departure_min=departure_min, hist_blend_weight=hist_blend_weight,
+        planned_date=planned_date, planned_dow=planned_dow)
     log(f"Phase 1 done in {time.time()-_t1:.2f}s — source={matrix_source}, "
         f"mat_shape={dist_mat.shape}, dist_range=[{dist_mat.min():.2f}, {dist_mat.max():.2f}] km, "
         f"time_range=[{time_mat.min():.2f}, {time_mat.max():.2f}] min")
