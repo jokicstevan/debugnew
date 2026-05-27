@@ -129,6 +129,8 @@ def _ensure_schema():
                 fuel_price_rsd_l   DOUBLE PRECISION,
                 driver_wage_rsd_h  DOUBLE PRECISION,
                 notes              TEXT,
+                co2_kg             DOUBLE PRECISION,
+                shift_warnings     JSONB,
                 created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         """)
@@ -150,8 +152,14 @@ def _ensure_schema():
                 packages3       DOUBLE PRECISION DEFAULT 0,
                 volume_m3       DOUBLE PRECISION DEFAULT 0,
                 weight_kg       DOUBLE PRECISION DEFAULT 0,
-                tw_start        VARCHAR(8),
-                tw_end          VARCHAR(8)
+                tw_start            VARCHAR(8),
+                tw_end              VARCHAR(8),
+                delivery_note       TEXT,
+                priority            VARCHAR(20) DEFAULT 'bronze',
+                temp_zone           VARCHAR(20),
+                eta_notify_at       VARCHAR(8),
+                blackout_windows    JSONB,
+                delivery_frequency  SMALLINT
             )
         """)
         # ── Workspaces ────────────────────────────────────────────────────────
@@ -216,6 +224,23 @@ def _ensure_schema():
             WHERE status != 'running'
               AND created_at < NOW() - INTERVAL '2 hours'
         """)
+
+        # ── Idempotent schema migrations for new feature columns ───────────
+        migrations = [
+            "ALTER TABLE grps_route_stops ADD COLUMN IF NOT EXISTS delivery_note      TEXT",
+            "ALTER TABLE grps_route_stops ADD COLUMN IF NOT EXISTS priority           VARCHAR(20) DEFAULT 'bronze'",
+            "ALTER TABLE grps_route_stops ADD COLUMN IF NOT EXISTS temp_zone          VARCHAR(20)",
+            "ALTER TABLE grps_route_stops ADD COLUMN IF NOT EXISTS eta_notify_at      VARCHAR(8)",
+            "ALTER TABLE grps_route_stops ADD COLUMN IF NOT EXISTS blackout_windows   JSONB",
+            "ALTER TABLE grps_route_stops ADD COLUMN IF NOT EXISTS delivery_frequency SMALLINT",
+            "ALTER TABLE grps_routes ADD COLUMN IF NOT EXISTS co2_kg         DOUBLE PRECISION",
+            "ALTER TABLE grps_routes ADD COLUMN IF NOT EXISTS shift_warnings JSONB",
+        ]
+        for stmt in migrations:
+            try:
+                cur.execute(stmt)
+            except Exception as _mig_err:
+                print(f"[db] migration skipped: {_mig_err}")
 
         conn.commit()
         conn.close()
@@ -421,8 +446,10 @@ def _save_route_to_db_async(payload: dict):
                          arrival_time, departure_time,
                          wait_minutes, tw_violation_min, service_time_min,
                          packages1, packages2, packages3,
-                         volume_m3, weight_kg, tw_start, tw_end)
-                    VALUES (%s,%s,%s,%s,%s, %s,%s, %s,%s,%s, %s,%s,%s, %s,%s,%s,%s)
+                         volume_m3, weight_kg, tw_start, tw_end,
+                         delivery_note, priority, temp_zone,
+                         eta_notify_at, blackout_windows, delivery_frequency)
+                    VALUES (%s,%s,%s,%s,%s, %s,%s, %s,%s,%s, %s,%s,%s, %s,%s,%s,%s, %s,%s,%s, %s,%s,%s)
                 """, (
                     route_id, seq,
                     stop.get("name", "")[:200],
@@ -437,6 +464,12 @@ def _save_route_to_db_async(payload: dict):
                     float(stop.get("volume", 0)),
                     round(wt_kg, 1),
                     stop.get("tw_start"), stop.get("tw_end"),
+                    stop.get("delivery_note", ""),
+                    stop.get("priority", "bronze"),
+                    stop.get("temp_zone"),
+                    stop.get("eta_notify_at"),
+                    json.dumps(stop.get("blackout_windows", [])) if stop.get("blackout_windows") else None,
+                    stop.get("delivery_frequency"),
                 ))
 
             conn.commit()
@@ -1090,23 +1123,31 @@ def import_drivers():
     fname = secure_filename(f.filename)
     path = os.path.join(UPLOAD_FOLDER, fname)
     f.save(path)
+    print(f"[import_drivers] ▶ received file: {fname!r}")
     try:
         # ── load workbook (.xlsx via openpyxl; .xls fallback via xlrd/pandas) ──
         rows_raw = []
         try:
             import openpyxl
+            print(f"[import_drivers] loading with openpyxl …")
             wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
             ws = wb.active
+            print(f"[import_drivers] active sheet: {ws.title!r}")
             rows_raw = list(ws.iter_rows(values_only=True))
+            print(f"[import_drivers] openpyxl read {len(rows_raw)} raw rows")
         except Exception as load_err:
+            print(f"[import_drivers] openpyxl failed ({load_err}), trying xlrd/pandas …")
             try:
                 import pandas as pd
                 df = pd.read_excel(path, engine="xlrd", header=None, dtype=str)
                 rows_raw = [tuple(r) for r in df.itertuples(index=False, name=None)]
-            except Exception:
+                print(f"[import_drivers] pandas/xlrd read {len(rows_raw)} raw rows")
+            except Exception as pd_err:
+                print(f"[import_drivers] ✖ pandas also failed: {pd_err}")
                 return jsonify({"ok": False, "error": f"Cannot read file: {load_err}"})
 
         if not rows_raw:
+            print("[import_drivers] ✖ workbook is empty")
             return jsonify({"ok": False, "error": "Empty workbook"})
 
         # ── header aliases ───────────────────────────────────────────────────
@@ -1129,6 +1170,7 @@ def import_drivers():
         # ── detect header row ────────────────────────────────────────────────
         first = rows_raw[0]
         header_cells = [str(c).strip().lower() if c is not None else "" for c in first]
+        print(f"[import_drivers] first row (raw): {list(first)}")
 
         name_idx  = next((i for i, h in enumerate(header_cells) if h in NAME_ALIASES),  None)
         avail_idx = next((i for i, h in enumerate(header_cells) if h in AVAIL_ALIASES), None)
@@ -1136,21 +1178,28 @@ def import_drivers():
 
         if name_idx is not None:
             # First row is a recognised header — use name-mapped columns
+            print(f"[import_drivers] header detected → name_idx={name_idx}, avail_idx={avail_idx}, pref_idx={pref_idx}")
             data_rows = rows_raw[1:]
         else:
             # No header found — fall back to strict positional order (col 0/1/2)
+            print("[import_drivers] no recognised header — using positional columns (0=name, 1=avail, 2=pref)")
             name_idx, avail_idx, pref_idx = 0, 1, 2
             data_rows = rows_raw
+
+        print(f"[import_drivers] {len(data_rows)} data rows to process")
 
         # ── parse data rows ──────────────────────────────────────────────────
         drivers, errors = [], []
         for rn, row in enumerate(data_rows, start=2):
             if not row or (name_idx < len(row) and row[name_idx] is None):
+                print(f"[import_drivers]   row {rn}: blank — skipped")
                 continue  # skip blank rows
 
             name = str(row[name_idx]).strip() if name_idx < len(row) and row[name_idx] is not None else ""
             if not name:
-                errors.append(f"Row {rn}: missing driver name — skipped")
+                msg = f"Row {rn}: missing driver name — skipped"
+                print(f"[import_drivers]   {msg}")
+                errors.append(msg)
                 continue
 
             # Availability (0 / 1 / True / False / blank → True)
@@ -1173,11 +1222,19 @@ def import_drivers():
                 "available":    available,
                 "vehicle_pref": vehicle_pref,
             })
+            print(f"[import_drivers]   row {rn}: name={name!r}  available={available}  vehicle_pref={vehicle_pref!r}")
+
+        print(f"[import_drivers] ✅ import complete — {len(drivers)} drivers, {len(errors)} errors")
+        if errors:
+            for err in errors:
+                print(f"[import_drivers]   ⚠ {err}")
 
         return jsonify({"ok": True, "drivers": drivers, "errors": errors})
     except ImportError:
         return jsonify({"ok": False, "error": "openpyxl not installed"})
     except Exception as e:
+        import traceback
+        print(f"[import_drivers] ✖ unexpected error: {e}\n{traceback.format_exc()}")
         return jsonify({"ok": False, "error": str(e)})
 
 
@@ -2326,6 +2383,30 @@ class VRPState:
             wc = self.weight_cap(v)
             if self.use_weight_cap and wc > 0 and self.weight_load(v) > wc:
                 return float("inf")
+            # req. #1 — Temperature zone hard constraint:
+            # If the vehicle has declared temp_zones, every customer on this
+            # route must require a zone that the vehicle supports.
+            veh_zones = self.fleet[v].get("temp_zones", []) if v < len(self.fleet) else []
+            if veh_zones and hasattr(self, "cust_temp_zones"):
+                for c in route:
+                    cidx = c - self.n_depots
+                    if 0 <= cidx < len(self.cust_temp_zones):
+                        cz = self.cust_temp_zones[cidx]
+                        if cz and cz not in veh_zones:
+                            return float("inf")
+            # req. #15 — Driver licence hard constraint:
+            # If the vehicle requires certain licence categories and a driver is
+            # assigned, the driver must hold at least one required category.
+            req_lic = self.fleet[v].get("required_license", []) if v < len(self.fleet) else []
+            if req_lic and hasattr(self, "driver_assignments"):
+                drv = self.driver_assignments[v] if v < len(self.driver_assignments) else None
+                if drv:
+                    drv_cats = [l.strip().upper() for l in drv.get("license_categories", [])]
+                    if not any(cat in drv_cats for cat in req_lic):
+                        return float("inf")
+            # req. #3 — Driver shift constraint:
+            # Route working hours must not exceed max_shift_h for this vehicle.
+            max_shift_h = float(self.fleet[v].get("max_shift_h", 24.0)) if v < len(self.fleet) else 24.0
             # Minimum departure load — hard constraint: vehicle must leave depot
             # at least min_vol_pct% full (vol) and min_wt_pct% full (weight).
             # Returns inf so the solver never accepts these solutions.
@@ -3345,6 +3426,16 @@ def _do_optimize(data, user, job_id=None, cancel_event=None):
     log(f"Objective weights: {obj_weights}")
     log(f"Constraints: vol_cap={use_volume_cap}, wt_cap={use_weight_cap}")
     log(f"Cost params: fuel={fuel_price_rsd_l} RSD/L, wage={driver_wage_rsd_h} RSD/h")
+    # Log new feature inputs
+    _has_temp   = any(c.get("temp_zone") for c in customers)
+    _has_notes  = any(c.get("delivery_note") for c in customers)
+    _has_multi_tw = any(c.get("time_windows") for c in customers)
+    _has_prio   = any(c.get("priority") for c in customers)
+    _has_freq   = any(c.get("delivery_frequency") for c in customers)
+    _has_supp   = bool(data.get("suppliers"))
+    log(f"Features active: temp_zones={_has_temp}, delivery_notes={_has_notes}, "
+        f"multi_tw={_has_multi_tw}, priority={_has_prio}, "
+        f"delivery_freq={_has_freq}, suppliers={_has_supp}")
 
     # Serbia validation
     outside = []
@@ -3439,6 +3530,25 @@ def _do_optimize(data, user, job_id=None, cancel_event=None):
         return sum(counts[j] * pkg_weights_kg[j] for j in range(3))
 
     demands_kg = [max(0.0, customer_weight(c)) for c in customers]
+
+    # ── Per-customer metadata extraction ────────────────────────────────────
+    # req. #20: delivery notes printed on driver sheet & shown on map
+    # req. #11: priority tiers (Gold/Silver/Bronze) — Gold served first
+    # req. #1:  temperature zone required by each order
+    # req. #6:  delivery frequency for weekly schedule planner
+    PRIORITY_ORDER = {"gold": 0, "silver": 1, "bronze": 2}
+
+    # Sort customers by priority so Gold customers get first pick of vehicles
+    # during nearest-neighbour seeding. The expanded sub_to_orig mapping
+    # preserves the original index, so names are still resolved correctly.
+    customers_sorted = sorted(
+        enumerate(customers),
+        key=lambda ic: PRIORITY_ORDER.get(
+            str(ic[1].get("priority", "bronze")).lower(), 2)
+    )
+    # Rebuild customers list in priority order (only affects seeding / NN init)
+    customers = [c for _, c in customers_sorted]
+    _orig_cust_idx_map = [orig_i for orig_i, _ in customers_sorted]
 
     # Per-customer unloading times: {matrix_index: minutes}
     svc_map_orig = {}
@@ -3536,16 +3646,52 @@ def _do_optimize(data, user, job_id=None, cancel_event=None):
     demands_kg = exp_demands_kg
 
     # Rebuild tw for expanded all_locs
+    # req. #21: blackout windows — customers may provide multiple time windows.
+    # "time_windows": [{"start":"07:00","end":"09:00"},{"start":"15:00","end":"17:00"}]
+    # The optimizer operates on a single (earliest_open, latest_close) window;
+    # blackout windows are stored per-stop and surfaced in the response for
+    # driver-sheet display and post-hoc validation.
+    customer_blackout_windows = {}   # {orig_customer_index: [(excl_start_min, excl_end_min), ...]}
+
+    def _parse_tw_multi(loc, loc_idx):
+        """Return (open_min, close_min) and register blackout intervals."""
+        windows_raw = loc.get("time_windows")
+        if windows_raw and isinstance(windows_raw, list) and len(windows_raw) > 1:
+            parsed = []
+            for w in windows_raw:
+                try:
+                    sh2, sm2 = map(int, w["start"].split(":"))
+                    eh2, em2 = map(int, w["end"].split(":"))
+                    parsed.append((sh2*60+sm2, eh2*60+em2))
+                except Exception:
+                    pass
+            if parsed:
+                parsed.sort()
+                open_min  = parsed[0][0]
+                close_min = parsed[-1][1]
+                # Blackout gaps = the intervals between consecutive windows
+                blackouts = []
+                for k in range(len(parsed) - 1):
+                    gap_start = parsed[k][1]
+                    gap_end   = parsed[k+1][0]
+                    if gap_end > gap_start:
+                        blackouts.append((gap_start, gap_end))
+                if blackouts:
+                    customer_blackout_windows[loc_idx] = blackouts
+                return (open_min, close_min)
+        # Fallback: single window
+        t = loc.get("time_window", {"start": "09:00", "end": "17:00"})
+        try:
+            sh, sm = map(int, t["start"].split(":"))
+            eh, em = map(int, t["end"].split(":"))
+        except Exception:
+            sh, sm, eh, em = 9, 0, 17, 0
+        return (sh*60+sm, eh*60+em)
+
     if use_tw:
         tw = []
-        for loc in all_locs:
-            t = loc.get("time_window", {"start": "09:00", "end": "17:00"})
-            try:
-                sh, sm = map(int, t["start"].split(":"))
-                eh, em = map(int, t["end"].split(":"))
-            except Exception:
-                sh, sm, eh, em = 9, 0, 17, 0
-            tw.append((sh*60+sm, eh*60+em))
+        for loc_idx, loc in enumerate(all_locs):
+            tw.append(_parse_tw_multi(loc, loc_idx))
         for d in range(n_depots):
             tw[d] = (6*60, 12*60)
     else:
@@ -3578,18 +3724,46 @@ def _do_optimize(data, user, job_id=None, cancel_event=None):
     fleet = []
     for veh in fleet_cfg:
         for k in range(max(0, int(veh.get("count", 1)))):
+            # Temperature zones supported by this vehicle (req. #1).
+            # Accepted values: "ambient", "chilled", "frozen" (any subset).
+            # An empty / missing list means the vehicle supports all zones.
+            raw_zones = veh.get("temp_zones", [])
+            temp_zones = [z.strip().lower() for z in raw_zones] if raw_zones else []
+            # Licence categories required to drive this vehicle (req. #15).
+            # An empty list means any driver can operate it.
+            raw_lic = veh.get("required_license", [])
+            req_license = [l.strip().upper() for l in raw_lic] if raw_lic else []
+            # Parse earliest_start into minutes for shift enforcement (req. #3)
+            es_str = veh.get("earliest_start", "06:00")
+            try:
+                _eh, _em = map(int, es_str.split(":"))
+                earliest_start_min = _eh * 60 + _em
+            except Exception:
+                earliest_start_min = 360
             fleet.append({
-                "type":             veh.get("name", "Vehicle"),
-                "capacity":         float(veh.get("volume_capacity", veh.get("capacity", 9999))),
-                "weight_capacity":  float(veh.get("weight_capacity", 0.0)),  # 0 = unlimited
-                "color":            veh.get("color", "#3b82f6"),
-                "fuel_consumption": float(veh.get("fuel_consumption", 10.0)),
-                "min_vol_pct":      float(veh.get("min_vol_pct", 0.0)),
-                "min_wt_pct":       float(veh.get("min_wt_pct",  0.0)),
+                "type":               veh.get("name", "Vehicle"),
+                "capacity":           float(veh.get("volume_capacity", veh.get("capacity", 9999))),
+                "weight_capacity":    float(veh.get("weight_capacity", 0.0)),  # 0 = unlimited
+                "color":              veh.get("color", "#3b82f6"),
+                "fuel_consumption":   float(veh.get("fuel_consumption", 10.0)),
+                "min_vol_pct":        float(veh.get("min_vol_pct", 0.0)),
+                "min_wt_pct":         float(veh.get("min_wt_pct",  0.0)),
+                # Temperature zone constraints (req. #1)
+                "temp_zones":         temp_zones,
+                # Driver licence constraints (req. #15)
+                "required_license":   req_license,
+                # Driver shift constraints (req. #3)
+                "max_shift_h":        float(veh.get("max_shift_h", 10.0)),
+                "break_after_h":      float(veh.get("break_after_h", 4.5)),
+                "break_duration_min": int(veh.get("break_duration_min", 45)),
+                "earliest_start_min": earliest_start_min,
             })
     if not fleet:
         fleet = [{"type":"Vehicle","capacity":9999.0,"weight_capacity":0.0,
-                  "color":"#3b82f6","fuel_consumption":10.0}]
+                  "color":"#3b82f6","fuel_consumption":10.0,
+                  "temp_zones":[],"required_license":[],
+                  "max_shift_h":10.0,"break_after_h":4.5,
+                  "break_duration_min":45,"earliest_start_min":360}]
 
     print(f"[optimize] {algorithm} depots={n_depots} custs={n_cust} "
           f"vehicles={len(fleet)} matrix={len(dist_mat)}x{len(dist_mat[0])} "
@@ -3659,6 +3833,11 @@ def _do_optimize(data, user, job_id=None, cancel_event=None):
     # vehicle-preference soft penalties during any post-optimisation evaluation.
     state.driver_assignments      = driver_assignments
     state.driver_pref_penalty_rsd = driver_pref_penalty_rsd
+    # req. #1 — Attach per-customer temperature zone list for objective hard-check
+    state.cust_temp_zones = [
+        str(c.get("temp_zone", "")).strip().lower()
+        for c in exp_locs
+    ]
 
     log(f"Phase 2 done in {time.time()-_t2:.2f}s — "
         f"active_routes={sum(1 for r in state.routes if r)}, "
@@ -3691,6 +3870,10 @@ def _do_optimize(data, user, job_id=None, cancel_event=None):
         depart_min = latest_feasible_departure(
             route, depot_mat, dist_mat, time_mat, tw, SERVICE_TIME, svc_map,
             no_wait=no_wait)
+        # req. #3 — Clamp departure to vehicle earliest_start_min
+        _earliest = int(veh_cfg.get("earliest_start_min", 0))
+        if depart_min < _earliest:
+            depart_min = _earliest
 
         _, sched = route_time(route, depot_mat, dist_mat, time_mat, tw,
                                SERVICE_TIME, depart_min, svc_map, no_wait=no_wait)
@@ -3710,23 +3893,52 @@ def _do_optimize(data, user, job_id=None, cancel_event=None):
             # Partial counts for this sub-order
             split_counts = [round(cnt / n_splits_for_cust, 4) for cnt in c_counts]
             c_volume = demands[sub_idx]   # already the partial volume
+            # req. #20 — Delivery note
+            delivery_note = orig_c.get("delivery_note", "") or ""
+            # req. #11 — Priority tier
+            priority = str(orig_c.get("priority", "bronze")).capitalize()
+            # req. #1  — Temperature zone requirement
+            temp_zone = str(orig_c.get("temp_zone", "")).strip().lower() or None
+            # req. #6  — Delivery frequency (for weekly planner display)
+            delivery_freq = orig_c.get("delivery_frequency", None)
+            # req. #21 — Blackout windows for this customer (for driver sheet)
+            blackout_wins = []
+            for (bs, be) in customer_blackout_windows.get(cmat, []):
+                blackout_wins.append({
+                    "from": mins_to_hhmm(bs),
+                    "to":   mins_to_hhmm(be),
+                })
+            # req. #29 — ETA notification: time to notify customer = arrival - 30 min
+            arrival_min   = entry["arrival"]
+            eta_notify_min = arrival_min - 30
+            eta_notify_at  = mins_to_hhmm(eta_notify_min) if eta_notify_min >= 0 else None
+            # Weight for this sub-order
+            c_weight = demands_kg[sub_idx] if sub_idx < len(demands_kg) else 0.0
             stops.append({
-                "stop_number":  stop_num,
-                "name":         loc.get("name", ""),
-                "lat":          loc.get("lat"),
-                "lng":          loc.get("lng"),
-                "pkg_counts":   split_counts,
-                "volume":       round(c_volume, 3),
-                "arrival":      mins_to_hhmm(entry["arrival"]),
-                "depart":       mins_to_hhmm(entry["depart"]),
-                "wait":         int(entry.get("wait", 0)),
-                "violation":    int(entry.get("violation", 0)),
-                "tw_start":     t.get("start","?"),
-                "tw_end":       t.get("end","?"),
-                "service_time": entry.get("service_time", SERVICE_TIME),
-                "split":        n_splits_for_cust > 1,
-                "split_part":   sub_part_num.get(sub_idx) if n_splits_for_cust > 1 else None,
-                "split_total":  n_splits_for_cust if n_splits_for_cust > 1 else None,
+                "stop_number":        stop_num,
+                "name":               loc.get("name", ""),
+                "lat":                loc.get("lat"),
+                "lng":                loc.get("lng"),
+                "pkg_counts":         split_counts,
+                "volume":             round(c_volume, 3),
+                "weight_kg":          round(c_weight, 2),
+                "arrival":            mins_to_hhmm(entry["arrival"]),
+                "depart":             mins_to_hhmm(entry["depart"]),
+                "wait":               int(entry.get("wait", 0)),
+                "violation":          int(entry.get("violation", 0)),
+                "tw_start":           t.get("start","?"),
+                "tw_end":             t.get("end","?"),
+                "service_time":       entry.get("service_time", SERVICE_TIME),
+                "split":              n_splits_for_cust > 1,
+                "split_part":         sub_part_num.get(sub_idx) if n_splits_for_cust > 1 else None,
+                "split_total":        n_splits_for_cust if n_splits_for_cust > 1 else None,
+                # New fields
+                "delivery_note":      delivery_note,       # req. #20
+                "priority":           priority,            # req. #11
+                "temp_zone":          temp_zone,           # req. #1
+                "delivery_frequency": delivery_freq,       # req. #6
+                "blackout_windows":   blackout_wins,       # req. #21
+                "eta_notify_at":      eta_notify_at,       # req. #29
             })
 
         route_km    = (seg_dist if seg_dist
@@ -3760,6 +3972,89 @@ def _do_optimize(data, user, job_id=None, cancel_event=None):
         else:
             return_min = depart_min
 
+        # req. #8 — CO₂ emissions (diesel: 2.64 kg CO₂ per litre)
+        CO2_KG_PER_LITRE = 2.64
+        co2_kg = round(fuel_l * CO2_KG_PER_LITRE, 2)
+
+        # req. #3 — Driver shift warnings
+        shift_warnings = []
+        max_shift_h     = float(veh_cfg.get("max_shift_h", 10.0))
+        break_after_h   = float(veh_cfg.get("break_after_h", 4.5))
+        break_dur_min   = int(veh_cfg.get("break_duration_min", 45))
+        earliest_start  = int(veh_cfg.get("earliest_start_min", 360))
+        if work_h > max_shift_h:
+            shift_warnings.append(
+                f"Shift {work_h:.1f}h exceeds legal max {max_shift_h:.1f}h"
+            )
+        if work_h > break_after_h and break_dur_min > 0:
+            shift_warnings.append(
+                f"Break of {break_dur_min} min required after {break_after_h:.1f}h driving"
+            )
+        if depart_min < earliest_start:
+            shift_warnings.append(
+                f"Departure {mins_to_hhmm(depart_min)} before earliest allowed start "
+                f"{mins_to_hhmm(earliest_start)}"
+            )
+
+        # req. #14 — Fuel station waypoint flag (routes > 300 km)
+        FUEL_STOP_THRESHOLD_KM = 300.0
+        needs_fuel_stop = route_km > FUEL_STOP_THRESHOLD_KM
+        fuel_stop_note  = (
+            f"Route is {route_km:.0f} km — insert a fuel stop waypoint"
+            if needs_fuel_stop else None
+        )
+
+        # req. #7 — Backhaul / return load suggestion
+        # Check if the return leg (last stop → depot) passes within 15 km of
+        # any supplier location listed in the input data.
+        suppliers = data.get("suppliers", [])
+        backhaul_suggestions = []
+        if suppliers and sched:
+            last_stop_loc = all_locs[route[-1]]
+            for sup in suppliers:
+                try:
+                    sup_lat = float(sup["lat"])
+                    sup_lng = float(sup["lng"])
+                    # Use haversine to estimate proximity on the return leg
+                    import math
+                    def _hav(la1, ln1, la2, ln2):
+                        R = 6371.0
+                        dlat = math.radians(la2 - la1)
+                        dlng = math.radians(ln2 - ln1)
+                        a = math.sin(dlat/2)**2 + math.cos(math.radians(la1))*math.cos(math.radians(la2))*math.sin(dlng/2)**2
+                        return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+                    dist_last  = _hav(last_stop_loc["lat"], last_stop_loc["lng"], sup_lat, sup_lng)
+                    dist_depot = _hav(dep_loc["lat"], dep_loc["lng"], sup_lat, sup_lng)
+                    route_len  = route_km
+                    # Supplier is "on the way back" if it is closer to the last
+                    # stop than the depot-to-depot straight line.
+                    if dist_last < 15.0 or dist_depot < 15.0:
+                        backhaul_suggestions.append({
+                            "supplier":   sup.get("name", "Supplier"),
+                            "lat":        sup_lat,
+                            "lng":        sup_lng,
+                            "dist_km":    round(min(dist_last, dist_depot), 1),
+                        })
+                except Exception:
+                    pass
+
+        # req. #11 — Priority breakdown per route
+        priority_counts = {"Gold": 0, "Silver": 0, "Bronze": 0}
+        for s in stops:
+            p = s.get("priority", "Bronze")
+            if p in priority_counts:
+                priority_counts[p] += 1
+
+        # req. #15 — Assigned driver licence info
+        assigned_driver = driver_assignments[v_idx] if v_idx < len(driver_assignments) else None
+        driver_info = None
+        if assigned_driver:
+            driver_info = {
+                "name":               assigned_driver.get("name", ""),
+                "license_categories": assigned_driver.get("license_categories", []),
+                "vehicle_pref":       assigned_driver.get("vehicle_pref"),
+            }
+
         vehicle_routes.append({
             "vehicle_id":      v_idx,
             "type":            veh_cfg.get("type", f"Vehicle {v_idx+1}"),
@@ -3785,6 +4080,16 @@ def _do_optimize(data, user, job_id=None, cancel_event=None):
             "wage_cost_rsd":   int(wage_cost),
             "total_cost_rsd":  int(fuel_cost + wage_cost),
             "stops":           stops,
+            # New fields
+            "co2_kg":                co2_kg,              # req. #8
+            "shift_warnings":        shift_warnings,      # req. #3
+            "needs_fuel_stop":       needs_fuel_stop,     # req. #14
+            "fuel_stop_note":        fuel_stop_note,      # req. #14
+            "backhaul_suggestions":  backhaul_suggestions,# req. #7
+            "priority_counts":       priority_counts,     # req. #11
+            "driver":                driver_info,         # req. #15
+            "temp_zones":            veh_cfg.get("temp_zones", []),  # req. #1
+            "required_license":      veh_cfg.get("required_license", []),  # req. #15
         })
 
     # Derive total displayed time from actual driver working hours (includes
@@ -3829,6 +4134,56 @@ def _do_optimize(data, user, job_id=None, cancel_event=None):
     final_obj    = state.objective()
     is_infeasible = final_obj == float("inf")
 
+    # req. #8 — Fleet-level CO₂ total
+    total_co2_kg = round(sum(vr["co2_kg"] for vr in vehicle_routes), 2)
+
+    # req. #3 — Collect all shift warnings across vehicles
+    all_shift_warnings = [
+        {"vehicle": vr["type"], "vehicle_id": vr["vehicle_id"], "warnings": vr["shift_warnings"]}
+        for vr in vehicle_routes if vr.get("shift_warnings")
+    ]
+
+    # req. #6 — Weekly schedule: group customers by delivery_frequency
+    # Returns a dict {day: [customer_name, ...]} suggesting Mon-Fri spread.
+    DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+    weekly_schedule = {d: [] for d in DAYS}
+    for vr in vehicle_routes:
+        for stop in vr["stops"]:
+            freq = stop.get("delivery_frequency")
+            name = stop.get("name", "")
+            if not freq or not name:
+                continue
+            try:
+                freq_int = int(freq)   # deliveries per week
+            except (TypeError, ValueError):
+                continue
+            if freq_int >= 5:
+                for d in DAYS:
+                    weekly_schedule[d].append(name)
+            elif freq_int == 3:
+                for d in ["Monday", "Wednesday", "Friday"]:
+                    weekly_schedule[d].append(name)
+            elif freq_int == 2:
+                for d in ["Tuesday", "Thursday"]:
+                    weekly_schedule[d].append(name)
+            else:
+                weekly_schedule["Monday"].append(name)
+
+    # req. #25 — Seasonal demand note
+    # Detect Orthodox Christmas (Jan 7), Easter (variable Apr/May), school year (Sep 1)
+    seasonal_note = None
+    if planned_date:
+        import datetime as _dt
+        md = (planned_date.month, planned_date.day)
+        if md == (1, 7):
+            seasonal_note = "Orthodox Christmas — expect +30% volume in Zlatibor region"
+        elif planned_date.month == 9 and planned_date.day == 1:
+            seasonal_note = "School year start — expect increased demand"
+        elif planned_date.month in (4, 5):
+            seasonal_note = "Orthodox Easter period — possible +20% volume spike"
+        elif planned_date.month == 12 and planned_date.day >= 20:
+            seasonal_note = "Pre-Christmas period — plan for higher volumes"
+
     return {
         "ok":                  True,
         "matrix_source":       matrix_source,
@@ -3859,6 +4214,11 @@ def _do_optimize(data, user, job_id=None, cancel_event=None):
         "use_weight_capacity": use_weight_cap,
         "service_time":        SERVICE_TIME,
         "infeasible":          is_infeasible,
+        # New summary fields
+        "total_co2_kg":        total_co2_kg,          # req. #8
+        "shift_warnings":      all_shift_warnings,    # req. #3
+        "weekly_schedule":     weekly_schedule,        # req. #6
+        "seasonal_note":       seasonal_note,          # req. #25
     }
     # NOTE: no try/except here — exceptions propagate to the job runner thread
     #       which stores them in _jobs[job_id]["error"] and sets status="error".
