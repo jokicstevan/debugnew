@@ -45,7 +45,7 @@
       <button class="lang-btn" data-lang="sr" onclick="setLanguage('sr')">SR</button>
     </div>
     <span class="user-badge" id="user-badge">...</span>
-    <a href="#" onclick="doLogout(); return false;" class="btn-logout" data-i18n="signOut">Sign out</a>
+    <a href="/logout" class="btn-logout" data-i18n="signOut">Sign out</a>
   </div>
 </header>
 
@@ -681,7 +681,7 @@
   // Set this to your active Cloudflare tunnel URL.
   // It is baked in at build time by render.yaml (BACKEND_URL env var).
   // Falls back to "" (same-origin) for local all-in-one runs.
-  window.BACKEND_URL = "https://views-retain-raleigh-employed.trycloudflare.com";
+  window.BACKEND_URL = "https://reported-herbal-track-steel.trycloudflare.com";
 
   // ── Auth guard ───────────────────────────────────────────────────────────
   // On page load, verify the session is still valid; redirect to login if not.
@@ -697,15 +697,6 @@
       window.location.href = "login.html";
     }
   })();
-
-  // ── Logout ───────────────────────────────────────────────────────────────
-  async function doLogout() {
-    const _b = (window.BACKEND_URL || "").replace(/\/$/, "");
-    try {
-      await fetch(_b + "/api/logout", { method: "POST", credentials: "include" });
-    } catch (_) {}
-    window.location.href = "login.html";
-  }
 </script>
 <script src="js/app.js"></script>
 </body>
